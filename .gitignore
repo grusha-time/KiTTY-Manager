@@ -1,0 +1,34 @@
+# Build artifacts
+src/*/bin/
+src/*/obj/
+build/
+dist/
+
+# .NET SDK and NuGet packages (local install)
+.dotnet/
+.dotnet_home/
+.dotnet-home/
+.nuget/
+.tools/
+
+# Downloads
+downloads/
+
+# Backups
+backups/
+
+# AI assistant memory
+memory/
+
+# Test results
+TestResults/
+
+# KiTTY source (external project)
+vendor/KiTTY-source/
+
+# Runtime data
+Data/
+
+# OS files
+Thumbs.db
+.DS_Store

@@ -1,0 +1,39 @@
+<Window x:Class="KiTTYManager.App.KittyChangesDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}" Title="Изменения KiTTY"
+        Width="1180" Height="700" MinWidth="850" MinHeight="480"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}">
+  <Grid Margin="22">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Margin="0,0,0,14">
+      <TextBlock Text="Неприменённые изменения KiTTY" FontSize="22" FontWeight="SemiBold"/>
+      <TextBlock Margin="0,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                 Text="Применить — записать значения менеджера во встроенную KiTTY. Отклонить — вернуть значения KiTTY в менеджер. Значения показаны полностью."/>
+    </StackPanel>
+    <DataGrid x:Name="ChangesGrid" Grid.Row="1" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="False">
+      <DataGrid.Columns>
+        <DataGridTemplateColumn Header="Выбор" Width="70">
+          <DataGridTemplateColumn.CellTemplate>
+            <DataTemplate><CheckBox IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                    IsEnabled="{Binding CanSelect}" HorizontalAlignment="Center"/></DataTemplate>
+          </DataGridTemplateColumn.CellTemplate>
+        </DataGridTemplateColumn>
+        <DataGridTextColumn Header="Сессия" Binding="{Binding SessionName}" IsReadOnly="True" Width="1.3*"/>
+        <DataGridTextColumn Header="Поле" Binding="{Binding FieldName}" IsReadOnly="True" Width="1.1*"/>
+        <DataGridTextColumn Header="Статус" Binding="{Binding Status}" IsReadOnly="True" Width="1.1*"/>
+        <DataGridTextColumn Header="Менеджер" Binding="{Binding ManagerDisplay}" IsReadOnly="True" Width="1.5*"/>
+        <DataGridTextColumn Header="KiTTY" Binding="{Binding KittyDisplay}" IsReadOnly="True" Width="1.5*"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <WrapPanel Grid.Row="2" HorizontalAlignment="Right" Margin="0,16,0,0">
+      <Button Click="SelectAll_Click" Margin="0,0,8,0">Выбрать все</Button>
+      <Button Click="Clear_Click" Margin="0,0,8,0">Снять выбор</Button>
+      <Button Click="Reject_Click" Margin="0,0,8,0">Отклонить выбранные</Button>
+      <Button Click="Ignore_Click" Margin="0,0,8,0">Игнорировать выбранные</Button>
+      <Button Click="Apply_Click" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0">Применить выбранные</Button>
+      <Button IsCancel="True">Закрыть</Button>
+    </WrapPanel>
+  </Grid>
+</Window>

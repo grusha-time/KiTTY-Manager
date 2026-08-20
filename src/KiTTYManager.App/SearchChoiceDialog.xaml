@@ -1,0 +1,28 @@
+<Window x:Class="KiTTYManager.App.SearchChoiceDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Title="Выбор" Width="680" Height="600" MinWidth="520" MinHeight="440"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI" FontSize="14">
+  <Grid Margin="24" Background="{StaticResource WindowBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel>
+      <TextBlock x:Name="PromptText" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+      <TextBlock Margin="0,6,0,0" Foreground="{StaticResource MutedTextBrush}" Text="Можно выбрать несколько вариантов."/>
+      <TextBlock x:Name="SelectedCountText" Margin="0,4,0,0" Foreground="#8FB4FF" Text="Выбрано: 0"/>
+    </StackPanel>
+    <TextBox x:Name="SearchText" Grid.Row="1" Margin="0,16,0,12" TextChanged="SearchText_TextChanged" ToolTip="Поиск"/>
+    <ListBox x:Name="ChoicesList" Grid.Row="2" SelectionMode="Multiple"/>
+    <DockPanel Grid.Row="3" Margin="0,16,0,0">
+      <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+        <Button Click="SelectAll_Click" Margin="0,0,8,0">Выбрать все</Button>
+        <Button Click="ClearSelection_Click">Снять выбор</Button>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button IsCancel="True" Margin="0,0,8,0">Отмена</Button>
+        <Button Click="Select_Click" IsDefault="True" Style="{StaticResource PrimaryButton}">Начать</Button>
+      </StackPanel>
+    </DockPanel>
+  </Grid>
+</Window>

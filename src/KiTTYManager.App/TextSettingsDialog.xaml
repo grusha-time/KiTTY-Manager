@@ -1,0 +1,72 @@
+<Window x:Class="KiTTYManager.App.TextSettingsDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Title="Настройки" Width="760" Height="680" MinWidth="560" MinHeight="480"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI" FontSize="14">
+  <Grid Margin="24" Background="{StaticResource WindowBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBlock Text="Настройки приложения" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,18"/>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Margin="0,0,10,0">
+        <TextBlock Text="Путь к KiTTY" Margin="0,0,0,7"/><TextBox x:Name="KittyBox"/>
+        <TextBlock Text="Путь к Firefox" Margin="0,18,0,7"/><TextBox x:Name="FirefoxBox"/>
+        <TextBlock Text="Имя отдельного Firefox-профиля" Margin="0,18,0,7"/><TextBox x:Name="ProfileBox"/>
+        <TextBlock Text="Шаблон профиля Firefox (папка, необязательно)" Margin="0,18,0,7"/>
+        <DockPanel>
+          <Button x:Name="BrowseTemplateButton" DockPanel.Dock="Right" Content="Выбрать…" Margin="8,0,0,0" Click="BrowseTemplate_Click" Padding="12,4"/>
+          <TextBox x:Name="TemplateProfileBox" ToolTip="Путь к настроенному профилю Firefox. Менеджер копирует его для каждого веб-интерфейса. Оставьте пустым для создания профиля с нуля."/>
+        </DockPanel>
+        <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Укажите папку профиля Firefox, в котором отключён чекбокс «Отправлять DNS-запросы через прокси при использовании SOCKS 5» (Настройки Firefox → Основные → Параметры сети → Настроить… → раздел «Ручная настройка прокси», внизу списка). Менеджер будет копировать эту папку, не изменяя оригинал. Как найти папку: откройте Firefox, введите в адресную строку about:support, скопируйте путь из поля «Папка профиля» и выберите эту папку здесь."/>
+        <TextBlock Text="Таймаут одной попытки подключения, сек" Margin="0,18,0,7"/>
+        <TextBox x:Name="ConnectionTimeoutBox" MaxLength="3" ToolTip="Допустимое значение: от 10 до 600 секунд"/>
+        <TextBlock Text="Лимит зонда одного адреса, сек" Margin="0,18,0,7"/>
+        <TextBox x:Name="EndpointProbeTimeoutBox" MaxLength="2" ToolTip="Допустимое значение: от 1 до 30 секунд"/>
+        <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Короткая проверка доступности конкретного основного или резервного ip:port. Входит в общий таймаут попытки маршрута."/>
+        <Border Margin="0,22,0,18" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"/>
+        <CheckBox x:Name="CloseToTrayBox" Content="По крестику скрывать менеджер в системный трей"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Обычные сессии KiTTY продолжают работать независимо. Автоматические маршруты требуют запущенного менеджера."/>
+        <CheckBox x:Name="EnableLoggingBox" Margin="0,20,0,0" Content="Записывать журнал работы менеджера"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="По умолчанию журнал отключён. Единый отчёт run-tests.cmd создаётся независимо от этой настройки."/>
+        <CheckBox x:Name="WriteToKittyBox" Margin="0,20,0,0" Content="Записывать изменения сразу в KiTTY"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Запись выполняется после кнопки «Сохранить изменения» и только в папку KiTTY рядом с менеджером."/>
+        <CheckBox x:Name="CloseWebTunnelBox" Margin="0,20,0,0" Content="Закрывать консоль веб-туннеля после закрытия Firefox"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="По умолчанию выключено: консоль KiTTY остаётся открытой, пока вы не закроете её вручную."/>
+        <CheckBox x:Name="TemporaryFirefoxProfilesBox" Margin="0,20,0,0" Content="Использовать временные профили Firefox"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Если включено, профиль удаляется после закрытия Firefox. Если выключено, профиль сессии сохраняет сертификаты и настройки."/>
+        <CheckBox x:Name="ShareFirefoxProfileByGroupBox" Margin="0,20,0,0" Content="Один профиль Firefox для сессий одной группы"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Работает для постоянных профилей и экономит место. В одной группе одновременно используется один веб-туннель; для параллельной работы отключите эту настройку. При перемещении сессии лишние профили удаляются."/>
+        <CheckBox x:Name="UseInternalWebResolverBox" Margin="0,20,0,0"
+                  Content="Использовать внутренний DNS для веб-интерфейсов"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="По умолчанию выключено: используется системный DNS/hosts. Если включить, менеджер использует собственный HTTP/HTTPS-прокси и направляет настроенные домены через выбранную сессию. Адрес можно переопределить у веб-интерфейса."/>
+        <CheckBox x:Name="AutoConfirmHostKeysBox" Margin="0,20,0,0" Content="Автоматически доверять новым и изменённым SSH host key"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Новые и изменённые ключи принимаются без диалога и сохраняются после успешного подключения. Отключите настройку, если хотите сверять каждый новый или изменившийся отпечаток вручную."/>
+        <CheckBox x:Name="SuppressKittyChangesBox" Margin="0,20,0,0" Content="Не показывать уведомления об изменениях KiTTY при запуске"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Изменения по-прежнему доступны в меню ⋯ → «Изменения KiTTY…». Включите, если храните сессии только в менеджере."/>
+        <CheckBox x:Name="RaceBestEntryPointsBox" Margin="0,20,0,0" Content="Параллельно проверять две лучшие точки входа"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="По умолчанию выключено. Если две лучшие JH уже запущены, менеджер одновременно проверит оба маршрута и возьмёт первый успешный. Это ускоряет отказ недоступной JH, но создаёт два одновременных SSH-подключения."/>
+        <CheckBox x:Name="SkipExistingLinksInMapCheckBox" Margin="0,20,0,0"
+                  Content="В режиме карты проверять только новые связи"/>
+        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="По умолчанию включено. При проверке выбранных узлов карты уже сохранённые пары пропускаются. Обычные проверки связей эта настройка не ограничивает."/>
+      </StackPanel>
+    </ScrollViewer>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+      <Button IsCancel="True" Margin="0,0,8,0">Отмена</Button>
+      <Button Click="Save_Click" IsDefault="True" Style="{StaticResource PrimaryButton}">Сохранить настройки</Button>
+    </StackPanel>
+  </Grid>
+</Window>

@@ -1,0 +1,17 @@
+<Window x:Class="KiTTYManager.App.PromptDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Width="480" MinHeight="210" SizeToContent="Height" WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize" ShowInTaskbar="False"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI" FontSize="14">
+  <Grid Margin="24" Background="{StaticResource WindowBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <TextBlock x:Name="PromptText" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+    <TextBox x:Name="InputBox" Grid.Row="1" Margin="0,18,0,24"/>
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button IsCancel="True" Margin="0,0,8,0">Отмена</Button>
+      <Button Click="Save_Click" IsDefault="True" Style="{StaticResource PrimaryButton}">Сохранить</Button>
+    </StackPanel>
+  </Grid>
+</Window>

@@ -1,0 +1,11 @@
+{
+  "SchemaVersion": 3,
+  "Groups": [],
+  "UngroupedServers": [],
+  "Links": [],
+  "BaseProxies": [],
+  "KittyPath": "KiTTY\\kitty.exe",
+  "FirefoxPath": "firefox.exe",
+  "FirefoxProfile": "kitty-manager",
+  "ConnectionTimeoutSeconds": 60
+}

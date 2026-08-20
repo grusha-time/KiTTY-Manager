@@ -1,0 +1,191 @@
+<Window x:Class="KiTTYManager.App.ProxySettingsDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:KiTTYManager.App"
+        Style="{StaticResource {x:Type Window}}"
+        Title="Точки входа" Width="1400" Height="980" MinWidth="820" MinHeight="620"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}" FontFamily="Segoe UI" FontSize="14">
+  <Window.Resources>
+    <Style TargetType="ToolTip">
+      <Setter Property="Background" Value="#202020"/><Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/><Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="10,8"/><Setter Property="MaxWidth" Value="520"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ToolTip">
+        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+          <TextBlock Text="{TemplateBinding Content}" TextWrapping="Wrap" MaxWidth="500"/>
+        </Border>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+    <Style x:Key="HelpButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Width" Value="24"/><Setter Property="Height" Value="24"/><Setter Property="MinHeight" Value="24"/>
+      <Setter Property="Padding" Value="0"/><Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="Foreground" Value="{StaticResource MutedTextBrush}"/><Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Content" Value="?"/><Setter Property="Focusable" Value="False"/>
+      <Setter Property="ToolTipService.InitialShowDelay" Value="250"/><Setter Property="ToolTipService.ShowDuration" Value="30000"/>
+      <Setter Property="ToolTipService.BetweenShowDelay" Value="0"/>
+    </Style>
+    <Style TargetType="ComboBoxItem">
+      <Setter Property="Background" Value="{StaticResource SurfaceBrush}"/><Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+      <Setter Property="Padding" Value="10,8"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="{StaticResource SurfaceHoverBrush}"/></Trigger>
+        <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="{StaticResource SurfaceSelectedBrush}"/><Setter Property="Foreground" Value="White"/></Trigger>
+      </Style.Triggers>
+    </Style>
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="#1B1B1B"/><Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/><Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="10,8"/><Setter Property="MinHeight" Value="38"/>
+      <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ComboBox">
+        <Grid>
+          <ToggleButton x:Name="Toggle" Focusable="False" IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}"
+                        Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+            <ToggleButton.Template><ControlTemplate TargetType="ToggleButton">
+              <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                      BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="5">
+                <ContentPresenter/>
+              </Border>
+            </ControlTemplate></ToggleButton.Template>
+            <Grid><ContentPresenter Margin="{TemplateBinding Padding}" Content="{TemplateBinding SelectionBoxItem}"
+                                    ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" VerticalAlignment="Center" HorizontalAlignment="Left"/>
+              <Path HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,12,0" Fill="{StaticResource MutedTextBrush}" Data="M 0,0 L 5,5 L 10,0 Z"/>
+            </Grid>
+          </ToggleButton>
+          <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}" AllowsTransparency="True" Focusable="False">
+            <Border MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}" MaxHeight="320"
+                    Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="6" Margin="0,3,0,0">
+              <ScrollViewer><ItemsPresenter/></ScrollViewer>
+            </Border>
+          </Popup>
+        </Grid>
+      </ControlTemplate></Setter.Value></Setter>
+    </Style>
+  </Window.Resources>
+  <Grid Margin="24" Background="{StaticResource WindowBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="220"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Margin="0,0,0,18">
+      <TextBlock Text="Точки входа и jumphost-сессии" FontSize="22" FontWeight="SemiBold"/>
+      <TextBlock Margin="0,7,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                 Text="Одна строка — одна точка входа. Выберите сессию jumphost и её фиксированный порт либо включите автоматический выбор. Строка без сессии означает уже запущенный внешний SOCKS5."/>
+    </StackPanel>
+    <Border Grid.Row="1" Background="{StaticResource SurfaceBrush}" CornerRadius="8" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" Padding="1">
+      <DataGrid x:Name="Grid" AutoGenerateColumns="False" CanUserAddRows="False" RowHeight="38"
+                SelectionChanged="Grid_SelectionChanged">
+        <DataGrid.Columns>
+          <DataGridCheckBoxColumn Header="Включён" Binding="{Binding Enabled}" Width="84"/>
+          <DataGridTextColumn Header="Название" Binding="{Binding Name}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+          <DataGridTemplateColumn Header="Сессия jumphost" Width="2*">
+            <DataGridTemplateColumn.CellTemplate><DataTemplate>
+              <ComboBox ItemsSource="{Binding SessionChoices, RelativeSource={RelativeSource AncestorType=Window}}"
+                        DisplayMemberPath="Name" SelectedValuePath="Id"
+                        SelectedValue="{Binding StartupServerId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+            </DataTemplate></DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+          <DataGridTextColumn Header="Адрес" Binding="{Binding Host}" Width="190" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+          <DataGridTextColumn Header="Порт" Binding="{Binding Port}" Width="100" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+          <DataGridTemplateColumn x:Name="CurrentTotpColumn" Header="Текущий OTP" Width="150" IsReadOnly="True">
+            <DataGridTemplateColumn.CellTemplate><DataTemplate>
+              <TextBlock Text="—" Tag="CurrentTotp" FontFamily="Consolas" VerticalAlignment="Center"
+                         Loaded="TotpCell_Loaded"/>
+            </DataTemplate></DataGridTemplateColumn.CellTemplate>
+          </DataGridTemplateColumn>
+        </DataGrid.Columns>
+        <DataGrid.ContextMenu>
+          <ContextMenu><MenuItem Header="Добавить jumphost" Click="Add_Click"/><MenuItem Header="Удалить выбранный" Click="Remove_Click"/></ContextMenu>
+        </DataGrid.ContextMenu>
+      </DataGrid>
+    </Border>
+    <TextBlock Grid.Row="2" Margin="0,16,0,8" Text="Параметры выбранной точки" FontSize="17" FontWeight="SemiBold"/>
+    <Border Grid.Row="3" Background="{StaticResource SurfaceBrush}" CornerRadius="8" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" Padding="14">
+      <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel>
+        <Grid DataContext="{Binding SelectedItem, ElementName=Grid}">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="32"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="Сессия jumphost" VerticalAlignment="Center"/>
+          <ComboBox Grid.Column="2" ItemsSource="{Binding SessionChoices, RelativeSource={RelativeSource AncestorType=Window}}"
+                    DisplayMemberPath="Name" SelectedValuePath="Id" SelectedValue="{Binding StartupServerId}"/>
+          <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,10,0,4">
+            <CheckBox Content="Запускать сессию, если SOCKS5 недоступен" IsChecked="{Binding AutoStartWhenUnavailable}"/>
+            <CheckBox Margin="0,8,0,0" Content="Выбирать свободный локальный SOCKS5-порт автоматически" IsChecked="{Binding UseAutomaticPort}"/>
+          </StackPanel>
+          <TextBlock Grid.Row="2" Text="TOTP secret" VerticalAlignment="Center"/>
+          <Button Grid.Row="2" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Секрет из FreeOTP в Base32 или полный otpauth:// URI. Хранится в config.json открытым текстом."/>
+          <local:SecretBox Grid.Row="2" Grid.Column="2" Value="{Binding TotpSecret}"/>
+          <TextBlock Grid.Row="3" Text="Алгоритм" VerticalAlignment="Center"/>
+          <Button Grid.Row="3" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Алгоритм TOTP. Для вашей настройки FreeOTP выберите SHA1."/>
+          <ComboBox x:Name="Algorithm" Grid.Row="3" Grid.Column="2" SelectedValue="{Binding TotpAlgorithm}"/>
+          <TextBlock Grid.Row="4" Text="Количество цифр" VerticalAlignment="Center"/>
+          <Button Grid.Row="4" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Длина одноразового кода: от 6 до 8 цифр. Для FreeOTP обычно 6."/>
+          <TextBox Grid.Row="4" Grid.Column="2" Text="{Binding TotpDigits}"/>
+          <TextBlock Grid.Row="5" Text="Период, секунд" VerticalAlignment="Center"/>
+          <Button Grid.Row="5" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Срок действия одного TOTP-кода. Стандартное и ваше значение FreeOTP — 30 секунд."/>
+          <TextBox Grid.Row="5" Grid.Column="2" Text="{Binding TotpPeriodSeconds}"/>
+          <TextBlock Grid.Row="6" Text="Ожидаемый OTP prompt" VerticalAlignment="Center"/>
+          <Button Grid.Row="6" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Подстрока реального запроса одноразового кода в консоли, например TOTP: или Verification code:. Регистр и текст должны совпадать."/>
+          <TextBox Grid.Row="6" Grid.Column="2" Text="{Binding TotpPrompt}"/>
+          <TextBlock Grid.Row="7" Text="Команда после входа" VerticalAlignment="Center"/>
+          <Button Grid.Row="7" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Команда, которую KiTTY отправит после появления shell prompt. Например: ./protei_access.sh"/>
+          <TextBox Grid.Row="7" Grid.Column="2" Text="{Binding PostLoginCommand}"/>
+          <TextBlock Grid.Row="8" Text="Повтор пароля" VerticalAlignment="Center"/>
+          <Button Grid.Row="8" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="После запуска команды дождаться нового запроса Password: и повторно отправить обычный пароль выбранной сессии."/>
+          <CheckBox Grid.Row="8" Grid.Column="2" Margin="0,10,0,4" Content="Отправить пароль учётной записи после команды"
+                    IsChecked="{Binding RepeatAccountPasswordAfterCommand}"/>
+          <TextBlock Grid.Row="9" Text="Ожидаемый prompt пароля" VerticalAlignment="Center"/>
+          <Button Grid.Row="9" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Подстрока запроса пароля, который появляется после команды. Например: password for user:. По умолчанию assword подходит для Password: и password for user:."/>
+          <TextBox Grid.Row="9" Grid.Column="2" Text="{Binding PostLoginPasswordPrompt}"/>
+          <TextBlock Grid.Row="10" Text="Таймаут скрипта, сек" VerticalAlignment="Center"/>
+          <Button Grid.Row="10" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Единый максимальный срок ожидания завершения access-скрипта. По умолчанию 180 секунд. После таймаута запуск считается неподтверждённым, а служебная консоль остаётся открытой."/>
+          <TextBox Grid.Row="10" Grid.Column="2" Text="{Binding PostCommandReadyDelaySeconds}"/>
+          <CheckBox Grid.Row="11" Grid.ColumnSpan="3" Margin="0,8,0,0" IsChecked="{Binding EnableControlServerMechanism}"
+                    Content="Включить механизм контрольных серверов (проверка доступности и автоперезапуск скрипта)"/>
+          <TextBlock Grid.Row="12" Text="Контрольных серверов" VerticalAlignment="Center"/>
+          <Button Grid.Row="12" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Механизм контрольных серверов: менеджер запоминает N серверов, доступных через данную точку входа. При неудаче подключения проверяется доступность этих серверов. Если все недоступны — скрипт доступа отправляется повторно в открытую консоль jumphost. Если после скрипта серверы появились — доступ восстановлен. Если ни один из запомненных серверов не появился — менеджер пробует обнаружить новые доступные серверы через этот jumphost и сформировать новый список. Если вообще ни одного доступного сервера нет — список сохраняется, повтор через 1 час. Допустимо от 1 до 20, по умолчанию 5."/>
+          <TextBox Grid.Row="12" Grid.Column="2" Text="{Binding AccessProbeServerLimit, UpdateSourceTrigger=PropertyChanged}"
+                   TextChanged="AccessProbeLimit_TextChanged"/>
+          <CheckBox Grid.Row="13" Grid.ColumnSpan="3" Margin="0,8,0,0" IsChecked="{Binding EnableScheduledRestart}"
+                    Content="Перезапускать скрипт доступа по расписанию"/>
+          <TextBlock Grid.Row="14" Text="Интервал перезапуска, мин" VerticalAlignment="Center"/>
+          <Button Grid.Row="14" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Как часто обязательно запускать скрипт доступа. При запуске менеджера успешная проверка уже работающей JH заново отсчитывает интервал; обычные recovery-проверки срок не переносят. Управляемая JH используется напрямую, для неизвестной KiTTY менеджер спрашивает способ запуска. Изменение применяется сразу. По умолчанию 1435 минут (23 часа 55 минут). Минимум 1 минута."/>
+          <TextBox Grid.Row="14" Grid.Column="2" Text="{Binding ScheduledRestartMinutes, UpdateSourceTrigger=PropertyChanged}"/>
+          <TextBlock Grid.Row="15" Text="Обучено" VerticalAlignment="Center"/>
+          <Button Grid.Row="15" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Серверы, на которых ранее был подтверждён доступ через эту точку входа. Сброс очищает только обученную выборку и начинает новый отсчёт расписания от текущего времени. История попыток, запусков и подтверждений сохраняется."/>
+          <StackPanel Grid.Row="15" Grid.Column="2" Orientation="Horizontal" Margin="0,4,0,0">
+            <TextBlock x:Name="AccessProbeSummary" VerticalAlignment="Center" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" MaxWidth="280"/>
+            <Button Margin="8,0,0,0" Click="ResetAccessProbe_Click">Сбросить</Button>
+          </StackPanel>
+          <TextBlock Grid.Row="16" Text="Состояние скрипта" VerticalAlignment="Top" Margin="0,8,0,0"/>
+          <TextBlock x:Name="AccessScriptStatus" Grid.Row="16" Grid.Column="2" Margin="0,8,0,0"
+                     Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" Text="—"/>
+          <TextBlock Grid.Row="17" Text="Консоли" VerticalAlignment="Top" Margin="0,8,0,0"/>
+          <Button Grid.Row="17" Grid.Column="1" Style="{StaticResource HelpButton}" ToolTip="Какие консоли KiTTY видит менеджер для этой точки входа: свои (запущенные или усыновленные), открытые вне менеджера и лишние дубли. Кнопка закрывает дубли, оставляя самую свежую консоль."/>
+          <StackPanel Grid.Row="17" Grid.Column="2" Margin="0,8,0,0">
+            <TextBlock x:Name="ConsoleStatus" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" Text="—"/>
+            <Button Margin="0,6,0,0" HorizontalAlignment="Left" Click="CloseExtraConsoles_Click">Закрыть лишние консоли</Button>
+          </StackPanel>
+        </Grid>
+        <TextBlock Margin="0,16,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="TOTP secret хранится в конфигурации открытым текстом, как и остальные пароли. Не передавайте файл конфигурации посторонним. Для FreeOTP обычно: SHA1, 6 цифр, 30 секунд."/>
+        </StackPanel>
+      </ScrollViewer>
+    </Border>
+    <DockPanel Grid.Row="4" Margin="0,18,0,0">
+      <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+        <Button Click="Add_Click" Margin="0,0,8,0">Добавить</Button><Button Click="Remove_Click">Удалить</Button>
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button Click="Cancel_Click" Margin="0,0,8,0">Отмена</Button>
+        <Button Click="Save_Click" IsDefault="True" Style="{StaticResource PrimaryButton}">Сохранить</Button>
+      </StackPanel>
+    </DockPanel>
+  </Grid>
+</Window>

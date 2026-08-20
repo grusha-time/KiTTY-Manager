@@ -1,0 +1,288 @@
+<Window x:Class="KiTTYManager.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:KiTTYManager.App"
+        Style="{StaticResource {x:Type Window}}"
+        Title="KiTTY Manager" Height="820" Width="1420" MinHeight="650" MinWidth="1050" WindowState="Maximized"
+        Icon="Assets/kitty-manager.ico" Closing="Window_Closing"
+        Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}"
+        FontFamily="Segoe UI" FontSize="14">
+  <Grid Background="{StaticResource WindowBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="42"/></Grid.RowDefinitions>
+
+    <Border x:Name="HeaderPanel" Grid.Row="0" Background="#101010" BorderBrush="#292929" BorderThickness="0,0,0,1" Padding="22,14">
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="KiTTY Manager" Foreground="White" FontSize="22" FontWeight="SemiBold"/>
+          <TextBlock Text="Сессии, маршруты и веб-интерфейсы" Foreground="#858585" FontSize="12"/>
+        </StackPanel>
+        <WrapPanel Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <Button Click="Jumphosts_Click" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0">Настроить точки входа</Button>
+          <Button Click="Settings_Click" Margin="0,0,8,0">Настройки</Button>
+          <Button Click="More_Click">⋯</Button>
+        </WrapPanel>
+      </Grid>
+    </Border>
+
+    <Grid x:Name="WorkspacePanel" Grid.Row="1" Margin="18">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="0.75*" MinWidth="190"/><ColumnDefinition Width="8"/>
+        <ColumnDefinition Width="1.35*" MinWidth="350"/><ColumnDefinition Width="8"/>
+        <ColumnDefinition Width="2.6*" MinWidth="470"/>
+      </Grid.ColumnDefinitions>
+
+      <Border Grid.Column="0" Background="#171717" CornerRadius="12" BorderBrush="#292929" BorderThickness="1">
+        <DockPanel>
+          <Border DockPanel.Dock="Top" Padding="16,14" BorderBrush="#292929" BorderThickness="0,0,0,1">
+            <StackPanel>
+              <TextBlock Text="Группы" FontSize="17" FontWeight="SemiBold"/>
+              <TextBox x:Name="GroupSearchBox" Margin="0,10,0,0" TextChanged="GroupSearchBox_TextChanged"
+                       ToolTip="Поиск по названиям групп и подгрупп"/>
+            </StackPanel>
+          </Border>
+          <TreeView x:Name="GroupTree" Margin="8" AllowDrop="True" SelectedItemChanged="GroupTree_SelectedItemChanged"
+                    Drop="GroupTree_Drop" DragOver="GroupTree_DragOver" PreviewMouseRightButtonDown="GroupTree_PreviewMouseRightButtonDown">
+            <TreeView.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="Создать группу" Click="CreateRootGroup_Click"/>
+                <MenuItem Header="Создать подгруппу" Click="CreateSubgroup_Click"/>
+                <MenuItem Header="Построить карту связей внутри группы…" Click="BuildGroupLinks_Click"/>
+                <MenuItem Header="Построить только недостающие связи…" Click="BuildMissingGroupLinks_Click"/>
+                <MenuItem Header="Удалить все связи внутри группы" Click="DeleteGroupLinks_Click"/>
+                <Separator/>
+                <MenuItem Header="Переименовать" Click="RenameGroup_Click"/>
+                <MenuItem Header="Удалить" Click="DeleteGroup_Click"/>
+              </ContextMenu>
+            </TreeView.ContextMenu>
+          </TreeView>
+        </DockPanel>
+      </Border>
+
+      <GridSplitter Grid.Column="1" Width="8" Background="Transparent"
+                    ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" HorizontalAlignment="Stretch"/>
+
+      <Border Grid.Column="2" Background="#171717" CornerRadius="12" BorderBrush="#292929" BorderThickness="1">
+        <DockPanel>
+          <Grid DockPanel.Dock="Top" Margin="16,12">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+            <Grid Grid.Row="0">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <StackPanel>
+                <TextBlock Text="Сессии" FontSize="17" FontWeight="SemiBold"/>
+                <TextBlock x:Name="SessionCountText" Foreground="#858585" FontSize="12"/>
+              </StackPanel>
+              <Button x:Name="ClearGroupFilterButton" Grid.Column="1" Click="ClearGroupFilter_Click" Padding="10,5" Visibility="Collapsed">Сбросить фильтр групп</Button>
+            </Grid>
+            <StackPanel Grid.Row="1" Margin="0,10,0,0">
+              <TextBlock x:Name="GroupFilterText" Foreground="#8FB4FF" FontSize="12" Margin="0,0,0,5"/>
+              <TextBox x:Name="SearchBox" TextChanged="SearchBox_TextChanged"
+                       ToolTip="Поиск по группам, сессиям, IP, портам, логинам, паролям и веб-интерфейсам"/>
+            </StackPanel>
+          </Grid>
+          <DataGrid x:Name="SessionsGrid" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
+                    ClipboardCopyMode="ExcludeHeader"
+                    MouseDoubleClick="SessionsGrid_MouseDoubleClick" PreviewMouseMove="SessionsGrid_PreviewMouseMove"
+                    PreviewMouseLeftButtonDown="SessionsGrid_PreviewMouseLeftButtonDown"
+                    ContextMenuOpening="SessionsGrid_ContextMenuOpening">
+            <DataGrid.ColumnHeaderStyle>
+              <Style TargetType="DataGridColumnHeader" BasedOn="{StaticResource {x:Type DataGridColumnHeader}}">
+                <Setter Property="Cursor" Value="Hand"/>
+              </Style>
+            </DataGrid.ColumnHeaderStyle>
+            <DataGrid.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="Копировать строку" Command="ApplicationCommands.Copy"/>
+                <Separator/>
+                <MenuItem Header="Создать сессию вручную" Click="CreateSession_Click"/>
+                <MenuItem Header="Дублировать сессию" Click="DuplicateSession_Click"/>
+                <Separator/>
+                <MenuItem Header="Подключиться" Click="OpenRoutedConsole_Click"/>
+                <MenuItem Header="Открыть сохранённую сессию KiTTY напрямую" Click="OpenOriginalSession_Click"/>
+                <MenuItem Header="Проверить доступ к другим серверам…" Click="CheckConnectivity_Click"/>
+                <MenuItem Header="Сохранённые связи…" Click="ShowSavedLinks_Click"/>
+                <Separator/>
+                <MenuItem x:Name="MoveToUngroupedItem" Header="Убрать из группы" Click="MoveToUngrouped_Click"/>
+                <MenuItem Header="Удалить из менеджера" Click="DeleteSession_Click"/>
+              </ContextMenu>
+            </DataGrid.ContextMenu>
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Сессия" Binding="{Binding Name}" Width="2*"/>
+              <DataGridTextColumn Header="Сервер" Binding="{Binding Endpoint}" Width="1.4*"/>
+              <DataGridTextColumn Header="Группа" Binding="{Binding Group}" Width="1.4*"/>
+            </DataGrid.Columns>
+          </DataGrid>
+        </DockPanel>
+      </Border>
+
+      <GridSplitter Grid.Column="3" Width="8" Background="Transparent"
+                    ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" HorizontalAlignment="Stretch"/>
+
+      <Border Grid.Column="4" Background="#171717" CornerRadius="12" BorderBrush="#292929" BorderThickness="1">
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Margin="22">
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBlock Text="Веб-интерфейсы" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center"/>
+              <Button Grid.Column="1" Click="AddWeb_Click">Добавить</Button>
+            </Grid>
+            <TextBlock Margin="0,7,0,0" Foreground="#858585" FontSize="12" TextWrapping="Wrap"
+                       Text="Логин и пароль хранятся как подсказка. Firefox не заполняет их автоматически."/>
+            <DataGrid x:Name="WebGrid" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="True"
+                      MinHeight="150" Margin="0,10,0,0" ClipboardCopyMode="ExcludeHeader"
+                      MouseDoubleClick="WebGrid_MouseDoubleClick"
+                      PreviewMouseRightButtonDown="WebGrid_PreviewMouseRightButtonDown"
+                      CellEditEnding="WebGrid_CellEditEnding"
+                      Sorting="WebGrid_Sorting">
+              <DataGrid.ColumnHeaderStyle>
+                <Style TargetType="DataGridColumnHeader" BasedOn="{StaticResource {x:Type DataGridColumnHeader}}">
+                  <Setter Property="Cursor" Value="Hand"/>
+                  <Setter Property="ToolTip" Value="Нажмите для сортировки"/>
+                </Style>
+              </DataGrid.ColumnHeaderStyle>
+              <DataGrid.ContextMenu>
+                <ContextMenu>
+                  <MenuItem Header="Переместить вверх" Click="MoveWebUp_Click"/>
+                  <MenuItem Header="Переместить вниз" Click="MoveWebDown_Click"/>
+                  <Separator/>
+                  <MenuItem Header="Редактировать поле" Click="EditWebField_Click"/>
+                  <Separator/>
+                  <MenuItem Header="Копировать строку" Command="ApplicationCommands.Copy"/>
+                </ContextMenu>
+              </DataGrid.ContextMenu>
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Название" Binding="{Binding Name, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                <DataGridTextColumn Header="URL" Binding="{Binding Url, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="2*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                <DataGridTextColumn Binding="{Binding ResolverAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}">
+                  <DataGridTextColumn.Header>
+                    <TextBlock Text="Резолвить домен по адресу"
+                               ToolTip="Если поле пустое, используется адрес выбранной сессии."/>
+                  </DataGridTextColumn.Header>
+                </DataGridTextColumn>
+                <DataGridTextColumn Header="Логин" Binding="{Binding Username, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                <DataGridTemplateColumn Header="Пароль" Width="*">
+                  <DataGridTemplateColumn.CellTemplate>
+                    <DataTemplate>
+                      <local:SecretBox Value="{Binding Password}" IsHitTestVisible="False" Margin="4"/>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellTemplate>
+                  <DataGridTemplateColumn.CellEditingTemplate>
+                    <DataTemplate>
+                      <local:SecretBox Value="{Binding Password, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Margin="4"/>
+                    </DataTemplate>
+                  </DataGridTemplateColumn.CellEditingTemplate>
+                </DataGridTemplateColumn>
+              </DataGrid.Columns>
+            </DataGrid>
+            <WrapPanel Margin="0,10,0,0">
+              <Button Click="OpenWeb_Click" Margin="0,0,8,0">Открыть веб-интерфейс</Button>
+              <Button Click="RemoveWeb_Click">Удалить выбранный интерфейс</Button>
+            </WrapPanel>
+
+            <Border Margin="0,22,0,18" BorderBrush="#292929" BorderThickness="0,1,0,0"/>
+            <WrapPanel>
+              <Button Click="ApplyServer_Click" Height="38" Margin="0,0,8,8">Сохранить изменения</Button>
+              <Button x:Name="SaveToKittyButton" Click="SaveToKitty_Click" Height="38" Margin="0,0,8,8" Visibility="Collapsed">Сохранить в KiTTY</Button>
+              <Button Click="DuplicateSession_Click" Height="38" Margin="0,0,8,8">Дублировать</Button>
+              <Button Click="OpenRoutedConsole_Click" Style="{StaticResource PrimaryButton}" Height="38" Margin="0,0,8,8">Подключиться</Button>
+              <Button x:Name="StartJumphostButton" Click="StartJumphost_Click" Height="38" Margin="0,0,8,8" Visibility="Collapsed">Запустить как точку входа</Button>
+              <Button Click="CheckConnectivity_Click" Height="38" Margin="0,0,8,8">Проверить доступ к другим серверам…</Button>
+              <Button Click="ShowSavedLinks_Click" Height="38" Margin="0,0,8,8">Сохранённые связи…</Button>
+            </WrapPanel>
+            <TextBlock x:Name="LastRouteText" Margin="0,4,0,0"
+                       Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Visibility="Collapsed"/>
+
+            <Border Margin="0,22,0,18" BorderBrush="#292929" BorderThickness="0,1,0,0"/>
+            <TextBlock Text="Сессия" FontSize="17" FontWeight="SemiBold"/>
+            <TextBlock x:Name="SelectionHint" Margin="0,8,0,0" Foreground="#858585" TextWrapping="Wrap"
+                       Text="Выберите сессию. Двойной клик построит автоматический маршрут и откроет её в KiTTY."/>
+            <Grid x:Name="DetailsPanel" Margin="0,18,0,0" Visibility="Collapsed">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="115"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+              </Grid.RowDefinitions>
+              <TextBlock Text="Название" VerticalAlignment="Center"/><TextBox x:Name="ServerNameBox" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="1" Text="Адрес" VerticalAlignment="Center"/><TextBox x:Name="HostBox" Grid.Row="1" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="2" Text="SSH-порт" VerticalAlignment="Center"/><TextBox x:Name="PortBox" Grid.Row="2" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="3" Text="Логин" VerticalAlignment="Center"/><TextBox x:Name="UsernameBox" Grid.Row="3" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="4" Text="Пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="PasswordBox" Grid.Row="4" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="5" Text="Ключ SSH" VerticalAlignment="Center"/><TextBox x:Name="PrivateKeyPathBox" Grid.Row="5" Grid.Column="1" Margin="0,0,0,8" ToolTip="Путь к PPK/PEM на этом ПК. Оставьте пустым, если ключ лежит на jumphost — пароль ключа всё равно будет передан."/>
+              <TextBlock Grid.Row="6" Text="Пароль ключа" VerticalAlignment="Center"/><local:SecretBox x:Name="PrivateKeyPassphraseBox" Grid.Row="6" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="7" Text="Повышение прав" VerticalAlignment="Center"/><TextBox x:Name="RootLoginBox" Grid.Row="7" Grid.Column="1" Margin="0,0,0,8" ToolTip="Команда su/sudo из Autocommand или login script KiTTY, например su - или sudo su -"/>
+              <TextBlock Grid.Row="8" Text="Root-пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="RootPasswordBox" Grid.Row="8" Grid.Column="1" Margin="0,0,0,8" ToolTip="Пароль для команды su/sudo"/>
+              <TextBlock Grid.Row="9" Text="Скрипт KiTTY" VerticalAlignment="Center"/>
+              <TextBlock x:Name="ScriptInfoText" Grid.Row="9" Grid.Column="1" Foreground="#9A9A9A" TextWrapping="Wrap" Margin="8,4,0,8"/>
+              <TextBlock Grid.Row="10" Text="Shell prompt" VerticalAlignment="Center"/>
+              <TextBox x:Name="ShellPromptBox" Grid.Row="10" Grid.Column="1" Margin="0,0,0,8" ToolTip="Часть приглашения shell, после которой можно безопасно отправить su/sudo. Обычно $"/>
+              <TextBlock Grid.Row="11" Text="Команда KiTTY" VerticalAlignment="Center"/>
+              <TextBox x:Name="ImportedCommandBox" Grid.Row="11" Grid.Column="1" Margin="0,0,0,8" TextWrapping="Wrap" ToolTip="Команда Autocommand из исходной сессии KiTTY. Изменение действует только внутри менеджера."/>
+              <CheckBox x:Name="IgnoreImportedCommandBox" Grid.Row="12" Grid.Column="1" Margin="0,0,0,8" Content="Не выполнять команду KiTTY при умном подключении"/>
+              <TextBlock Grid.Row="13" Text="Маршрут через" VerticalAlignment="Center"/>
+              <Grid x:Name="RequiredRoutePicker" Grid.Row="13" Grid.Column="1" Margin="0,0,0,8"
+                    ToolTip="Если выбрана сессия, она всегда будет последним SSH-переходом перед этой целью. Используйте для одинаковых private IP в разных сетях.">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="38"/></Grid.ColumnDefinitions>
+                <TextBox x:Name="RequiredRouteSearchBox" Padding="10,8"
+                         TextChanged="RequiredRouteSearchBox_TextChanged"
+                         PreviewKeyDown="RequiredRouteSearchBox_PreviewKeyDown"
+                         GotKeyboardFocus="RequiredRouteSearchBox_GotKeyboardFocus"
+                         ToolTip="Введите часть названия, адреса или группы"/>
+                <Button x:Name="RequiredRouteDropDownButton" Grid.Column="1" Margin="4,0,0,0" Padding="0" MinHeight="38"
+                        Content="▼" FontSize="10" Click="RequiredRouteDropDownButton_Click"
+                        ToolTip="Показать варианты"/>
+                <Popup x:Name="RequiredRoutePopup" PlacementTarget="{Binding ElementName=RequiredRoutePicker}"
+                       Placement="Bottom" StaysOpen="False" AllowsTransparency="True"
+                       Closed="RequiredRoutePopup_Closed">
+                  <Border Width="{Binding ActualWidth, ElementName=RequiredRoutePicker}" MaxHeight="360"
+                          Margin="0,3,0,0" Padding="1" CornerRadius="6"
+                          Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1">
+                    <ListBox x:Name="RequiredRouteOptionsList" BorderThickness="0"
+                             PreviewMouseLeftButtonUp="RequiredRouteOptionsList_PreviewMouseLeftButtonUp"/>
+                  </Border>
+                </Popup>
+              </Grid>
+              <CheckBox x:Name="TryDirectWithoutJumphostBox" Grid.Row="14" Grid.Column="1" Margin="0,2,0,8"
+                        Content="Сначала подключаться напрямую, без JH"
+                        ToolTip="Сначала попробовать SSH напрямую с этого компьютера. Если прямой доступ не работает, менеджер использует обычные сохранённые связи и точки входа; после обходного подключения прямой путь перепроверяется в фоне."/>
+            </Grid>
+
+            <Border Margin="0,22,0,18" BorderBrush="#292929" BorderThickness="0,1,0,0"/>
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+              <TextBlock Text="Резервные адреса (ip:port)" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center"/>
+              <Button Grid.Column="1" Click="AddBackupEndpoint_Click">Добавить</Button>
+            </Grid>
+            <TextBlock Margin="0,7,0,0" Foreground="#858585" FontSize="12" TextWrapping="Wrap"
+                       Text="Адреса, по которым сервер доступен, если основной порт не подошёл (например, другой SSH‑порт внутри подсети проекта). Менеджер стучится сначала по основному адресу, затем по резервным; последний рабочий запоминается и в следующий раз идёт первым, а при его отказе менеджер сам переключится обратно. Пустой IP = тот же хост, что и основной."/>
+            <DataGrid x:Name="BackupGrid" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="False"
+                      MinHeight="90" Margin="0,10,0,0" CellEditEnding="BackupGrid_CellEditEnding">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="IP (необязательно)" Binding="{Binding Host, Mode=TwoWay, UpdateSourceTrigger=LostFocus}" Width="2*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                <DataGridTextColumn Header="Порт" Binding="{Binding Port, Mode=TwoWay, UpdateSourceTrigger=LostFocus}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+            <WrapPanel Margin="0,10,0,0">
+              <Button Click="RemoveBackupEndpoint_Click">Удалить</Button>
+            </WrapPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+    </Grid>
+
+    <Border Grid.Row="2" Background="#151515" BorderBrush="#292929" BorderThickness="0,1,0,0">
+      <Grid Margin="18,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#8A8A8A" TextTrimming="CharacterEllipsis"/>
+        <Button x:Name="CancelOperationButton" Grid.Column="1" Height="32" MinHeight="32" Padding="12,4" Margin="12,0"
+                Visibility="Collapsed" Click="CancelOperation_Click">Отменить</Button>
+        <TextBlock Grid.Column="2" VerticalAlignment="Center" Foreground="#707070" Text="Перетащите сессию на группу • Двойной клик — умное подключение"/>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
