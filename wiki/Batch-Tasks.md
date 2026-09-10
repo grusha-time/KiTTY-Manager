@@ -12,6 +12,7 @@
 | Режим | Что открыть | Что понадобится |
 |---|---|---|
 | Конструктор | [`task-safe-smoke.kmtask`](../examples/batch-tasks/task-safe-smoke.kmtask) | Linux, SSH/SFTP, `sh`, обычные Unix-утилиты, Python 3, `tar`, `gzip` |
+| Конструктор (туннели) | [`task-tunnel-smoke.kmtask`](../examples/batch-tasks/task-tunnel-smoke.kmtask) | SSH-сервер с разрешённым пробросом портов, Python 3 на сервере |
 | Ansible | [`ansible/ansible-safe-smoke.yml`](../examples/batch-tasks/ansible/ansible-safe-smoke.yml) | Linux с Python 3 и `tar`, настроенные SSH-сессии, готовый встроенный Ansible runtime |
 
 Обычный запуск не требует root, Интернета, внешнего HTTP-сервера или Vault-пароля. Задачи не устанавливают пакеты и не меняют службы. Начните с одного тестового сервера, затем выберите несколько **разных** серверов. Не выбирайте две сессии одного физического сервера для конструктора: у него один фиксированный рабочий путь.

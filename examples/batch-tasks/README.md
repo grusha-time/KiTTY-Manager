@@ -2,7 +2,9 @@
 
 [Руководство: запуск, создание задач, особенности Ansible и дополнительные проверки](../../wiki/Batch-Tasks.md).
 
-- **Конструктор:** откройте [`task-safe-smoke.kmtask`](task-safe-smoke.kmtask). Все файлы уже внутри. Редактируемый исходник — [`constructor/task.yaml`](constructor/task.yaml).
+- **Конструктор:**
+  - [`task-safe-smoke.kmtask`](task-safe-smoke.kmtask) — полная проверка всех 11 типов действий конструктора. Исходник — [`constructor/task.yaml`](constructor/task.yaml).
+  - [`task-tunnel-smoke.kmtask`](task-tunnel-smoke.kmtask) — проверка петли SSH-туннелей (Remote 28080 → Local 18080 → SSH 22).
 - **Ansible:** сохраните всю папку [`ansible/`](ansible/), откройте [`ansible/ansible-safe-smoke.yml`](ansible/ansible-safe-smoke.yml). Соседние материалы обязательны.
 
 Откройте **«Массовые задачи»**, выберите нужный режим и один тестовый сервер. Затем используйте пошаговую инструкцию руководства. После успеха повторите на нескольких разных серверах.
