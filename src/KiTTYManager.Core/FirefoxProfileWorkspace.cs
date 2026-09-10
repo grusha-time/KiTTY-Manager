@@ -57,7 +57,8 @@ public static class FirefoxProfileWorkspace
             ["network.dns.disablePrefetch"] = "true",
             ["network.prefetch-next"] = "false",
             ["network.http.speculative-parallel-limit"] = "0",
-            ["media.peerconnection.enabled"] = "false",
+            // WebRTC media follows the OS network route; the container SOCKS relay is TCP-only.
+            ["media.peerconnection.enabled"] = "true",
             ["privacy.userContext.enabled"] = "true",
             ["privacy.userContext.ui.enabled"] = "true",
             ["privacy.sanitize.sanitizeOnShutdown"] = "false",

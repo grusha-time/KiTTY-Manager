@@ -11,7 +11,8 @@ public sealed class FirefoxContainerBrowser : IDisposable
 {
     private Process? browser;
     private FileStream? owner;
-    private int marionettePort;
+    private TcpClient? smokeClient;
+    private readonly string startupUrl = "about:blank#kitty-manager-" + Guid.NewGuid().ToString("N");
     public FirefoxContainerBridge Bridge { get; } = new();
     public bool IsRunning => browser is { HasExited: false };
 
@@ -47,7 +48,6 @@ public sealed class FirefoxContainerBrowser : IDisposable
         var portReservation = new TcpListener(IPAddress.Loopback, 0);
         portReservation.Start();
         var port = ((IPEndPoint)portReservation.LocalEndpoint).Port;
-        marionettePort = port;
         portReservation.Stop();
         FirefoxProfileWorkspace.ConfigureContainers(profile, Bridge.BlockedPort, port, new Uri(Bridge.Url).Port);
         var addonPath = Path.Combine(root, "containers-test.xpi");
@@ -55,13 +55,14 @@ public sealed class FirefoxContainerBrowser : IDisposable
         var start = new ProcessStartInfo(executable) { UseShellExecute = false };
         foreach (var arg in new[] { "-wait-for-browser", "-no-remote", "-new-instance", "-profile", profile, "-marionette" }) start.ArgumentList.Add(arg);
         if (headless) start.ArgumentList.Add("-headless");
-        start.ArgumentList.Add("about:blank");
+        start.ArgumentList.Add(startupUrl);
         browser?.Dispose();
         browser = Process.Start(start) ?? throw new IOException("Firefox не запущен.");
         Bridge.Trace?.Invoke($"Firefox containers: browser launched pid={browser.Id}");
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
         deadline.CancelAfter(TimeSpan.FromSeconds(60));
-        using var client = new TcpClient();
+        using var ownedClient = headless ? null : new TcpClient();
+        var client = ownedClient ?? (smokeClient = new TcpClient());
         while (!client.Connected)
         {
             if (browser.HasExited) throw new IOException("Firefox завершился до загрузки расширения. Возможно, профиль уже открыт.");
@@ -84,7 +85,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
         finally
         {
             // Delete only the automation session, not the browser or profile.
-            await CommandAsync(stream, 3, "WebDriver:DeleteSession", new { }, deadline.Token);
+            if (!headless) await CommandAsync(stream, 3, "WebDriver:DeleteSession", new { }, deadline.Token);
         }
         while (!Bridge.Connected)
         {
@@ -107,23 +108,27 @@ public sealed class FirefoxContainerBrowser : IDisposable
         }
         using var writer = new StreamWriter(archive.CreateEntry("config.js").Open(), new UTF8Encoding(false));
         writer.Write("const KITTY = " + JsonSerializer.Serialize(new
-        {url = Bridge.Url, token = Bridge.Token, blockedPort = Bridge.BlockedPort}) + ";");
+        {url = Bridge.Url, token = Bridge.Token, blockedPort = Bridge.BlockedPort, startupUrl}) + ";");
     }
 
     internal async Task CloseForSmokeAsync()
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-        using var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, marionettePort, deadline.Token);
-        var stream = client.GetStream();
-        using var greeting = await ReadPacketAsync(stream, deadline.Token);
-        await CommandAsync(stream, 1, "WebDriver:NewSession", new
-        { capabilities = new { alwaysMatch = new { acceptInsecureCerts = false } } }, deadline.Token);
-        await CommandAsync(stream, 2, "Marionette:Quit", new {flags = new[] {"eAttemptQuit"}}, deadline.Token);
+        var stream = smokeClient!.GetStream();
+        await CommandAsync(stream, 6, "Marionette:Quit", new {flags = new[] {"eAttemptQuit"}}, deadline.Token);
         if (browser is not null) await browser.WaitForExitAsync(deadline.Token);
     }
 
-    private static async Task CommandAsync(Stream stream, int id, string command, object parameters, CancellationToken token)
+    internal async Task<int> TabCountForSmokeAsync()
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var stream = smokeClient!.GetStream();
+        var response = await CommandAsync(stream, 4, "WebDriver:GetWindowHandles", new { }, deadline.Token);
+        var handles = response.ValueKind == JsonValueKind.Array ? response : response.GetProperty("value");
+        return handles.GetArrayLength();
+    }
+
+    private static async Task<JsonElement> CommandAsync(Stream stream, int id, string command, object parameters, CancellationToken token)
     {
         var data = JsonSerializer.SerializeToUtf8Bytes(new object[] {0, id, command, parameters});
         await stream.WriteAsync(Encoding.ASCII.GetBytes(data.Length + ":"), token);
@@ -134,6 +139,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
             throw new IOException("Некорректный ответ Firefox.");
         if (result[2].ValueKind != JsonValueKind.Null)
             throw new IOException("Firefox: " + result[2].GetProperty("message").GetString());
+        return result[3].Clone();
     }
 
     private static async Task<JsonDocument> ReadPacketAsync(Stream stream, CancellationToken token)
@@ -156,6 +162,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
     public void Dispose()
     {
         Bridge.Dispose();
+        smokeClient?.Dispose();
         browser?.Dispose(); // Leave Firefox alive to finish saving; never kill or delete its profile.
         owner?.Dispose();
     }

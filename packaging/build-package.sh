@@ -17,7 +17,6 @@ mkdir -p "$ROOT/build/package/KiTTY" "$ROOT/build/package/Runtime" "$ROOT/dist"
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "$ROOT/build/app"
 
 cp "$ROOT/build/app/KiTTYManager.exe" "$ROOT/build/package/"
-cp "$ROOT/FIREFOX-CONTAINERS-TEST.md" "$ROOT/build/package/"
 cp "$ROOT/downloads/kitty_portable-0.76.1.13.exe" "$ROOT/build/package/KiTTY/kitty.exe"
 cp "$ROOT/packaging/kitty.ini" "$ROOT/build/package/KiTTY/kitty.ini"
 cp "$ROOT/vendor/KITTY-LICENCE.TXT" "$ROOT/build/package/KiTTY/LICENCE.TXT"

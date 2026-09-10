@@ -7,6 +7,7 @@ const completed = new Map();
 let online = false;
 let lastError = "";
 let containerIds = {};
+let startupTabs = [];
 const ownOrigin = browser.runtime.getURL("");
 const bridgeRequest = r => r.url === KITTY.url &&
   [r.originUrl, r.documentUrl].some(u => u && u.startsWith(ownOrigin));
@@ -67,10 +68,21 @@ async function poll() {
             const id = containerIds[command.key];
             if (!routes.has(id)) throw new Error("Маршрут контейнера недоступен");
             await browser.tabs.create({url: command.url, cookieStoreId: id});
-          } catch (e) { error = String(e); }
+          } catch (e) { console.error("KiTTY container open", command.key, e); error = String(e); }
           completed.set(command.id, {id: command.id, error});
         }
         acknowledgements.push(completed.get(command.id));
+      }
+      if (acknowledgements.some(a => a.error === null)) {
+        // Close only our marked launcher tab, after a real tab exists.
+        // If the user already navigated it elsewhere, preserve that tab.
+        for (const tabId of startupTabs) {
+          try {
+            const tab = await browser.tabs.get(tabId);
+            if (tab.url === KITTY.startupUrl) await browser.tabs.remove(tabId);
+          } catch (_) { /* already closed */ }
+        }
+        startupTabs = [];
       }
       // Keep deduplication only for commands still awaiting acknowledgement.
       const pending = new Set(state.commands.map(c => c.id));
@@ -85,5 +97,6 @@ async function poll() {
 }
 (async () => {
   containerIds = (await browser.storage.local.get("containerIds")).containerIds || {};
+  startupTabs = (await browser.tabs.query({})).filter(t => t.url === KITTY.startupUrl).map(t => t.id);
   await poll();
 })();

@@ -25,6 +25,16 @@ internal sealed partial class SelfTestRunner
                 () => throw new Exception("Must not access the original profile again")));
             Equal("new data", File.ReadAllText(Path.Combine(profile, "logins.json")));
             Equal("initial", File.ReadAllText(Path.Combine(source, "logins.json")));
+            // Upgrade an already-created TEST profile which explicitly disabled WebRTC.
+            foreach (var name in new[] { "prefs.js", "user.js" })
+                File.WriteAllText(Path.Combine(profile, name), "user_pref(\"media.peerconnection.enabled\", false);\n");
+            FirefoxProfileWorkspace.ConfigureContainers(profile, 12340, 12341, 12342);
+            foreach (var name in new[] { "prefs.js", "user.js" })
+            {
+                var preferences = File.ReadAllText(Path.Combine(profile, name));
+                Equal(true, preferences.Contains("user_pref(\"media.peerconnection.enabled\", true);"));
+                Equal(false, preferences.Contains("user_pref(\"media.peerconnection.enabled\", false);"));
+            }
             using var bridge = new FirefoxContainerBridge();
             using var http = new HttpClient(new HttpClientHandler { UseProxy = false });
             var denied = await http.PostAsync(bridge.Url, new StringContent("{}"));
@@ -72,6 +82,7 @@ internal static class FirefoxContainerSmoke
             using var b = new FakePanel("B", direct.Port);
             using var browser = new FirefoxContainerBrowser();
             browser.Bridge.Trace = Console.WriteLine;
+            var failed = false;
             try
             {
                 await browser.StartAsync(executable, Path.Combine(root, "managed"),
@@ -81,6 +92,8 @@ internal static class FirefoxContainerSmoke
                     browser.Bridge.OpenAsync("a", "Test A", a.Port, "http://same.test/", CancellationToken.None),
                     browser.Bridge.OpenAsync("b", "Test B", b.Port, "http://same.test/", CancellationToken.None));
                 var results = await Task.WhenAll(a.Seen.Task, b.Seen.Task).WaitAsync(TimeSpan.FromSeconds(20));
+                if (await browser.TabCountForSmokeAsync() != 2)
+                    throw new Exception("Unexpected tab left over after opening two interfaces");
                 if (!results[0].Contains("after=flavor=A") || !results[1].Contains("after=flavor=B"))
                     throw new Exception("Cookie isolation failed: " + string.Join(" / ", results));
                 if (pass == 1 && (!results[0].Contains("before=flavor=A") || !results[1].Contains("before=flavor=B")))
@@ -98,9 +111,17 @@ internal static class FirefoxContainerSmoke
                 if (direct.Connections != 0) throw new Exception("Browser bypassed the container proxy");
                 Console.WriteLine($"PASS {pass + 1}: real Firefox, same domain, two SOCKS routes, isolated cookies, revoked route blocked, no direct loopback bypass after manager disconnect.");
             }
+            catch (Exception ex)
+            {
+                failed = true;
+                Console.Error.WriteLine("SMOKE FAILURE: " + ex);
+                throw;
+            }
             finally
             {
-                if (browser.IsRunning) await browser.CloseForSmokeAsync();
+                if (browser.IsRunning)
+                    try { await browser.CloseForSmokeAsync(); }
+                    catch (Exception ex) when (failed) { Console.Error.WriteLine("Smoke shutdown: " + ex.Message); }
             }
         }
         Console.WriteLine("PASS: cookies and container identities survived Firefox restart; original profile not re-read.");
