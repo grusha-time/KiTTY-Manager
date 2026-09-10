@@ -1,0 +1,7 @@
+---
+- name: Проверить переменные в роли локальной коллекции
+  ansible.builtin.assert:
+    that: sample_items | map(attribute='value') | sum == 87
+- name: Отметить выполнение роли коллекции
+  ansible.builtin.set_fact:
+    collection_verified: true

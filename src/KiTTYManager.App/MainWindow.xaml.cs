@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -44,11 +45,16 @@ public partial class MainWindow : Window
     private readonly JumphostProcessRegistry jumphostProcesses = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> jumphostStartupGates = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> accessScriptGates = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> backgroundAccessChecks = new();
     private LinkMapWindow? linkMapWindow;
+    private BatchTaskWindow? batchTaskWindow;
+    private readonly Dictionary<Guid, QuickDuplicateDialog> quickDuplicateWindows = [];
+    private bool batchExitPending;
     private bool configAvailable = true;
     private RequiredRouteOption[] requiredRouteOptions = [];
     private RequiredRouteOption? selectedRequiredRouteOption;
     private bool updatingRequiredRoutePicker;
+    private bool refreshingGroups;
     private readonly DispatcherTimer accessScriptAlarm = new()
         { Interval = TimeSpan.FromSeconds(30) };
     private readonly CancellationTokenSource accessScriptAlarmCancellation = new();
@@ -56,12 +62,13 @@ public partial class MainWindow : Window
     private bool accessScriptAlarmRerunRequested;
     private readonly HashSet<Guid> accessStartupPreflightCompleted = [];
     private readonly Dictionary<Guid, DateTimeOffset> accessPromptCancelledUtc = [];
-
+    private string? lastImportBackupPath;
     public MainWindow()
     {
         InitializeComponent();
         KittyRoutedSession.CleanupStaleFiles(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
         KittySessionWriter.RelocateLegacyBackups(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
+        WinScpCredentialFiles.CleanupStale(Path.Combine(dataDirectory, "Temp"), DateTime.UtcNow);
         configPath = Path.Combine(dataDirectory, "config.json");
         try { config = ConfigStore.Load(configPath, migratePlaintextSecrets: true); }
         catch (Exception ex)
@@ -92,7 +99,7 @@ public partial class MainWindow : Window
         };
         RefreshAll();
         accessScriptAlarm.Tick += AccessScriptAlarm_Tick;
-        Loaded += (_, _) =>
+        Loaded += async (_, _) =>
         {
             if (!configAvailable)
             {
@@ -101,9 +108,10 @@ public partial class MainWindow : Window
                 return;
             }
             ConfigureFirstCloseBehavior();
-            PromptForFirefoxTemplateProfile();
+            ValidateFirefoxProfile(showWarning: true);
             ShowPendingKittyConflicts();
             OfferDuplicateConsoleCleanup();
+            await OfferStartMissingJumphostsAsync();
             accessScriptAlarm.Start();
             _ = RunAccessScriptAlarmAsync();
         };
@@ -150,6 +158,7 @@ public partial class MainWindow : Window
             config.SchemaVersion = 7;
             changed = true;
         }
+        changed |= ManagerConfigMigration.UpgradeToVersion8(config);
         if (changed) SaveConfig();
     }
 
@@ -270,21 +279,31 @@ public partial class MainWindow : Window
         SaveConfig();
     }
 
-    private void PromptForFirefoxTemplateProfile()
+    private string FirefoxSourceProfile()
     {
-        if (config.FirefoxTemplateProfile.Length > 0) return;
-        if (ThemedMessageDialog.Show(this,
-                "Для корректной работы веб-интерфейсов укажите рабочий профиль Firefox (с отключённым чекбоксом «Отправлять DNS-запросы через прокси при использовании SOCKS 5»).\n\nКак найти: откройте Firefox, введите в адресную строку about:support и скопируйте путь из поля «Папка профиля».\n\nВыбрать папку профиля сейчас?",
-                "Профиль Firefox для веб-интерфейсов", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
-        var dialog = new System.Windows.Forms.FolderBrowserDialog
+        if (!config.AutoDiscoverFirefoxProfile) return config.FirefoxTemplateProfile;
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return FirefoxProfileWorkspace.DiscoverDefaultProfile(appData);
+    }
+
+    private bool ValidateFirefoxProfile(bool showWarning = false)
+    {
+        try
         {
-            Description = "Выберите папку рабочего профиля Firefox (about:support → «Папка профиля»)",
-            ShowNewFolderButton = false
-        };
-        if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
-        config.FirefoxTemplateProfile = dialog.SelectedPath;
-        SaveConfig();
-        Status($"Шаблон профиля Firefox: {config.FirefoxTemplateProfile}");
+            var sourceProfile = FirefoxSourceProfile();
+            FirefoxProfileWorkspace.ValidateSourceProfile(sourceProfile);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (showWarning)
+            {
+                ThemedMessageDialog.Show(this,
+                    ex.Message + "\n\nИсправьте профиль в настройках. Без исправного профиля сохранённые пароли и принятые риски сертификатов недоступны.",
+                    "Профиль Firefox", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            return false;
+        }
     }
 
     private void RefreshAll()
@@ -295,11 +314,32 @@ public partial class MainWindow : Window
 
     private void RefreshGroups()
     {
-        GroupTree.Items.Clear();
-        var query = GroupSearchBox?.Text.Trim() ?? "";
-        foreach (var group in config.Groups.OrderBy(g => g.Name))
-            if (query.Length == 0 || GroupMatches(group, query))
-                GroupTree.Items.Add(CreateGroupItem(group, query));
+        refreshingGroups = true;
+        try
+        {
+            GroupTree.Items.Clear();
+            var query = GroupSearchBox?.Text.Trim() ?? "";
+            foreach (var group in config.Groups.OrderBy(g => g.Name))
+                if (query.Length == 0 || GroupMatches(group, query))
+                    GroupTree.Items.Add(CreateGroupItem(group, query));
+            if (selectedGroup is not null)
+                SelectGroupTreeItem(GroupTree.Items, selectedGroup.Id);
+        }
+        finally { refreshingGroups = false; }
+    }
+
+    private static bool SelectGroupTreeItem(ItemCollection items, Guid groupId)
+    {
+        foreach (TreeViewItem item in items)
+        {
+            if (item.Tag is ServerGroup group && group.Id == groupId)
+            {
+                item.IsSelected = true;
+                return true;
+            }
+            if (SelectGroupTreeItem(item.Items, groupId)) return true;
+        }
+        return false;
     }
 
     private static TreeViewItem CreateGroupItem(ServerGroup group, string query = "", bool ancestorMatched = false)
@@ -400,8 +440,6 @@ public partial class MainWindow : Window
         ResetRequiredRoutePicker();
         StartJumphostButton.Visibility = config.BaseProxies.Any(proxy => proxy.Enabled && proxy.StartupServerId == server.Id)
             ? Visibility.Visible : Visibility.Collapsed;
-        SaveToKittyButton.Visibility = string.IsNullOrWhiteSpace(server.SourceSessionPath)
-            ? Visibility.Visible : Visibility.Collapsed;
         ScriptInfoText.Text = server.SourceScriptPath is not null
             ? server.SourceScriptPath
             : server.SourceScriptContent.Length > 0 ? "Встроенный login script из сессии KiTTY" : "Не указан";
@@ -415,7 +453,12 @@ public partial class MainWindow : Window
         else LastRouteText.Visibility = Visibility.Collapsed;
     }
 
-    private void GroupTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e) { selectedGroup = (e.NewValue as TreeViewItem)?.Tag as ServerGroup; RefreshSessions(); }
+    private void GroupTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+    {
+        if (refreshingGroups) return;
+        selectedGroup = (e.NewValue as TreeViewItem)?.Tag as ServerGroup;
+        RefreshSessions();
+    }
     private void ClearGroupFilter_Click(object sender, RoutedEventArgs e) { selectedGroup = null; ClearTreeSelection(GroupTree.Items); RefreshSessions(); }
     private static void ClearTreeSelection(ItemCollection items) { foreach (var value in items) if (value is TreeViewItem item) { item.IsSelected = false; ClearTreeSelection(item.Items); } }
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) { if (SessionsGrid is not null) RefreshSessions(); }
@@ -533,6 +576,7 @@ public partial class MainWindow : Window
         dragStartedOnRow = FindParent<DataGridRow>(e.OriginalSource as DependencyObject) is not null;
         if (dragStartedOnRow) SelectGridRowFromEvent(e);
     }
+    private void SessionsGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e) => SelectGridRowFromEvent(e);
     private void SessionsGrid_PreviewMouseMove(object sender, MouseEventArgs e)
     {
         if (!dragStartedOnRow || e.LeftButton != MouseButtonState.Pressed || SelectedRow() is not SessionRow row) return;
@@ -584,218 +628,11 @@ public partial class MainWindow : Window
         IReadOnlyList<ManagedServer> selectedServers,
         bool skipExistingLinks)
     {
-        if (config.BaseProxies.All(proxy => !proxy.Enabled))
-        {
-            Warn("Нет включённых точек входа. Назначьте сессию jumphost либо добавьте уже запущенный внешний SOCKS5.");
-            return;
-        }
-        var groupServers = selectedServers.DistinctBy(server => server.Id).ToArray();
-        if (groupServers.Length < 2) { Warn("Для проверки связей выберите хотя бы две сессии."); return; }
-        var allPairs = ConnectivityBatchPlanner.Pairs(groupServers);
-        var pairs = (skipExistingLinks
-            ? ConnectivityBatchPlanner.NewPairs(config, groupServers)
-            : allPairs).ToList();
-        var remoteAnchor = ConnectivityBatchPlanner.RemoteAnchor(config, groupServers);
-        var skippedCount = allPairs.Count - pairs.Count;
-        var attempts = pairs.Count;
-        var serverNames = string.Join("\n", pairs.Take(20).Select(pair => $"• {pair.A.Name} ↔ {pair.B.Name}"));
-        if (pairs.Count > 20) serverNames += $"\n…и ещё {pairs.Count - 20}";
-        if (skippedCount > 0) serverNames += $"\n\nПропущено уже сохранённых пар: {skippedCount}";
-        if (pairs.Count == 0)
-        {
-            Status(skipExistingLinks
-                ? "Между выбранными сессиями уже сохранены все возможные связи."
-                : "Нет пар для проверки.");
-            return;
-        }
-        if (ThemedMessageDialog.Show(this,
-                $"{scopeName}: {groupServers.Length} серверов.\nБудет проверено пар: {attempts}. При успехе связь сохраняется сразу в обоих направлениях; обратная проверка выполняется только после неудачи первой.\n\n{serverNames}\n\nНесколько неверных паролей могут вызвать блокировку. Начать?",
-                "Построение карты связей", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
-
-        if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return; }
-        using var cts = new CancellationTokenSource();
-        operationCancellation = cts;
-        var progressWindow = new LinkBuildingProgress
-        {
-            Owner = this,
-            CancelRequested = () =>
-            {
-                Status("Отменяю операцию…");
-                cts.Cancel();
-            }
-        };
-        progressWindow.Show();
-        HeaderPanel.IsEnabled = false;
-        WorkspacePanel.IsEnabled = false;
-        CancelOperationButton.IsEnabled = true;
-        CancelOperationButton.Visibility = Visibility.Visible;
-
-        // await (а не fire-and-forget), иначе `using var cts` уничтожится сразу
-        // после возврата обработчика и фоновая задача получит disposed CTS.
-        await Task.Run(async () =>
-        {
-            try
-            {
-                var startup = await Dispatcher.InvokeAsync(() =>
-                    EnsureManagedJumphostAsync(cts.Token, false, startAllAutoStart: true));
-                await startup;
-                var results = new System.Collections.Concurrent.ConcurrentBag<ConnectivityResult>();
-                var completed = 0;
-                var total = pairs.Count;
-                // Если до одного сервера группы уже известен рабочий внешний
-                // маршрут, открываем эту длинную цепочку один раз и из неё
-                // проверяем сразу всех соседей группы.
-                if (remoteAnchor is not null)
-                {
-                    var anchorTargets = pairs
-                        .Where(pair => pair.A.Id == remoteAnchor.Id || pair.B.Id == remoteAnchor.Id)
-                        .Select(pair => pair.A.Id == remoteAnchor.Id ? pair.B : pair.A)
-                        .DistinctBy(server => server.Id)
-                        .ToArray();
-                    if (anchorTargets.Length > 0)
-                    {
-                        await Dispatcher.InvokeAsync(() =>
-                            progressWindow.UpdateStatus(
-                                $"Открываю опорную сессию «{remoteAnchor.Name}» для {anchorTargets.Length} связей…",
-                                completed, total));
-                        try
-                        {
-                            var anchorPairs = anchorTargets
-                                .Select(target => (A: remoteAnchor, B: target)).ToArray();
-                            var anchorResults = await ConnectivityBatchExecutor.CheckPairsAsync(
-                                anchorPairs, CheckConnectivityBatchFromAsync, cts.Token);
-                            foreach (var result in anchorResults) results.Add(result);
-                            RouteLog($"Group anchor: source={remoteAnchor.Name}; targets=" +
-                                     string.Join(", ", anchorTargets.Select(server => server.Name)));
-                            foreach (var pair in anchorPairs.Where(pair => !anchorResults.Any(result =>
-                                         result.Success &&
-                                         ((result.SourceId == pair.A.Id && result.TargetId == pair.B.Id) ||
-                                          (result.SourceId == pair.B.Id && result.TargetId == pair.A.Id)))))
-                                ServerLinkPairPolicy.Invalidate(config, pair.A.Id, pair.B.Id);
-                            SaveLinkResults(anchorResults);
-                        }
-                        catch (OperationCanceledException) when (cts.IsCancellationRequested) { throw; }
-                        catch (Exception ex)
-                        {
-                            RouteLog($"Group anchor failed: source={remoteAnchor.Name}; " +
-                                     $"error={ex.GetType().Name}: {ex.Message}");
-                        }
-                    }
-                }
-
-                var remainingPairs = ConnectivityBatchPlanner.UnsuccessfulPairs(pairs, results);
-                completed = pairs.Count - remainingPairs.Count;
-                // Опорные пары должны успеть сохранить найденные маршруты до
-                // проверки зависимых. Уже найденные опорной сессией не повторяем.
-                var stages = ConnectivityBatchPlanner.DependencyStages(
-                    config, groupServers, remainingPairs);
-                foreach (var stage in stages)
-                {
-                    var stageResults = await ConnectivityBatchExecutor.CheckPairsAsync(
-                        stage, CheckConnectivityBatchFromAsync, cts.Token);
-                    foreach (var result in stageResults) results.Add(result);
-                    foreach (var pair in stage.Where(pair => !stageResults.Any(result =>
-                                 result.Success &&
-                                 ((result.SourceId == pair.A.Id && result.TargetId == pair.B.Id) ||
-                                  (result.SourceId == pair.B.Id && result.TargetId == pair.A.Id)))))
-                        ServerLinkPairPolicy.Invalidate(config, pair.A.Id, pair.B.Id);
-                    SaveLinkResults(stageResults);
-                    completed += stage.Count;
-                    await Dispatcher.InvokeAsync(() => progressWindow.UpdateStatus(
-                        $"Проверено {completed}/{total}: пакет из {stage.Count} связей",
-                        completed, total));
-                }
-
-                // Если в начале ни один сервер ещё не был известен как прямой,
-                // пары могли стартовать одновременно. Успех соседних пар уже
-                // открыл новые маршруты; один раз допроверяем только оставшиеся
-                // неуспешные пары, не повторяя найденные связи.
-                var unresolved = ConnectivityBatchPlanner.UnsuccessfulPairs(pairs, results);
-                if (unresolved.Count > 0 && unresolved.Count < pairs.Count)
-                {
-                    await Dispatcher.InvokeAsync(() =>
-                        progressWindow.UpdateStatus(
-                            $"Допроверяю {unresolved.Count} пар через только что найденные связи…",
-                            completed, total));
-                    foreach (var pair in unresolved)
-                    {
-                        cts.Token.ThrowIfCancellationRequested();
-                        var forwardTested = results.Any(result =>
-                            result.SourceId == pair.A.Id && result.TargetId == pair.B.Id &&
-                            result.Strategy != "SOURCE_UNREACHABLE");
-                        var reverseTested = results.Any(result =>
-                            result.SourceId == pair.B.Id && result.TargetId == pair.A.Id &&
-                            result.Strategy != "SOURCE_UNREACHABLE");
-                        if (forwardTested && reverseTested) continue;
-                        var retrySource = !forwardTested ? pair.A : pair.B;
-                        var retryTarget = !forwardTested ? pair.B : pair.A;
-                        try
-                        {
-                            RouteLog($"Pair retry after new route: reach source={retrySource.Name}; direction={retrySource.Name}->{retryTarget.Name}");
-                            var retry = await ssh.CheckFromAsync(config, retrySource.Id,
-                                [retryTarget.Id], cts.Token);
-                            foreach (var result in retry) results.Add(result);
-                            SaveLinkResults(retry);
-                        }
-                        catch (Exception ex) when (ex is not OperationCanceledException)
-                        {
-                            results.Add(new ConnectivityResult(retryTarget.Id, false,
-                                ex.Message, TimeSpan.Zero, "SOURCE_UNREACHABLE", SourceId: retrySource.Id));
-                        }
-                    }
-                }
-
-                var resultList = results.ToList();
-
-                var pairResultsList = new List<(ManagedServer A, ManagedServer B, bool Found, string? Failure)>();
-                foreach (var (serverA, serverB) in pairs)
-                {
-                    var forward = resultList.FirstOrDefault(r => r.SourceId == serverA.Id && r.TargetId == serverB.Id);
-                    var reverse = resultList.FirstOrDefault(r => r.SourceId == serverB.Id && r.TargetId == serverA.Id);
-                    // Успех считаем по любому прохождению направления (пару могли
-                    // проверить несколько раз из-за повторных проходов).
-                    var found = resultList.Any(r => r.SourceId == serverA.Id && r.TargetId == serverB.Id && r.Success) ||
-                                resultList.Any(r => r.SourceId == serverB.Id && r.TargetId == serverA.Id && r.Success);
-                    string? failure = null;
-                    if (!found)
-                    {
-                        var forwardMsg = forward is not null ? $"{serverA.Name} → {serverB.Name}: {forward.Message}" : null;
-                        var reverseMsg = reverse is not null ? $"{serverB.Name} → {serverA.Name}: {reverse.Message}" : null;
-                        failure = string.Join(Environment.NewLine, new[] { forwardMsg, reverseMsg }.Where(m => m is not null));
-                    }
-                    pairResultsList.Add((serverA, serverB, found, failure));
-                }
-
-                var successful = pairResultsList.Count(r => r.Found);
-                var failedPairs = pairResultsList.Where(r => !r.Found).Take(12).Select(r => $"✗ {r.A.Name} ↔ {r.B.Name}:{Environment.NewLine}{r.Failure}");
-                var failureText = string.Join(Environment.NewLine, failedPairs);
-                if (pairResultsList.Count - successful > 12) failureText += $"\n…и ещё {pairResultsList.Count - successful - 12}";
-
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    EndProgressOperation(cts, progressWindow);
-                    ThemedMessageDialog.Show(this,
-                        $"Пар проверено: {pairResultsList.Count}\nСвязи найдены: {successful}\nНедоступно: {pairResultsList.Count - successful}" +
-                        (failureText.Length == 0 ? "" : $"\n\n{RedactSecrets(failureText)}"),
-                        "Карта SSH-связей", MessageBoxButton.OK,
-                        successful == pairResultsList.Count ? MessageBoxImage.Information : MessageBoxImage.Warning);
-                });
-            }
-            catch (OperationCanceledException) { /* user cancelled */ }
-            catch (Exception ex)
-            {
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    EndProgressOperation(cts, progressWindow);
-                    Error(ex);
-                });
-            }
-            finally
-            {
-                await Dispatcher.InvokeAsync(() =>
-                    EndProgressOperation(cts, progressWindow));
-            }
-        });
+        var initialIds = selectedServers.Select(server => server.Id).ToArray();
+        var dialog = new ConnectivityPairSelectionDialog(config, initialIds, skipExistingLinks)
+            { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        await RunDirectedConnectivityAsync(scopeName, dialog.SelectedPairs);
     }
 
     private void DeleteGroupLinks_Click(object sender, RoutedEventArgs e)
@@ -825,7 +662,13 @@ public partial class MainWindow : Window
     }
     private static IEnumerable<ManagedServer> AllNestedServers(ServerGroup group) => group.Servers.Concat(group.Groups.SelectMany(AllNestedServers));
 
-    private void CreateSession_Click(object sender, RoutedEventArgs e) { var server = new ManagedServer(); config.UngroupedServers.Add(server); SaveAndRefresh(); ShowServer(server); }
+    private void CreateSession_Click(object sender, RoutedEventArgs e)
+    {
+        var server = new ManagedServer();
+        config.UngroupedServers.Add(server);
+        SaveConfig();
+        SelectServerFromLinkMap(server.Id);
+    }
     private void DuplicateSession_Click(object sender, RoutedEventArgs e)
     {
         var source = selectedServer ?? SelectedRow()?.Server;
@@ -835,12 +678,117 @@ public partial class MainWindow : Window
         SaveAndRefresh();
         Status($"Создана сессия «{copy.Name}»");
     }
+    private void QuickDuplicateSession_Click(object sender, RoutedEventArgs e)
+    {
+        var source = selectedServer ?? SelectedRow()?.Server;
+        if (source is null) { Warn("Сначала выберите сессию."); return; }
+        if (quickDuplicateWindows.TryGetValue(source.Id, out var existing))
+        {
+            if (existing.WindowState == WindowState.Minimized) existing.WindowState = WindowState.Normal;
+            existing.Activate();
+            return;
+        }
+        var dialog = new QuickDuplicateDialog(config, source) { Owner = this };
+        quickDuplicateWindows[source.Id] = dialog;
+        dialog.Closed += (_, _) => quickDuplicateWindows.Remove(source.Id);
+        dialog.Saved += async (_, _) => await SaveQuickDuplicateAsync(dialog, source.Id);
+        dialog.Show();
+    }
+
+    private async Task SaveQuickDuplicateAsync(QuickDuplicateDialog dialog, Guid sourceId)
+    {
+        var source = config.FindServer(sourceId);
+        if (source is null)
+        {
+            Warn("Исходная сессия была удалена. Быстрый дубль не сохранён.");
+            return;
+        }
+        var copy = dialog.Draft;
+        ManagedServerDuplicator.RefreshQuickDuplicateName(config, source, copy, dialog.InitiallyGeneratedName);
+        var selectedIds = dialog.SelectedServerIds.Where(id => id != copy.Id).Distinct().ToArray();
+        ManagedServerDuplicator.AddToSourceGroup(config, source, copy);
+        SaveAndRefresh();
+        ShowServer(copy);
+        Status($"Создан быстрый дубль «{copy.Name}»");
+        if (selectedIds.Length > 0) await BuildQuickDuplicateLinksAsync(copy, selectedIds);
+    }
+
+    private async Task BuildQuickDuplicateLinksAsync(ManagedServer copy, IReadOnlyList<Guid> sourceIds)
+    {
+        if (operationCancellation is not null) { Status("Дубль сохранён. Дождитесь завершения текущей операции, чтобы построить связи."); return; }
+        if (config.BaseProxies.All(proxy => !proxy.Enabled)) { Warn("Дубль сохранён, но нет включённых точек входа для построения связей."); return; }
+        using var cts = new CancellationTokenSource();
+        operationCancellation = cts;
+        var progress = new LinkBuildingProgress { Owner = this, CancelRequested = () => cts.Cancel() };
+        progress.Show(); HeaderPanel.IsEnabled = false; WorkspacePanel.IsEnabled = false;
+        CancelOperationButton.IsEnabled = true; CancelOperationButton.Visibility = Visibility.Visible;
+        var successful = 0; var failed = 0; var completed = 0;
+        var successfulNames = new List<string>();
+        var failedDetails = new List<string>();
+        var showSummary = false;
+        var cancelled = false;
+        try
+        {
+            await EnsureManagedJumphostAsync(cts.Token, false, startAllAutoStart: true);
+            foreach (var sourceId in sourceIds)
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                var source = config.FindServer(sourceId);
+                if (source is null) continue;
+                progress.UpdateStatus($"{source.Name} → {copy.Name}  •  успешно: {successful}, ошибок: {failed}", completed, sourceIds.Count);
+                var results = await CheckConnectivityBatchFromAsync(sourceId, [copy.Id], cts.Token);
+                var result = results.FirstOrDefault(item => item.SourceId == sourceId && item.TargetId == copy.Id);
+                if (result is not null && result.Success)
+                {
+                    ServerLinkPairPolicy.RememberDirectedSuccess(config, result, DateTimeOffset.UtcNow);
+                    successful++;
+                    successfulNames.Add($"{source.Name} → {copy.Name}");
+                }
+                else
+                {
+                    failed++;
+                    var reason = result?.Message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+                    failedDetails.Add($"{source.Name} → {copy.Name}: " +
+                        (string.IsNullOrWhiteSpace(reason) ? "связь не подтверждена" : reason));
+                }
+                completed++; SaveConfig();
+                var failureText = failedDetails.Count == 0 ? "" :
+                    $"\nНеуспешно: {string.Join(", ", failedDetails.TakeLast(5).Select(item => item.Split(':')[0]))}";
+                progress.UpdateStatus($"Проверено: {completed}/{sourceIds.Count}  •  успешно: {successful}, ошибок: {failed}{failureText}", completed, sourceIds.Count);
+            }
+            Status($"Связи к «{copy.Name}»: успешно {successful}, ошибок {failed}.");
+            showSummary = true;
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            cancelled = true;
+            showSummary = true;
+            Status($"Проверка остановлена. Дубль сохранён; подтверждено связей: {successful}.");
+        }
+        catch (Exception ex)
+        { RouteLog($"Quick duplicate links failed: duplicate={copy.Name}; error={ex.GetType().Name}: {ex.Message}"); Error(ex); }
+        finally { EndProgressOperation(cts, progress); }
+        if (showSummary)
+        {
+            var successText = successfulNames.Count == 0 ? "—" :
+                string.Join(Environment.NewLine, successfulNames.Select(name => $"✓ {name}"));
+            var failureText = failedDetails.Count == 0 ? "—" :
+                string.Join(Environment.NewLine, failedDetails.Select(item => $"✗ {item}"));
+            ThemedMessageDialog.Show(this,
+                $"{(cancelled ? "Проверка остановлена пользователем.\n" : "")}Проверено направлений: {completed} из {sourceIds.Count}\n" +
+                $"Успешно: {successful}\nНеуспешно: {failed}\n\nУспешные:\n{RedactSecrets(successText)}\n\nНеуспешные:\n{RedactSecrets(failureText)}",
+                "Результат связей быстрого дубля", MessageBoxButton.OK,
+                !cancelled && failed == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+        }
+    }
     private void MoveToUngrouped_Click(object sender, RoutedEventArgs e) { if (SelectedRow() is SessionRow row) { config.MoveServerToGroup(row.Server.Id, null); SaveAndRefresh(); } }
     private void SessionsGrid_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
         var row = SelectedRow();
         var inGroup = row is not null && config.FindServerGroup(row.Server.Id) is not null;
         MoveToUngroupedItem.Visibility = inGroup ? Visibility.Visible : Visibility.Collapsed;
+        SaveToKittyMenuItem.Visibility = row is not null && string.IsNullOrWhiteSpace(row.Server.SourceSessionPath)
+            ? Visibility.Visible : Visibility.Collapsed;
     }
     private void DeleteSession_Click(object sender, RoutedEventArgs e) { if (SelectedRow() is not SessionRow row || ThemedMessageDialog.Show(this, $"Удалить «{row.Name}» только из менеджера? Исходная сессия KiTTY останется.", "Удаление", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return; config.RemoveServer(row.Server.Id); if (selectedServer?.Id == row.Server.Id) selectedServer = null; SaveAndRefresh(); }
 
@@ -919,7 +867,7 @@ public partial class MainWindow : Window
     private void AddBackupEndpoint_Click(object sender, RoutedEventArgs e)
     {
         if (selectedServer is null) { Warn("Сначала выберите сессию."); return; }
-        selectedServer.BackupEndpoints.Add(new ServerEndpoint());
+        selectedServer.BackupEndpoints.Add(new ServerEndpoint("", 22));
         BackupGrid.ItemsSource = null; BackupGrid.ItemsSource = selectedServer.BackupEndpoints;
     }
     private void RemoveBackupEndpoint_Click(object sender, RoutedEventArgs e)
@@ -982,12 +930,13 @@ public partial class MainWindow : Window
     };
     private void SaveToKitty_Click(object sender, RoutedEventArgs e)
     {
-        if (selectedServer is null) { Warn("Сначала выберите сессию."); return; }
+        var server = SelectedRow()?.Server ?? selectedServer;
+        if (server is null) { Warn("Сначала выберите сессию."); return; }
         try
         {
-            ApplyKittyProperties(selectedServer, KittySessionWriter.WritableProperties);
+            ApplyKittyProperties(server, KittySessionWriter.WritableProperties);
             SaveAndRefresh();
-            Status($"Сессия «{selectedServer.Name}» сохранена в KiTTY");
+            Status($"Сессия «{server.Name}» сохранена в KiTTY");
         }
         catch (Exception ex) { Error(ex); }
     }
@@ -1077,11 +1026,81 @@ public partial class MainWindow : Window
         await OpenRoutedConsoleAsync(server);
     }
 
+    private async void OpenWinScp_Click(object sender, RoutedEventArgs e)
+    {
+        var server = SelectedRow()?.Server ?? selectedServer;
+        if (server is null || BlockIfOperationRunning()) return;
+        var winScp = FindWinScp();
+        if (winScp is null)
+        {
+            Warn("WinSCP.exe не найден. Укажите путь в настройках.");
+            return;
+        }
+        try
+        {
+            ssh.ClearFailureCache();
+            var route = await Connect(server, CancellationToken.None, true);
+            try
+            {
+                var info = new ProcessStartInfo(winScp)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(winScp)!,
+                    UseShellExecute = false
+                };
+                foreach (var argument in WinScpLaunchPlan.BuildArguments(server, route.LocalSshPort,
+                             server.Password, server.PrivateKeyPassphrase))
+                    info.ArgumentList.Add(argument);
+                var process = Process.Start(info) ?? throw new IOException("WinSCP не вернула процесс.");
+                Status($"WinSCP открыта для «{server.Name}»");
+                _ = ReleaseRouteAfterExitAsync(process, route);
+            }
+            catch
+            {
+                ReleaseRoute(route);
+                throw;
+            }
+        }
+        catch (Exception ex) { Error(ex); }
+    }
+
+    private string? FindWinScp()
+    {
+        return WinScpLaunchPlan.FindExecutable(config.WinScpPath, AppContext.BaseDirectory,
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86));
+    }
+
+    private async Task ReleaseRouteAfterExitAsync(Process process, ActiveRoute route, IDisposable? cleanup = null)
+    {
+        try
+        {
+            await process.WaitForExitAsync();
+            // WinSCP передаёт сессию уже открытому экземпляру и сразу завершается,
+            // поэтому маршрут держим, пока жив хотя бы один процесс WinSCP —
+            // иначе файл с паролем удалялся до того, как WinSCP его читал.
+            while (AnyWinScpRunning())
+                await Task.Delay(TimeSpan.FromSeconds(3));
+        }
+        catch { }
+        finally
+        {
+            process.Dispose();
+            cleanup?.Dispose();
+            await Dispatcher.InvokeAsync(() => ReleaseRoute(route));
+        }
+    }
+
+    private static bool AnyWinScpRunning()
+    {
+        try { return Process.GetProcessesByName("WinSCP").Length > 0; }
+        catch { return false; }
+    }
+
     private bool BlockIfOperationRunning()
     {
         if (operationCancellation is null) return false;
         ThemedMessageDialog.Show(this,
-            "Сейчас идёт проверка связей — подключение недоступно.\nЕсли нужно подключиться, отмените проверку кнопкой «Отмена».",
+            "Сейчас идёт проверка связей — подключение недоступно.\nЕсли нужно подключиться, остановите проверку кнопкой «Остановить».",
             "Идёт проверка связей", MessageBoxButton.OK, MessageBoxImage.Information);
         return true;
     }
@@ -1091,7 +1110,13 @@ public partial class MainWindow : Window
         CancellationToken externalCancellationToken = default)
     {
         if (BlockIfOperationRunning()) return;
-        var keyPath = ManagerPathResolver.ResolveOptionalFile(server.PrivateKeyPath, "SSH-ключ");
+        var keyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
+        if (ManagerPathResolver.MissingConfiguredFileMessage(
+                server.PrivateKeyPath, "SSH-ключ") is { } missingKeyMessage)
+        {
+            Warn(missingKeyMessage);
+            return;
+        }
         var key = PrivateKeyInspector.Inspect(keyPath ?? "");
         if (key.Encrypted == true && server.PrivateKeyPassphrase.Length == 0)
         {
@@ -1226,16 +1251,51 @@ public partial class MainWindow : Window
             Process? tunnel = null;
             KittyRoutedSession? routedSession = null;
             KittyLoginScript? loginScript = null;
-            ResolvingHttpProxy? resolver = null;
+            ResolvingSocks5Relay? resolver = null;
             string? profile = null;
-            var temporaryProfile = config.TemporaryFirefoxProfiles;
+            Task<string>? profilePreparation = null;
+            var handedOff = false;
             try
             {
-                var resolverMappings = config.UseInternalWebResolver
-                    ? WebResolverMappingPlan.Build(server)
-                    : [];
-                route = await Connect(server, cancellationToken, true);
+                if (!ValidateFirefoxProfile(showWarning: true)) return;
                 var webPort = SelectFreeLoopbackPort();
+                var originalDestination = new Uri(web.Url);
+                var useInternalResolver = !string.IsNullOrWhiteSpace(web.ResolverAddress) &&
+                    !System.Net.IPAddress.TryParse(originalDestination.Host, out _);
+                if (useInternalResolver && !System.Net.IPAddress.TryParse(web.ResolverAddress.Trim(), out _))
+                    throw new InvalidOperationException($"Для веб-интерфейса «{web.Name}» укажите IP в поле «Адрес DNS».");
+                var destination = useInternalResolver
+                    ? originalDestination
+                    : await ResolveWebDestinationAsync(originalDestination, cancellationToken);
+                var resolverMappings = new List<KeyValuePair<string, string>>();
+                if (useInternalResolver)
+                {
+                    resolverMappings.Add(new(originalDestination.DnsSafeHost, web.ResolverAddress.Trim()));
+                    resolverMappings.Add(new("127.0.0.1", web.ResolverAddress.Trim()));
+                }
+                foreach (var pair in WebResolverMappingPlan.Build(server))
+                {
+                    if (!resolverMappings.Any(m => string.Equals(m.Key, pair.Key, StringComparison.OrdinalIgnoreCase)))
+                        resolverMappings.Add(pair);
+                }
+                resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings);
+                var browserProxyPort = resolver.Port;
+                profilePreparation = Task.Run(() =>
+                {
+                    var sourceProfile = FirefoxSourceProfile();
+                    RouteLog($"Firefox source profile: {sourceProfile}");
+                    var prepared = FirefoxProfileWorkspace.Create(FirefoxRuntimeRoot, server.Id, web.Id, sourceProfile);
+                    try
+                    {
+                        FirefoxProfileWorkspace.ApplyPreferences(prepared, browserProxyPort,
+                            useInternalResolver,
+                            useInternalResolver ? [originalDestination.DnsSafeHost] : null);
+                        RouteLog($"Firefox runtime profile: {FirefoxProfileWorkspace.StateSummary(prepared)}");
+                        return prepared;
+                    }
+                    catch { TryDeleteDirectory(prepared); throw; }
+                }, cancellationToken);
+                route = await Connect(server, cancellationToken, true);
                 var loadSavedSession = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
                                        File.Exists(server.SourceSessionPath);
                 var kitty = loadSavedSession
@@ -1289,74 +1349,79 @@ public partial class MainWindow : Window
                     loginScript = null;
                 }
 
-                var originalDestination = new Uri(web.Url);
-                var destination = config.UseInternalWebResolver
-                    ? originalDestination
-                    : await ResolveWebDestinationAsync(originalDestination, cancellationToken);
-                if (config.UseInternalWebResolver)
-                    resolver = new ResolvingHttpProxy("127.0.0.1", webPort,
-                        resolverMappings, message => RouteLog($"Web resolver: {message}"));
-                var browserProxyPort = resolver?.Port ?? webPort;
-                var probe = resolver is null
-                    ? await ProbeThroughSocksAsync("127.0.0.1", browserProxyPort, destination,
-                        TimeSpan.FromSeconds(8), cancellationToken)
-                    : await ProbeThroughHttpProxyAsync("127.0.0.1", browserProxyPort, destination,
-                        TimeSpan.FromSeconds(8), cancellationToken);
-                RouteLog($"Web destination probe: session={server.Name}; engine=kitty; exit=target; socks=127.0.0.1:{browserProxyPort}; resolver={(resolver is null ? "system" : "internal")}; destination={destination.Host}:{destination.Port}; result={(probe.Success ? "PASS" : "FAIL")}; detail={probe.Detail}");
+                var probeDestination = useInternalResolver
+                    ? new UriBuilder(originalDestination) { Host = "127.0.0.1" }.Uri
+                    : destination;
+                var probe = await ProbeThroughSocksAsync("127.0.0.1", browserProxyPort, probeDestination,
+                    TimeSpan.FromSeconds(8), cancellationToken);
+                RouteLog($"Web destination probe: session={server.Name}; engine=kitty; exit=target; proxy=127.0.0.1:{browserProxyPort}; resolver={(useInternalResolver ? "internal" : "system")}; destination={destination.Host}:{destination.Port}; result={(probe.Success ? "PASS" : "FAIL")}; detail={probe.Detail}");
                 if (!probe.Success)
                     throw new IOException("KiTTY-туннель конечной сессии не смог открыть указанный веб-адрес. Подробности записаны в журнал.");
 
                 var firefox = ResolveProgram(config.FirefoxPath);
-                if (config.UseInternalWebResolver)
-                    FirefoxProfileWorkspace.RemoveLegacyAutoConfig(firefox);
-                var templateProfile = config.FirefoxTemplateProfile.Length > 0 ? config.FirefoxTemplateProfile : null;
-                while (true)
-                {
-                    try
-                    {
-                        profile = temporaryProfile
-                            ? FirefoxProfileWorkspace.Create(FirefoxRuntimeRoot, server.Id, web.Id, templateProfile)
-                            : FirefoxProfileWorkspace.Persistent(FirefoxPersistentRoot, FirefoxProfileKey(server));
-                        break;
-                    }
-                    catch (FirefoxProfileLockedException lockEx)
-                    {
-                        var retry = await Dispatcher.InvokeAsync(() =>
-                            ThemedMessageDialog.Show(this,
-                                $"Firefox, из которого копируется шаблон профиля, сейчас запущен.\n\n" +
-                                $"Путь профиля: {lockEx.TemplateProfilePath}\n\n" +
-                                "Закройте этот Firefox и нажмите «Повторить».\n" +
-                                "Или нажмите «Отмена», чтобы не открывать веб-интерфейс.",
-                                "Шаблон профиля заблокирован",
-                                MessageBoxButton.OKCancel, MessageBoxImage.Warning) == MessageBoxResult.OK);
-                        if (!retry) return;
-                    }
-                }
-                FirefoxProfileWorkspace.ApplyPreferences(profile, browserProxyPort,
-                    config.UseInternalWebResolver, resolverMappings.Select(mapping => mapping.Key));
+                FirefoxProfileWorkspace.RemoveLegacyAutoConfig(firefox);
+                profile = await profilePreparation;
                 // Small delay ensures the profile files are fully committed to
                 // disk before Firefox reads them (Windows file system caching).
                 await Task.Delay(150, cancellationToken);
-                RouteLog($"Web SOCKS destination ready: session={server.Name}; engine=kitty; port={browserProxyPort}; resolver={(resolver is null ? "system" : "internal")}; profile={profile}; url={web.Url}");
+                RouteLog($"Web destination ready: session={server.Name}; engine=kitty; proxy=127.0.0.1:{browserProxyPort}; resolver={(useInternalResolver ? "internal" : "system")}; profile={profile}; url={web.Url}");
                 var browserStart = new ProcessStartInfo(firefox)
                     { WorkingDirectory = Path.GetDirectoryName(firefox)! };
+                // The runtime profile is disposable; a crash dump from it would
+                // only produce a "report Firefox crash" dialog for the user.
+                browserStart.Environment["MOZ_CRASHREPORTER_DISABLE"] = "1";
                 foreach (var argument in FirefoxProfileWorkspace.LaunchArguments(profile, web.Url))
                     browserStart.ArgumentList.Add(argument);
                 var browser = Process.Start(browserStart)
                     ?? throw new IOException("Firefox не вернул запущенный процесс.");
-                browser.EnableRaisingEvents = true;
-                RouteLog($"Web cleanup: registered for Firefox pid={browser.Id}, tunnel pid={tunnel.Id}");
-                _ = CleanupWebSessionAfterExitAsync(browser, tunnel, route, resolver, profile, temporaryProfile);
-                tunnel = null; route = null; resolver = null; profile = null;
+                // The browser owns the profile from the moment it starts: any
+                // later failure in this block must not delete the directory
+                // out from under the running process.
+                handedOff = true;
+                try
+                {
+                    browser.EnableRaisingEvents = true;
+                    RouteLog($"Web cleanup: registered for Firefox pid={browser.Id}, tunnel pid={tunnel.Id}");
+                    _ = CleanupWebSessionAfterExitAsync(browser, tunnel, route, resolver, profile)
+                        .ContinueWith(t => RouteLog($"Web cleanup failed: {t.Exception?.GetBaseException().Message}"),
+                            TaskContinuationOptions.OnlyOnFaulted);
+                }
+                catch
+                {
+                    handedOff = false;
+                    StopProcess(browser);
+                    throw;
+                }
             }
             finally
             {
                 routedSession?.Dispose();
                 loginScript?.Dispose();
-                if (resolver is not null) await resolver.DisposeAsync();
-                if (tunnel is not null) StopProcess(tunnel);
-                if (route is not null) ReleaseRoute(route);
-                if (profile is not null) TryDeleteDirectory(profile);
+                if (profile is null && profilePreparation is { IsFaulted: true })
+                    RouteLog($"Firefox profile preparation failed: {profilePreparation.Exception?.GetBaseException().Message}");
+                if (!handedOff)
+                {
+                    if (resolver is not null) await resolver.DisposeAsync();
+                    if (tunnel is not null) StopProcess(tunnel);
+                    if (route is not null) ReleaseRoute(route);
+                    if (WebSessionCleanupPolicy.ShouldDeletePreparedProfile(
+                            handedOff, profile is not null,
+                            profilePreparation is { IsCompletedSuccessfully: true }))
+                    {
+                        if (profile is not null) TryDeleteDirectory(profile);
+                        else if (profilePreparation is { IsCompletedSuccessfully: true })
+                            TryDeleteDirectory(profilePreparation.Result);
+                    }
+                    else if (profilePreparation is { IsCompleted: false } pendingPreparation)
+                    {
+                        // The copy is still in flight; delete its result as
+                        // soon as it lands so a failed startup leaks nothing.
+                        _ = pendingPreparation.ContinueWith(t =>
+                        {
+                            if (t.Status == TaskStatus.RanToCompletion) TryDeleteDirectory(t.Result);
+                        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                    }
+                }
             }
         });
     }
@@ -1365,8 +1430,6 @@ public partial class MainWindow : Window
         ManagedServer server, CancellationToken cancellationToken, bool consoleOnly = false,
         Guid? forcedViaServerId = null)
     {
-        // Пользовательское подключение всегда важнее устаревшей фоновой проверки.
-        backgroundRouteProbes.Cancel(server.Id);
         if (!server.TryDirectWithoutJumphost && config.BaseProxies.All(p => !p.Enabled))
             throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
         if (forcedViaServerId is Guid requestedViaId)
@@ -1433,8 +1496,8 @@ public partial class MainWindow : Window
                          $"{config.FindServer(successfulViaId)?.Name ?? successfulViaId.ToString()}; " +
                          $"route={RouteLabel(result.Candidate)}");
             if (forcedViaServerId is null && consoleOnly &&
-                RoutePreferencePolicy.BetterCandidates(ranked, result.Candidate).Count > 0)
-                ScheduleBetterRouteProbe(server, ranked, result.Candidate);
+                RoutePreferencePolicy.BetterCandidates(candidates, result.Candidate).Count > 0)
+                ScheduleBetterRouteProbe(server, candidates, result.Candidate);
             else if (forcedViaServerId is null && consoleOnly && server.TryDirectWithoutJumphost &&
                      !result.Candidate.WithoutProxy)
                 ScheduleDirectRouteProbe(server, result.Candidate);
@@ -1490,6 +1553,59 @@ public partial class MainWindow : Window
                 continue;
             }
 
+            // Если текущий кандидат многопереходный, а в списке есть более короткие непроверенные
+            // кандидаты (например, прямой 1-хоп), запускаем их параллельную проверку.
+            if (candidate.Servers.Count > 1 && !racedCandidates.Contains(candidate))
+            {
+                var shorter = candidates
+                    .Where(item => !racedCandidates.Contains(item) &&
+                                   !ReferenceEquals(item, candidate) &&
+                                   item.Servers.Count < candidate.Servers.Count)
+                    .OrderBy(item => item.Servers.Count)
+                    .FirstOrDefault();
+
+                if (shorter is not null)
+                {
+                    var shorterReady = shorter.WithoutProxy ||
+                        (proxyReady.TryGetValue(shorter.Proxy.Id, out var pr)
+                            ? pr
+                            : await IsSocks5ReadyAsync(shorter.Proxy, TimeSpan.FromSeconds(1), cancellationToken));
+
+                    if (shorterReady)
+                    {
+                        racedCandidates.Add(candidate);
+                        racedCandidates.Add(shorter);
+                        try
+                        {
+                            Status($"Параллельно проверяю короткий путь «{RouteLabel(shorter)}» и текущий «{RouteLabel(candidate)}» для «{server.Name}»…");
+                            RouteLog($"Shorter route race started: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}");
+                            var raced = await ssh.ConnectFirstSuccessfulAsync(
+                                config, [shorter, candidate], cancellationToken, consoleOnly);
+                            if (ReferenceEquals(raced.Candidate, shorter))
+                                RouteLog($"Shorter route race WON: target={server.Name}; winner={RouteLabel(shorter)}");
+                            else
+                                RouteLog($"Primary candidate finished first: target={server.Name}; winner={RouteLabel(candidate)}");
+                            return CompleteRoute(raced);
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                        catch (Exception raceError)
+                        {
+                            errors.Add(raceError);
+                            var failedHops = ExceptionChain(raceError).OfType<SshHopException>()
+                                .DistinctBy(h => (h.SourceId, h.TargetId)).ToArray();
+                            if (failedHops.Length > 0)
+                            {
+                                foreach (var hop in failedHops)
+                                    ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
+                                SaveConfig();
+                            }
+                            RouteLog($"Shorter route race failed: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}; error={raceError.GetType().Name}: {raceError.Message}");
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if (config.RaceBestEntryPoints && !candidate.WithoutProxy && !raceAttempted &&
                 !sequentialPriority.Contains(candidate) && candidate.Servers.Count == 1)
             {
@@ -1514,6 +1630,11 @@ public partial class MainWindow : Window
                     catch (Exception error)
                     {
                         errors.Add(error);
+                        if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
+                        {
+                            ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
+                            SaveConfig();
+                        }
                         RouteLog($"Entry point race failed: target={server.Name}; routes={RouteLabel(candidate)} | {RouteLabel(second)}; error={error.GetType().Name}: {error.Message}");
                         continue;
                     }
@@ -1531,9 +1652,16 @@ public partial class MainWindow : Window
             catch (Exception error)
             {
                 errors.Add(error);
+                if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
+                {
+                    ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
+                    SaveConfig();
+                }
                 var detail = string.Join(" --> ", ExceptionChain(error).Select(e => $"{e.GetType().Name}: {e.Message}"));
                 RouteLog($"Route failed: target={server.Name}; route={RouteLabel(candidate)}; " +
                          $"error={detail}");
+                if (forcedViaServerId is null && server.PreferredRoute?.ProxyId == candidate.Proxy.Id)
+                    _ = RestoreFailedPreferredAccessAsync(candidate, cancellationToken);
             }
         }
 
@@ -1559,6 +1687,11 @@ public partial class MainWindow : Window
                 catch (Exception error)
                 {
                     errors.Add(error);
+                    if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
+                    {
+                        ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
+                        SaveConfig();
+                    }
                     RouteLog($"Route retry failed: target={server.Name}; route={RouteLabel(candidate)}; error={error.GetType().Name}: {error.Message}");
                 }
             }
@@ -1571,19 +1704,37 @@ public partial class MainWindow : Window
             errors.Count == 0 ? null : new AggregateException(errors));
     }
 
+    private async Task RestoreFailedPreferredAccessAsync(
+        RouteCandidate candidate, CancellationToken cancellationToken)
+    {
+        try
+        {
+            RouteLog($"Preferred JH failed; checking access in background: proxy={candidate.Proxy.Name}");
+            await TryRestoreAccessAsync([candidate], cancellationToken);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            RouteLog($"Background access check failed: proxy={candidate.Proxy.Name}; error={ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Mechanism B: when all routes fail, check if a jumphost's access script
     /// expired. If all control servers are unreachable, send the script command
     /// to the running jumphost console and re-check.
     /// </summary>
     private async Task<bool> TryRestoreAccessAsync(
-        IReadOnlyList<RouteCandidate> candidates, CancellationToken cancellationToken)
+        IReadOnlyList<RouteCandidate> candidates, CancellationToken cancellationToken,
+        bool routeFailure = false)
     {
         var now = DateTimeOffset.UtcNow;
         var proxiesToCheck = candidates
             .Select(c => c.Proxy)
             .DistinctBy(p => p.Id)
-            .Where(p => AccessGrantPolicy.ShouldCheckControlsOnFailure(p, now))
+            .Where(p => routeFailure
+                ? AccessGrantPolicy.ShouldCheckControlsAfterRouteFailure(p)
+                : AccessGrantPolicy.ShouldCheckControlsOnFailure(p, now))
             .ToArray();
         if (proxiesToCheck.Length == 0) return false;
 
@@ -1612,6 +1763,30 @@ public partial class MainWindow : Window
             }
         }
         return restored;
+    }
+
+    private void ScheduleAccessCheckAfterRouteFailure(RouteCandidate candidate, Guid targetServerId)
+    {
+        var proxy = candidate.Proxy;
+        if (candidate.WithoutProxy || !AccessGrantPolicy.ShouldCheckControlsAfterRouteFailure(proxy) ||
+            !backgroundAccessChecks.TryAdd(proxy.Id, 0)) return;
+        _ = CheckAsync();
+
+        async Task CheckAsync()
+        {
+            try
+            {
+                RouteLog($"JH route failed; checking access in background: proxy={proxy.Name}");
+                await TryRestoreAccessAsync([candidate], accessScriptAlarmCancellation.Token, routeFailure: true);
+            }
+            catch (OperationCanceledException) when (accessScriptAlarmCancellation.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                RouteLog($"Background access check failed: proxy={proxy.Name}; target={targetServerId}; " +
+                         $"error={ex.GetType().Name}: {ex.Message}");
+            }
+            finally { backgroundAccessChecks.TryRemove(proxy.Id, out _); }
+        }
     }
 
     private async Task<bool> RunAccessScriptInExistingConsoleAsync(
@@ -1810,6 +1985,7 @@ public partial class MainWindow : Window
                     catch (Exception ex)
                     {
                         RouteLog($"Fallback probe failed: target={server.Name}; route={RouteLabel(candidate)}; error={ex.GetType().Name}: {ex.Message}");
+                        ScheduleAccessCheckAfterRouteFailure(candidate, server.Id);
                     }
                 }
                 RouteLog($"Fallback probe: target={server.Name}; no managed route available; keeping fallback");
@@ -1866,6 +2042,7 @@ public partial class MainWindow : Window
                     catch (Exception ex)
                     {
                         RouteLog($"Background route recovery failed: target={server.Name}; route={RouteLabel(candidate)}; error={ex.GetType().Name}: {ex.Message}");
+                        ScheduleAccessCheckAfterRouteFailure(candidate, server.Id);
                     }
                 }
             }
@@ -1940,6 +2117,7 @@ public partial class MainWindow : Window
                     catch (Exception ex)
                     {
                         RouteLog($"Background direct probe failed: target={server.Name}; route={RouteLabel(candidate)}; error={ex.GetType().Name}: {ex.Message}");
+                        ScheduleAccessCheckAfterRouteFailure(candidate, server.Id);
                     }
                 }
             }
@@ -2045,8 +2223,7 @@ public partial class MainWindow : Window
         {
             if (!accessStartupPreflightCompleted.Contains(proxy.Id))
             {
-                var accessAlreadyValid = await ConfirmExistingAccessAsync(
-                    proxy, cancellationToken, rebaseSchedule: true);
+                var accessAlreadyValid = await ConfirmExistingAccessAsync(proxy, cancellationToken);
                 accessStartupPreflightCompleted.Add(proxy.Id);
                 if (accessAlreadyValid)
                 {
@@ -2067,7 +2244,7 @@ public partial class MainWindow : Window
                         RouteLog($"Access startup preflight adopted KiTTY: proxy={proxy.Name}; " +
                                  $"pid={pid}; title={identity.WindowTitle}");
                     }
-                    RouteLog($"Access startup preflight rebased schedule: proxy={proxy.Name}");
+                    RouteLog($"Access startup preflight confirmed existing access without postponing schedule: proxy={proxy.Name}");
                     return;
                 }
             }
@@ -2249,13 +2426,32 @@ public partial class MainWindow : Window
                     if (!startAllAutoStart) return true;
                     continue;
                 }
+                var stoppedExistingManagedProcess = false;
                 if (jumphostProcesses.TryGetAliveManaged(proxy, out var existingProcess))
                 {
-                    RouteLog($"Jumphost startup blocked by existing process: name={proxy.Name}; " +
-                             $"endpoint={proxy.Host}:{proxy.Port}; pid={existingProcess.ProcessId}; socks=not-ready");
-                    Status($"KiTTY точки входа «{proxy.Name}» уже запущена (PID {existingProcess.ProcessId}), " +
-                           "но SOCKS5 ещё недоступен. Проверьте открытую консоль.");
-                    continue;
+                    RouteLog($"Jumphost process alive while SOCKS is unavailable: name={proxy.Name}; " +
+                             $"endpoint={proxy.Host}:{proxy.Port}; pid={existingProcess.ProcessId}");
+                    var existingDeadline = DateTime.UtcNow.AddSeconds(config.ConnectionTimeoutSeconds);
+                    while (DateTime.UtcNow < existingDeadline)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                        {
+                            anyReady = true;
+                            if (!startAllAutoStart) return true;
+                            break;
+                        }
+                        await Task.Delay(500, cancellationToken);
+                    }
+                    if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                        continue;
+                    if (!jumphostProcesses.TryStopAliveManaged(proxy))
+                    {
+                        Status($"Не удалось безопасно перезапустить собственную KiTTY «{proxy.Name}».");
+                        continue;
+                    }
+                    RouteLog($"Unhealthy managed jumphost stopped for one retry: name={proxy.Name}; pid={existingProcess.ProcessId}");
+                    stoppedExistingManagedProcess = true;
                 }
             var server = config.FindServer(proxy.StartupServerId!.Value);
             if (server is null) continue;
@@ -2326,6 +2522,9 @@ public partial class MainWindow : Window
                 }
             }
 
+            var maximumLaunchAttempts = stoppedExistingManagedProcess ? 1 : 2;
+            for (var launchAttempt = 1; launchAttempt <= maximumLaunchAttempts; launchAttempt++)
+            {
             Status($"Запускаю точку входа «{proxy.Name}»…");
             if (!proxy.UseAutomaticPort &&
                 await IsTcpPortOpenAsync(proxy.Host, proxy.Port, TimeSpan.FromSeconds(1), cancellationToken))
@@ -2370,7 +2569,7 @@ public partial class MainWindow : Window
                 foreach (var argument in JumphostStartupPlan.KittyAuthenticationArguments(
                              server, preserveSavedAuthentication))
                     startInfo.ArgumentList.Add(argument);
-                var startupKeyPath = ManagerPathResolver.ResolveOptionalFile(server.PrivateKeyPath, "SSH-ключ");
+                var startupKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
                 if (startupKeyPath is not null)
                 { startInfo.ArgumentList.Add("-i"); startInfo.ArgumentList.Add(startupKeyPath); }
                 startInfo.ArgumentList.Add("-D"); startInfo.ArgumentList.Add(port.ToString());
@@ -2395,13 +2594,46 @@ public partial class MainWindow : Window
                     if (deferAccessScriptUntilReady) return true;
                     anyReady = true;
                     if (!startAllAutoStart) return true;
+                    break;
                 }
             }
             finally { loginScript?.Dispose(); }
+            if (launchAttempt == 1 && jumphostProcesses.TryStopAliveManaged(proxy))
+            {
+                RouteLog($"New unhealthy jumphost stopped for one retry: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
+                continue;
+            }
+            Status($"Точка входа «{proxy.Name}» не подняла SOCKS5 после запуска.");
+            break;
+            }
             }
             finally { gate.Release(); }
         }
         return anyReady;
+    }
+
+    private async Task OfferStartMissingJumphostsAsync()
+    {
+        if (!config.OfferStartMissingJumphosts) return;
+        var configured = config.BaseProxies.Where(item =>
+            item.Enabled && item.StartupServerId is not null).ToArray();
+        var readiness = await Task.WhenAll(configured.Select(async proxy =>
+            (proxy.Id, Ready: await IsSocks5ReadyAsync(
+                proxy, TimeSpan.FromSeconds(1), CancellationToken.None))));
+        var ready = readiness.Where(x => x.Ready).Select(x => x.Id).ToHashSet();
+        var missing = JumphostStartupOfferPolicy.MissingConfigured(config, ready);
+        if (missing.Count == 0) return;
+        var names = string.Join("\n", missing.Select(item =>
+            $"• {JumphostStartupOfferPolicy.DisplayName(config, item)}"));
+        if (ThemedMessageDialog.Show(this,
+                $"Запустить ещё не работающие точки входа?\n\n{names}",
+                "Точки входа", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+            return;
+        foreach (var proxy in missing)
+        {
+            if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), CancellationToken.None)) continue;
+            await EnsureManagedJumphostAsync(CancellationToken.None, true, proxyId: proxy.Id);
+        }
     }
 
     private void PersistConsoles()
@@ -2750,32 +2982,21 @@ public partial class MainWindow : Window
         catch (Exception ex) { return new(false, ex.GetType().Name); }
     }
 
-    private static async Task<SocksProbeResult> ProbeThroughHttpProxyAsync(
-        string proxyHost, int proxyPort, Uri destination, TimeSpan timeout, CancellationToken cancellationToken)
+    private async void CheckConnectivity_Click(object sender, RoutedEventArgs e)
     {
-        try
+        var source = SelectedRow()?.Server ?? selectedServer;
+        if (source is null) return;
+        if (config.BaseProxies.All(proxy => !proxy.Enabled))
         {
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            linked.CancelAfter(timeout);
-            using var client = new System.Net.Sockets.TcpClient();
-            await client.ConnectAsync(proxyHost, proxyPort, linked.Token);
-            await using var stream = client.GetStream();
-            var authority = destination.Host.Contains(':', StringComparison.Ordinal)
-                ? $"[{destination.Host}]:{destination.Port}"
-                : $"{destination.Host}:{destination.Port}";
-            var request = Encoding.ASCII.GetBytes(
-                $"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
-            await stream.WriteAsync(request, linked.Token);
-            var response = new byte[12];
-            await stream.ReadExactlyAsync(response, linked.Token);
-            var status = Encoding.ASCII.GetString(response);
-            return new(status.StartsWith("HTTP/1.1 200", StringComparison.Ordinal), status.Trim());
+            Warn("Нет включённых точек входа. Назначьте сессию jumphost либо добавьте уже запущенный внешний SOCKS5.");
+            return;
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return new(false, "timeout"); }
-        catch (Exception ex) { return new(false, ex.GetType().Name); }
+        var dialog = new ConnectivityPairSelectionDialog(config, [], false, source) { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        await RunDirectedConnectivityAsync($"Связи от «{source.Name}»", dialog.SelectedPairs);
     }
 
-    private async void CheckConnectivity_Click(object sender, RoutedEventArgs e)
+    private async void CheckConnectivityLegacy_Click(object sender, RoutedEventArgs e)
     {
         var source = SelectedRow()?.Server ?? selectedServer; if (source is null) return;
         if (config.BaseProxies.All(proxy => !proxy.Enabled))
@@ -2949,6 +3170,170 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task RunDirectedConnectivityAsync(
+        string scopeName, IReadOnlyList<ConnectivityPairChoice> requestedPairs)
+    {
+        var pairs = ConnectivityPairSelectionPolicy.Selected(requestedPairs);
+        if (pairs.Count == 0) return;
+        if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return; }
+        using var cts = new CancellationTokenSource();
+        operationCancellation = cts;
+        var progress = new LinkBuildingProgress { Owner = this, CancelRequested = () => cts.Cancel() };
+        progress.Show();
+        HeaderPanel.IsEnabled = false;
+        WorkspacePanel.IsEnabled = false;
+        CancelOperationButton.IsEnabled = true;
+        CancelOperationButton.Visibility = Visibility.Visible;
+        try
+        {
+            progress.UpdateStatus("Запускаю точки входа…", 0, pairs.Count);
+            await EnsureManagedJumphostAsync(cts.Token, false, startAllAutoStart: true);
+            var processed = 0;
+            var successfulPairs = new HashSet<(Guid, Guid)>();
+            var checkedPairs = new HashSet<(Guid, Guid)>();
+            var pendingAsymmetricReverses = new List<ConnectivityPairChoice>();
+            var results = await ConnectivityBatchExecutor.CheckDirectedAsync(
+                pairs,
+                async (sourceId, targetIds, cancellationToken) =>
+                {
+                    var source = config.FindServer(sourceId);
+                    progress.UpdateStatus(
+                        $"{source?.Name ?? sourceId.ToString()} → {targetIds.Count} целей",
+                        processed, pairs.Count);
+                    return await Task.Run(() => CheckConnectivityBatchFromAsync(
+                        sourceId, targetIds, cancellationToken), cancellationToken);
+                },
+                cts.Token,
+                result =>
+                {
+                    var pair = pairs.First(item => item.SourceId == result.SourceId &&
+                                                   item.TargetId == result.TargetId);
+                    lock (checkedPairs)
+                    {
+                        checkedPairs.Add((pair.SourceId, pair.TargetId));
+                    }
+                    if (result.Success)
+                    {
+                        bool requiresReverseCheck;
+                        lock (linkSaveLock)
+                        {
+                            requiresReverseCheck = ServerLinkPairPolicy.RememberAdaptiveSuccess(
+                                config, result, DateTimeOffset.UtcNow);
+                            SaveConfig();
+                        }
+                        lock (successfulPairs)
+                        {
+                            successfulPairs.Add((pair.SourceId, pair.TargetId));
+                        }
+                        if (requiresReverseCheck)
+                        {
+                            lock (pendingAsymmetricReverses)
+                            {
+                                pendingAsymmetricReverses.Add(new ConnectivityPairChoice(
+                                    pair.TargetId, pair.SourceId, pair.TargetName, pair.SourceName));
+                            }
+                        }
+                    }
+                    else
+                    {
+                        lock (linkSaveLock)
+                        {
+                            ServerLinkPairPolicy.InvalidateDirection(config, pair.SourceId, pair.TargetId);
+                            SaveConfig();
+                        }
+                    }
+                    processed++;
+                    progress.UpdateStatus($"Проверено {processed}/{pairs.Count}", processed, pairs.Count);
+                });
+
+            // Для недоступных направлений и известных односторонних связей проверяем обратное направление
+            var reversePairs = new List<ConnectivityPairChoice>();
+            foreach (var failed in pairs.Where(pair => !successfulPairs.Contains((pair.SourceId, pair.TargetId))))
+            {
+                if (checkedPairs.Contains((failed.TargetId, failed.SourceId))) continue;
+                if (reversePairs.Any(r => r.SourceId == failed.TargetId && r.TargetId == failed.SourceId)) continue;
+                reversePairs.Add(new ConnectivityPairChoice(
+                    failed.TargetId, failed.SourceId, failed.TargetName, failed.SourceName));
+            }
+            foreach (var asymmetric in pendingAsymmetricReverses)
+            {
+                if (checkedPairs.Contains((asymmetric.SourceId, asymmetric.TargetId))) continue;
+                if (reversePairs.Any(r => r.SourceId == asymmetric.SourceId && r.TargetId == asymmetric.TargetId)) continue;
+                reversePairs.Add(asymmetric);
+            }
+
+            if (reversePairs.Count > 0 && !cts.Token.IsCancellationRequested)
+            {
+                progress.UpdateStatus($"Проверка обратных направлений: {reversePairs.Count}…", processed, pairs.Count);
+                var reverseResults = await ConnectivityBatchExecutor.CheckDirectedAsync(
+                    reversePairs,
+                    async (sourceId, targetIds, cancellationToken) =>
+                    {
+                        var source = config.FindServer(sourceId);
+                        progress.UpdateStatus(
+                            $"Обратно: {source?.Name ?? sourceId.ToString()} → {targetIds.Count} целей",
+                            processed, pairs.Count);
+                        return await Task.Run(() => CheckConnectivityBatchFromAsync(
+                            sourceId, targetIds, cancellationToken), cancellationToken);
+                    },
+                    cts.Token,
+                    result =>
+                    {
+                        if (result.Success)
+                        {
+                            lock (linkSaveLock)
+                            {
+                                ServerLinkPairPolicy.RememberDirectedSuccess(config, result, DateTimeOffset.UtcNow);
+                                SaveConfig();
+                            }
+                            lock (successfulPairs)
+                            {
+                                successfulPairs.Add((result.SourceId, result.TargetId));
+                            }
+                        }
+                        else
+                        {
+                            lock (linkSaveLock)
+                            {
+                                ServerLinkPairPolicy.InvalidateDirection(config, result.SourceId, result.TargetId);
+                                SaveConfig();
+                            }
+                        }
+                    });
+            }
+
+            // Инвалидируем только те направления, где связь отсутствует
+            lock (linkSaveLock)
+            {
+                foreach (var pair in pairs)
+                {
+                    if (!successfulPairs.Contains((pair.SourceId, pair.TargetId)))
+                    {
+                        ServerLinkPairPolicy.InvalidateDirection(config, pair.SourceId, pair.TargetId);
+                    }
+                }
+                SaveConfig();
+            }
+
+            var successful = successfulPairs.Count;
+            progress.UpdateStatus($"Проверено {pairs.Count}/{pairs.Count}", pairs.Count, pairs.Count);
+            var unavailCount = pairs.Count(pair => !successfulPairs.Contains((pair.SourceId, pair.TargetId)));
+            var failures = pairs.Where(pair => !successfulPairs.Contains((pair.SourceId, pair.TargetId)))
+                .Select(pair => $"✗ {pair.Display}").Take(20).ToArray();
+            ThemedMessageDialog.Show(this,
+                $"{scopeName}\nСвязей проверено: {pairs.Count}\nДоступно (включая обратные): {successful}\nНедоступно: {unavailCount}" +
+                (failures.Length == 0 ? "" : "\n\n" + string.Join(Environment.NewLine, failures)),
+                "Результат построения связей", MessageBoxButton.OK,
+                unavailCount == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+        }
+        catch (OperationCanceledException)
+        {
+            Status("Проверка остановлена. Уже подтверждённые направления сохранены.");
+        }
+        catch (Exception ex) { Error(ex); }
+        finally { EndProgressOperation(cts, progress); }
+    }
+
     private async Task<IReadOnlyList<ConnectivityResult>> CheckConnectivityBatchFromAsync(
         Guid sourceId, IReadOnlyList<Guid> targetIds, CancellationToken cancellationToken)
     {
@@ -2966,7 +3351,7 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>Persists each successful result as one bidirectional link.</summary>
+    /// <summary>Persists each successful result considering link symmetry.</summary>
     private void SaveLinkResults(IReadOnlyList<ConnectivityResult> results)
     {
         lock (linkSaveLock)
@@ -2974,7 +3359,7 @@ public partial class MainWindow : Window
             foreach (var result in results)
             {
                 if (!result.Success) continue;
-                ServerLinkPairPolicy.RememberSuccess(config, result, DateTimeOffset.UtcNow);
+                ServerLinkPairPolicy.RememberAdaptiveSuccess(config, result, DateTimeOffset.UtcNow);
             }
             SaveConfig();
         }
@@ -3005,9 +3390,9 @@ public partial class MainWindow : Window
             Log($"{source.Name} → {destination?.Name}: {(result.Success ? "OK" : "FAIL")} — {result.Message}" +
                 (result.Strategy.Length == 0 ? "" : $"; strategy={result.Strategy}"));
             if (result.Success)
-                ServerLinkPairPolicy.RememberSuccess(config, result, DateTimeOffset.UtcNow);
+                ServerLinkPairPolicy.RememberDirectedSuccess(config, result, DateTimeOffset.UtcNow);
             else
-                ServerLinkPairPolicy.Invalidate(config, sourceId, result.TargetId);
+                ServerLinkPairPolicy.InvalidateDirection(config, sourceId, result.TargetId);
         }
         SaveConfig();
         return results;
@@ -3053,34 +3438,38 @@ public partial class MainWindow : Window
     private void Settings_Click(object sender, RoutedEventArgs e)
     {
         var loggingWasEnabled = config.EnableLogging;
-        var dialog = new TextSettingsDialog(config.KittyPath, config.FirefoxPath, config.FirefoxProfile,
+        var dialog = new TextSettingsDialog(config.KittyPath, config.FirefoxPath,
             config.CloseToTray, config.EnableLogging, config.ConnectionTimeoutSeconds,
             config.EndpointProbeTimeoutSeconds,
             config.WriteChangesImmediatelyToKitty, config.CloseWebTunnelWithFirefox,
-            config.TemporaryFirefoxProfiles, config.ShareFirefoxProfileByGroup,
+            config.AutoDiscoverFirefoxProfile,
             config.FirefoxTemplateProfile, config.AutoConfirmHostKeys,
             config.SuppressKittyChangeNotifications, config.RaceBestEntryPoints,
-            config.SkipExistingLinksInMapCheck, config.UseInternalWebResolver) { Owner = this };
+            config.SkipExistingLinksInMapCheck,
+            config.WinScpPath, config.OfferStartMissingJumphosts,
+            config.TaskConnectionRecoveryMinutes) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
-        config.FirefoxProfile = dialog.Profile; config.CloseToTray = dialog.CloseToTray;
+        config.WinScpPath = dialog.WinScpPath;
+        config.CloseToTray = dialog.CloseToTray;
         if (loggingWasEnabled && !dialog.EnableLogging)
             RouteLog("Журналирование отключено пользователем; дальнейшие записи прекращены.");
         config.EnableLogging = dialog.EnableLogging; config.ConnectionTimeoutSeconds = dialog.ConnectionTimeoutSeconds;
         config.EndpointProbeTimeoutSeconds = dialog.EndpointProbeTimeoutSeconds;
+        config.TaskConnectionRecoveryMinutes = dialog.TaskConnectionRecoveryMinutes;
         config.WriteChangesImmediatelyToKitty = dialog.WriteChangesImmediatelyToKitty;
         config.CloseWebTunnelWithFirefox = dialog.CloseWebTunnelWithFirefox;
-        config.TemporaryFirefoxProfiles = dialog.TemporaryFirefoxProfiles;
-        config.ShareFirefoxProfileByGroup = dialog.ShareFirefoxProfileByGroup;
-        config.FirefoxTemplateProfile = dialog.TemplateProfile;
+        config.AutoDiscoverFirefoxProfile = dialog.AutoDiscoverFirefoxProfile;
+        config.FirefoxTemplateProfile = dialog.AutoDiscoverFirefoxProfile ? "" : dialog.TemplateProfile;
         config.AutoConfirmHostKeys = dialog.AutoConfirmHostKeys;
         config.SuppressKittyChangeNotifications = dialog.SuppressKittyChangeNotifications;
         config.RaceBestEntryPoints = dialog.RaceBestEntryPoints;
         config.SkipExistingLinksInMapCheck = dialog.SkipExistingLinksInMapCheck;
-        config.UseInternalWebResolver = dialog.UseInternalWebResolver;
+        config.OfferStartMissingJumphosts = dialog.OfferStartMissingJumphosts;
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
         ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
-        config.ClosePreferenceConfigured = true; SaveConfig(); CleanupUnusedFirefoxProfiles();
+        config.ClosePreferenceConfigured = true; SaveConfig();
+        ValidateFirefoxProfile(showWarning: true);
         if (!loggingWasEnabled && config.EnableLogging &&
             !TryRouteLog("Журналирование включено пользователем; изменения применены без перезапуска.", out var logError))
             Warn($"Не удалось создать журнал. Проверьте доступ к папке Data\\Logs.\n\n{logError}");
@@ -3226,15 +3615,28 @@ public partial class MainWindow : Window
         var menu = new ContextMenu();
         var export = new MenuItem { Header = "Экспорт JSON…" }; export.Click += Export_Click;
         var import = new MenuItem { Header = "Импорт JSON…" }; import.Click += ImportConfig_Click;
+        var rollbackImport = new MenuItem { Header = "Откатить последний импорт" };
+        rollbackImport.IsEnabled = lastImportBackupPath is not null && File.Exists(lastImportBackupPath);
+        rollbackImport.Click += (_, _) => RollbackLastImport();
         var logs = new MenuItem { Header = "Открыть папку журналов…" }; logs.Click += (_, _) => OpenLogsDirectory();
         var changes = new MenuItem { Header = "Изменения KiTTY…" }; changes.Click += (_, _) => ShowKittyChanges();
         var resetIgnored = new MenuItem { Header = "Снова показывать игнорируемые изменения KiTTY" };
         resetIgnored.Click += (_, _) => ResetIgnoredKittyChanges();
-        var linkMap = new MenuItem { Header = "Карта связей…" }; linkMap.Click += (_, _) => ShowLinkMap();
+        var jumphosts = new MenuItem { Header = "Настройки точек входа…" }; jumphosts.Click += Jumphosts_Click;
+        var settings = new MenuItem { Header = "Настройки…" }; settings.Click += Settings_Click;
         var help = new MenuItem { Header = "Справка по полям…" }; help.Click += (_, _) => _ = new HelpDialog { Owner = this }.ShowDialog();
+        var about = new MenuItem { Header = "О программе…" }; about.Click += (_, _) => ShowAbout();
         var exit = new MenuItem { Header = "Выйти" }; exit.Click += (_, _) => ExitApplication();
-        menu.Items.Add(changes); menu.Items.Add(resetIgnored); menu.Items.Add(linkMap); menu.Items.Add(new Separator()); menu.Items.Add(export); menu.Items.Add(import);
-        menu.Items.Add(logs); menu.Items.Add(help); menu.Items.Add(exit); menu.PlacementTarget = sender as UIElement; menu.IsOpen = true;
+        menu.Items.Add(jumphosts); menu.Items.Add(settings); menu.Items.Add(new Separator());
+        menu.Items.Add(changes); menu.Items.Add(resetIgnored); menu.Items.Add(new Separator()); menu.Items.Add(export); menu.Items.Add(import); menu.Items.Add(rollbackImport);
+        menu.Items.Add(logs); menu.Items.Add(help); menu.Items.Add(about); menu.Items.Add(exit); menu.PlacementTarget = sender as UIElement; menu.IsOpen = true;
+    }
+
+    private void ShowAbout()
+    {
+        var version = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? ProductInfo.Version;
+        ThemedMessageDialog.Show(this, $"KiTTY Manager {version}\n\nУниверсальный менеджер SSH-сессий и маршрутов.",
+            "О программе", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     private void ShowLinkMap()
@@ -3248,6 +3650,28 @@ public partial class MainWindow : Window
         linkMapWindow.Closed += (_, _) => linkMapWindow = null;
         linkMapWindow.Show();
     }
+
+    private void ShowBatchTasks()
+    {
+        if (batchTaskWindow is not null)
+        {
+            batchTaskWindow.Activate();
+            return;
+        }
+        async Task<ActiveRoute> OpenRoute(Guid serverId, CancellationToken token)
+        {
+            var server = config.FindServer(serverId) ?? throw new InvalidOperationException("Сессия не найдена.");
+            var operation = await Dispatcher.InvokeAsync(() => Connect(server, token));
+            return await operation;
+        }
+        void CloseRoute(ActiveRoute route) => Dispatcher.Invoke(() => ReleaseRoute(route));
+        batchTaskWindow = new BatchTaskWindow(config, Array.Empty<Guid>(), ssh, OpenRoute, CloseRoute, SaveConfig, RouteLog)
+            { Owner = this };
+        batchTaskWindow.Closed += (_, _) => batchTaskWindow = null;
+        batchTaskWindow.Show();
+    }
+    private void ShowBatchTasks_Click(object sender, RoutedEventArgs e) => ShowBatchTasks();
+    private void ShowLinkMap_Click(object sender, RoutedEventArgs e) => ShowLinkMap();
 
     private async Task CheckLinksFromMapAsync(IReadOnlyList<Guid> serverIds)
     {
@@ -3315,32 +3739,31 @@ public partial class MainWindow : Window
         try
         {
             var incoming = ConfigStore.Import(dialog.FileName);
-            var conflicts = ConfigTransfer.FindConflicts(config, incoming);
-            IReadOnlyDictionary<(TransferConflictKind Kind, Guid IncomingId), bool> decisions =
-                new Dictionary<(TransferConflictKind, Guid), bool>();
-            if (conflicts.Count > 0)
-            {
-                var conflictDialog = new ImportConflictsDialog(conflicts) { Owner = this };
-                if (conflictDialog.ShowDialog() != true) return;
-                decisions = conflictDialog.Decisions;
-            }
-            else if (ThemedMessageDialog.Show(this,
-                         $"Добавить {incoming.AllServers().Count()} сессий и {incoming.BaseProxies.Count} точек входа?",
-                         "Импорт", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
-
-            config = ConfigTransfer.Merge(config, incoming, decisions);
+            var wizard = new ImportWizardDialog(config, incoming) { Owner = this };
+            if (wizard.ShowDialog() != true || wizard.ResultConfig is null) return;
+            var merged = wizard.ResultConfig;
+            foreach (var line in ImportWizardEngine.DescribePlan(wizard.Plan)) RouteLog(line);
+            RouteLog(ImportWizardEngine.DescribeResult(config, merged));
+            lastImportBackupPath = ImportWizardTransaction.SaveWithBackup(configPath, merged);
+            RouteLog($"IMPORT APPLY success backup=\"{Path.GetFileName(lastImportBackupPath)}\"");
+            config = merged;
             ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
             ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
             var selectedId = selectedServer?.Id;
-            SaveAndRefresh();
+            RefreshAll();
             if (selectedId is Guid sid)
             {
                 var refreshed = config.FindServer(sid);
                 if (refreshed is not null) ShowServer(refreshed);
             }
-            Status($"Импорт завершён. Сессий: {config.AllServers().Count()}, точек входа: {config.BaseProxies.Count}");
+            Status($"Импорт завершён. Backup: {Path.GetFileName(lastImportBackupPath)}");
 
-            var missingTotp = ConfigTransfer.FindProxiesMissingTotp(incoming);
+            var selectedIncomingProxyIds = wizard.Plan.Proxies
+                .Where(row => row.Decision is ImportDecision.Add or ImportDecision.UseIncoming)
+                .Select(row => row.IncomingId).ToHashSet();
+            var missingTotp = ConfigTransfer.FindProxiesMissingTotp(incoming)
+                .Where(name => incoming.BaseProxies.Any(proxy => proxy.Name == name && selectedIncomingProxyIds.Contains(proxy.Id)))
+                .ToList();
             if (missingTotp.Count > 0)
             {
                 var proxyList = string.Join("\n", missingTotp.Select(name => $"• {name}"));
@@ -3350,7 +3773,25 @@ public partial class MainWindow : Window
                     "Импорт: требуется настройка OTP", MessageBoxButton.OK, MessageBoxImage.Information);
             }
         }
-        catch (Exception ex) { Error(ex); }
+        catch (Exception ex)
+        {
+            RouteLog($"IMPORT APPLY failed type={ex.GetType().Name} message=\"{ex.Message}\"");
+            Error(ex);
+        }
+    }
+
+    private void RollbackLastImport()
+    {
+        if (lastImportBackupPath is null || !File.Exists(lastImportBackupPath)) return;
+        if (ThemedMessageDialog.Show(this, "Вернуть конфигурацию к состоянию перед последним импортом?",
+                "Откат импорта", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+        ImportWizardTransaction.Rollback(configPath, lastImportBackupPath);
+        config = ConfigStore.Load(configPath, migratePlaintextSecrets: true);
+        ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
+        ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
+        lastImportBackupPath = null;
+        RefreshAll();
+        Status("Последний импорт отменён");
     }
 
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -3359,7 +3800,20 @@ public partial class MainWindow : Window
         {
             e.Cancel = true; Hide(); EnsureTrayIcon(); trayIcon!.Visible = true; trayIcon.ShowBalloonTip(1500, "KiTTY Manager", "Приложение продолжает работать, активные туннели сохранены.", System.Windows.Forms.ToolTipIcon.Info); return;
         }
+        if (batchTaskWindow?.IsRunning == true && !batchExitPending)
+        {
+            e.Cancel = true;
+            batchExitPending = true;
+            _ = StopBatchAndExitAsync();
+            return;
+        }
         Cleanup();
+    }
+    private async Task StopBatchAndExitAsync()
+    {
+        if (batchTaskWindow is not null) await batchTaskWindow.StopAndCloseAsync();
+        batchExitPending = false;
+        Close();
     }
     private void EnsureTrayIcon()
     {
@@ -3423,6 +3877,16 @@ public partial class MainWindow : Window
         HeaderPanel.IsEnabled = true;
         WorkspacePanel.IsEnabled = true;
         if (progressWindow.IsLoaded) progressWindow.CloseCompleted();
+        if (!IsLoaded || !IsVisible) return;
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Activate();
+        var wasTopmost = Topmost;
+        if (!wasTopmost)
+        {
+            Topmost = true;
+            Topmost = false;
+        }
+        Focus();
     }
     private void CancelOperation_Click(object sender, RoutedEventArgs e)
     {
@@ -3431,7 +3895,7 @@ public partial class MainWindow : Window
         Status("Отменяю операцию…");
         operationCancellation.Cancel();
     }
-    private void SaveAndRefresh() { SaveConfig(); CleanupUnusedFirefoxProfiles(); var group = selectedGroup; RefreshAll(); selectedGroup = group; RefreshSessions(); }
+    private void SaveAndRefresh() { SaveConfig(); var group = selectedGroup; RefreshAll(); selectedGroup = group; RefreshSessions(); }
     private void SaveConfig()
     {
         if (configAvailable) ConfigStore.Save(configPath, config);
@@ -3454,35 +3918,22 @@ public partial class MainWindow : Window
     }
     private static string Quote(string value) => '"' + value.Replace("\"", "\\\"") + '"';
     private static string SafeFileName(string value) => string.Concat(value.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
-    private string FirefoxRuntimeRoot => Path.Combine(dataDirectory, "FirefoxProfiles",
-        SafeFileName(config.FirefoxProfile), "runtime");
-    private string FirefoxPersistentRoot => Path.Combine(dataDirectory, "FirefoxProfiles",
-        SafeFileName(config.FirefoxProfile), "persistent");
-
-    private string FirefoxProfileKey(ManagedServer server)
-    {
-        var group = config.ShareFirefoxProfileByGroup ? config.FindServerGroup(server.Id) : null;
-        return group is null ? $"session-{server.Id:N}" : $"group-{group.Id:N}";
-    }
+    private string FirefoxRuntimeRoot => Path.Combine(dataDirectory, "FirefoxProfiles", "runtime");
 
     private void CleanupOrphanedFirefoxProfiles()
     {
         if (Directory.Exists(FirefoxRuntimeRoot))
-            foreach (var path in Directory.EnumerateDirectories(FirefoxRuntimeRoot)) TryDeleteDirectory(path);
-        CleanupUnusedFirefoxProfiles();
-    }
-
-    private void CleanupUnusedFirefoxProfiles()
-    {
-        if (!Directory.Exists(FirefoxPersistentRoot)) return;
-        var valid = config.AllServers().Select(FirefoxProfileKey).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var path in Directory.EnumerateDirectories(FirefoxPersistentRoot))
-            if (!valid.Contains(Path.GetFileName(path))) TryDeleteDirectory(path);
+            foreach (var path in Directory.EnumerateDirectories(FirefoxRuntimeRoot))
+            {
+                if (!WaitForFirefoxProfileProcesses(path, TimeSpan.Zero) ||
+                    !FirefoxProfileWorkspace.CanMergeAndDelete(path)) continue;
+                TryDeleteDirectory(path);
+            }
     }
 
     private async Task CleanupWebSessionAfterExitAsync(
-        Process browser, Process tunnel, ActiveRoute route, ResolvingHttpProxy? resolver,
-        string profile, bool deleteProfile)
+        Process browser, Process tunnel, ActiveRoute route, ResolvingSocks5Relay? resolver,
+        string profile)
     {
         var browserPid = browser.Id;
         RouteLog($"Web cleanup: polling Firefox pid={browserPid}; closeTunnel={config.CloseWebTunnelWithFirefox}");
@@ -3502,6 +3953,11 @@ public partial class MainWindow : Window
         }
 
         RouteLog($"Web cleanup: Firefox pid={browserPid} exited; closeTunnel={config.CloseWebTunnelWithFirefox}");
+        var processesExited = await Task.Run(() => WaitForFirefoxProfileProcesses(profile, TimeSpan.FromSeconds(10))).ConfigureAwait(false);
+        for (var attempt = 0; attempt < 4 && processesExited && !FirefoxProfileWorkspace.CanMergeAndDelete(profile); attempt++)
+            await Task.Delay(250).ConfigureAwait(false);
+        var profileReleased = processesExited && FirefoxProfileWorkspace.CanMergeAndDelete(profile);
+        if (!profileReleased) RouteLog("Web cleanup: Firefox всё ещё держит файлы профиля; профиль оставлен для безопасной очистки при следующем запуске");
         if (resolver is not null) await resolver.DisposeAsync().ConfigureAwait(false);
         if (config.CloseWebTunnelWithFirefox)
         {
@@ -3515,12 +3971,45 @@ public partial class MainWindow : Window
             tunnel.Dispose();
             RouteLog("Web KiTTY tunnel left open after Firefox exit; close-after-firefox setting is disabled");
         }
-        if (!deleteProfile) return;
+        if (!profileReleased) return;
         for (var attempt = 0; attempt < 40 && Directory.Exists(profile); attempt++)
         {
             if (TryDeleteDirectory(profile)) return;
             await Task.Delay(250);
         }
+    }
+
+    private static bool WaitForFirefoxProfileProcesses(string profile, TimeSpan timeout)
+    {
+        if (!OperatingSystem.IsWindows()) return true;
+        try
+        {
+            var script = "$deadline=(Get-Date).AddMilliseconds([int]$env:KITTY_FIREFOX_WAIT_MS); " +
+                "do { $count=@(Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" -ErrorAction SilentlyContinue | " +
+                "Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($env:KITTY_FIREFOX_PROFILE,[StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count; " +
+                "if ($count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline); exit 1";
+            var start = new ProcessStartInfo("powershell.exe")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            start.ArgumentList.Add("-NoProfile");
+            start.ArgumentList.Add("-NonInteractive");
+            start.ArgumentList.Add("-Command");
+            start.ArgumentList.Add(script);
+            start.Environment["KITTY_FIREFOX_PROFILE"] = profile;
+            start.Environment["KITTY_FIREFOX_WAIT_MS"] = Math.Max(0, (int)timeout.TotalMilliseconds).ToString();
+            using var process = Process.Start(start);
+            if (process is null || !process.WaitForExit((int)timeout.TotalMilliseconds + 5000))
+            {
+                try { process?.Kill(true); } catch { }
+                return false;
+            }
+            return process.ExitCode == 0;
+        }
+        catch { return FirefoxProfileWorkspace.CanMergeAndDelete(profile); }
     }
 
     private void ReleaseRoute(ActiveRoute route)

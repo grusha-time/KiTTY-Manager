@@ -202,6 +202,7 @@ public static class ConfigStore
         config.UngroupedServers ??= [];
         config.Links ??= [];
         config.BaseProxies ??= [];
+        ManagerConfigMigration.UpgradeToVersion9(config);
         foreach (var proxy in config.BaseProxies)
         {
             proxy.TotpSecret ??= "";
@@ -222,7 +223,9 @@ public static class ConfigStore
                 : Math.Clamp(proxy.AccessProbeServerLimit, 1, 20);
             proxy.AccessProbeServerIds ??= [];
         }
-        config.ConnectionTimeoutSeconds = Math.Clamp(config.ConnectionTimeoutSeconds, 10, 600);
+        config.ConnectionTimeoutSeconds = Math.Clamp(config.ConnectionTimeoutSeconds, 3, 600);
+        config.TaskConnectionRecoveryMinutes = Math.Clamp(config.TaskConnectionRecoveryMinutes, 0, 99999);
+        if (config.AutoDiscoverFirefoxProfile) config.FirefoxTemplateProfile = "";
         config.EndpointProbeTimeoutSeconds = Math.Clamp(
             config.EndpointProbeTimeoutSeconds <= 0 ? 4 : config.EndpointProbeTimeoutSeconds, 1, 30);
         foreach (var server in config.UngroupedServers) Normalize(server);
@@ -300,7 +303,7 @@ public static class ConfigStore
         server.EndpointPreferences ??= [];
         server.BackupEndpoints = server.BackupEndpoints
             .Where(endpoint => endpoint is not null && endpoint.Port > 0)
-            .Select(endpoint => new ServerEndpoint((endpoint.Host ?? "").Trim(), endpoint.Port))
+            .Select(endpoint => new ServerEndpoint((endpoint.Host ?? "").Trim(), endpoint.Port, endpoint.InternalOnly))
             .ToList();
         if (server.PreferredEndpoint is not null && server.PreferredEndpoint.Port <= 0)
             server.PreferredEndpoint = null;
@@ -316,10 +319,9 @@ public static class ConfigStore
             var inSet = resolvedPreferred.Equals(main) || server.BackupEndpoints.Any(backup =>
                 new ServerEndpoint(
                     string.IsNullOrWhiteSpace(backup.Host) ? server.CleanHost : backup.Host,
-                    backup.Port).Equals(resolvedPreferred));
+                    backup.Port, backup.InternalOnly).Equals(resolvedPreferred));
             if (!inSet) server.PreferredEndpoint = null;
         }
-        var allowedEndpoints = ServerEndpointPolicy.Ordered(server).ToHashSet();
         server.EndpointPreferences = server.EndpointPreferences
             .Where(item => item is not null && item.Endpoint is not null && item.Endpoint.Port > 0)
             .Select(item => new EndpointPreference
@@ -329,9 +331,11 @@ public static class ConfigStore
                 Endpoint = new ServerEndpoint((item.Endpoint.Host ?? "").Trim(), item.Endpoint.Port),
                 LastSuccessUtc = item.LastSuccessUtc
             })
-            .Where(item => allowedEndpoints.Contains(new ServerEndpoint(
-                string.IsNullOrWhiteSpace(item.Endpoint.Host) ? server.CleanHost : item.Endpoint.Host,
-                item.Endpoint.Port)))
+            .Where(item => ServerEndpointPolicy.Ordered(server,
+                    new EndpointContext(item.ProxyId, item.PreviousServerId))
+                .Contains(new ServerEndpoint(
+                    string.IsNullOrWhiteSpace(item.Endpoint.Host) ? server.CleanHost : item.Endpoint.Host,
+                    item.Endpoint.Port)))
             .DistinctBy(item => (item.ProxyId, item.PreviousServerId))
             .ToList();
         server.ManagerOverrides ??= [];

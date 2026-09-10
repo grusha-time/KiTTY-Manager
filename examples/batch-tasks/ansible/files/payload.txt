@@ -1,0 +1,3 @@
+smoke_test=1
+initial_value=ready
+status=ok

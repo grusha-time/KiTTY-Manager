@@ -1,0 +1,271 @@
+{
+  "Version": 1,
+  "Name": "Учебная проверка всех действий конструктора",
+  "WorkingDirectory": "/tmp",
+  "PrivilegeMode": 0,
+  "AutoReconnectTunnels": true,
+  "KeepTunnelsAfterSteps": false,
+  "ServerIds": [],
+  "Tunnels": [],
+  "Steps": [
+    {
+      "Kind": 5,
+      "Name": "Предусловия: Linux, Python 3, tar и отдельный каталог",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "test \"$(uname -s)\" = Linux && command -v python3 && command -v tar && command -v gzip && (umask 077; mkdir -- /tmp/kitty-manager-constructor-example) && printf \"owned-by-example\\n\" > /tmp/kitty-manager-constructor-example/.owner"
+    },
+    {
+      "Kind": 2,
+      "Name": "Создать вложенный каталог",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Destination": "/tmp/kitty-manager-constructor-example/tree"
+    },
+    {
+      "Kind": 1,
+      "Name": "Загрузить несколько файлов",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Source": "files/payload.txt\nfiles/second.txt\nfiles/dialog.sh\nfiles/verify.py",
+      "Destination": "/tmp/kitty-manager-constructor-example"
+    },
+    {
+      "Kind": 1,
+      "Name": "Повторная загрузка одинакового файла: пропуск",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Source": "files/payload.txt",
+      "Destination": "/tmp/kitty-manager-constructor-example/payload.txt"
+    },
+    {
+      "Kind": 1,
+      "Name": "Загрузить дерево каталогов с пробелом в имени",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Source": "files/tree",
+      "Destination": "/tmp/kitty-manager-constructor-example/tree"
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить исходный файл",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "grep -qx 'initial_value=ready' payload.txt",
+      "WorkingDirectory": "/tmp/kitty-manager-constructor-example"
+    },
+    {
+      "Kind": 0,
+      "Name": "Обычная команда: записать маркер",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "printf 'command=ok\\n' > command.marker",
+      "WorkingDirectory": "/tmp/kitty-manager-constructor-example",
+      "WaitAfterSeconds": 1
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить результат команды и рабочую папку шага",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "test \"$PWD\" = '/tmp/kitty-manager-constructor-example' && grep -qx 'command=ok' command.marker",
+      "WorkingDirectory": "/tmp/kitty-manager-constructor-example"
+    },
+    {
+      "Kind": 3,
+      "Name": "Заменить текст с резервной копией",
+      "TimeoutSeconds": 30,
+      "Backup": true,
+      "ContinueOnError": false,
+      "Destination": "/tmp/kitty-manager-constructor-example/payload.txt",
+      "Search": "initial_value",
+      "Replacement": "updated_value"
+    },
+    {
+      "Kind": 4,
+      "Name": "Применить четыре макроса сервера",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Source": "files/server.txt.j2",
+      "Destination": "/tmp/kitty-manager-constructor-example/server.txt"
+    },
+    {
+      "Kind": 5,
+      "Name": "Условие false: этот шаг должен быть пропущен",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "touch /tmp/kitty-manager-constructor-example/must-not-exist",
+      "ConditionCommand": "false"
+    },
+    {
+      "Kind": 5,
+      "Name": "Условие true: проверить пропуск",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "test ! -e /tmp/kitty-manager-constructor-example/must-not-exist",
+      "ConditionCommand": "true"
+    },
+    {
+      "Kind": 5,
+      "Name": "ОЖИДАЕМАЯ ОШИБКА: продолжить после exit 7",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": true,
+      "Command": "printf 'expected failure for ContinueOnError\\n'; exit 7"
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить продолжение после ожидаемой ошибки",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "test -f /tmp/kitty-manager-constructor-example/.owner && echo CONTINUED_OK",
+      "ExpectedText": "CONTINUED_OK"
+    },
+    {
+      "Kind": 6,
+      "Name": "Ждать текст в общей SSH-консоли и выполнить действие",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "printf 'WAIT_%s\\n' READY",
+      "ExpectedText": "WAIT_READY",
+      "ActionCommand": "printf 'wait=ok\\n' > /tmp/kitty-manager-constructor-example/wait.marker"
+    },
+    {
+      "Kind": 7,
+      "Name": "Отправить команду запуска программы в общую консоль",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "sh /tmp/kitty-manager-constructor-example/dialog.sh /tmp/kitty-manager-constructor-example/dialog-one.txt"
+    },
+    {
+      "Kind": 8,
+      "Name": "Ответить работающей программе: два вопроса",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "ExpectedText": "Name:\nTotal:",
+      "ActionCommand": "alpha\n87"
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить ответы работающей программе",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "for n in 1 2 3 4 5; do test -f /tmp/kitty-manager-constructor-example/dialog-one.txt && break; sleep 1; done; grep -qx \"dialog=ok\" /tmp/kitty-manager-constructor-example/dialog-one.txt"
+    },
+    {
+      "Kind": 8,
+      "Name": "Запустить диалог и ответить в одном действии",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "sh /tmp/kitty-manager-constructor-example/dialog.sh /tmp/kitty-manager-constructor-example/dialog-two.txt",
+      "ExpectedText": "Name:\nTotal:",
+      "ActionCommand": "alpha\n87",
+      "WaitForExit": true
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить диалоги, файлы, макросы и backup",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "python3 /tmp/kitty-manager-constructor-example/verify.py",
+      "ExpectedText": "CONSTRUCTOR_ARTIFACTS_OK"
+    },
+    {
+      "Kind": 5,
+      "Name": "Опционально: HTTP через Remote-туннель 18081",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "python3 -c \"import urllib.request; assert urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:18081/tunnel.txt', timeout=10).read() == b'kitty-tunnel-ok\\n'; print('REMOTE_OK')\"",
+      "ConditionCommand": "test -f /tmp/kitty-manager-constructor-example/enable-remote",
+      "ExpectedText": "REMOTE_OK"
+    },
+    {
+      "Kind": 9,
+      "Name": "Скачать несколько файлов по маске",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Source": "/tmp/kitty-manager-constructor-example/result.txt\n/tmp/kitty-manager-constructor-example/dialog-*.txt\n/tmp/kitty-manager-constructor-example/server.txt",
+      "DownloadFolder": "constructor-example"
+    },
+    {
+      "Kind": 9,
+      "Name": "Скачать каталог напрямую",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Source": "/tmp/kitty-manager-constructor-example/tree",
+      "DownloadFolder": "constructor-example"
+    },
+    {
+      "Kind": 9,
+      "Name": "Скачать каталог архивом",
+      "TimeoutSeconds": 30,
+      "Backup": true,
+      "ContinueOnError": false,
+      "Source": "/tmp/kitty-manager-constructor-example/tree",
+      "DownloadFolder": "constructor-example",
+      "DownloadAsArchive": true
+    },
+    {
+      "Kind": 2,
+      "Name": "Создать каталог для проверки удаления",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Destination": "/tmp/kitty-manager-constructor-example/delete-me"
+    },
+    {
+      "Kind": 10,
+      "Name": "Удалить только тестовый вложенный каталог",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Destination": "/tmp/kitty-manager-constructor-example/delete-me"
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить удаление и принадлежность рабочей папки",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "test ! -e /tmp/kitty-manager-constructor-example/delete-me && test ! -L /tmp/kitty-manager-constructor-example && grep -qx owned-by-example /tmp/kitty-manager-constructor-example/.owner"
+    },
+    {
+      "Kind": 10,
+      "Name": "Очистить рабочую папку успешного запуска",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Destination": "/tmp/kitty-manager-constructor-example"
+    },
+    {
+      "Kind": 5,
+      "Name": "Проверить очистку",
+      "TimeoutSeconds": 30,
+      "Backup": false,
+      "ContinueOnError": false,
+      "Command": "test ! -e /tmp/kitty-manager-constructor-example && echo CONSTRUCTOR_SMOKE_OK",
+      "ExpectedText": "CONSTRUCTOR_SMOKE_OK"
+    }
+  ]
+}

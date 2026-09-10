@@ -133,6 +133,7 @@ public static class RoutePlanner
         CachedRoute? preferred = null) =>
         candidates
             .OrderBy(candidate => CandidateClass(config, candidate))
+            .ThenBy(candidate => EntryDependencyPriority(candidate))
             .ThenBy(candidate => StartupComplexity(candidate.Proxy))
             .ThenBy(candidate => candidate.Servers.Count)
             // Среди одинаково коротких цепочек сначала используем входной сервер,
@@ -159,6 +160,16 @@ public static class RoutePlanner
                route.ServerIds[0] == candidate.Servers[0].Id
             ? 0
             : 1;
+    }
+
+    private static int EntryDependencyPriority(RouteCandidate candidate)
+    {
+        if (candidate.WithoutProxy) return 0;
+        var preferred = candidate.Servers[0].PreferredRoute;
+        if (preferred is null || preferred.ProxyId != candidate.Proxy.Id ||
+            preferred.ServerIds.Count <= 1) return 0;
+        return candidate.Servers.Select(server => server.Id)
+            .Take(preferred.ServerIds.Count).SequenceEqual(preferred.ServerIds) ? 0 : 1;
     }
 
     /// <summary>
@@ -209,7 +220,7 @@ public static class RoutePlanner
     public static IReadOnlyList<RouteCandidate> OrderPreferred(
         ManagerConfig config, IReadOnlyList<RouteCandidate> ranked, CachedRoute? preferred)
     {
-        if (preferred is null) return ranked;
+        if (preferred is null || preferred.ServerIds.Count == 0) return ranked;
         var list = ranked.ToList();
         if (!list.Any(candidate => RoutePreferencePolicy.Matches(preferred, candidate)))
         {
@@ -301,6 +312,8 @@ public static class RoutePlanner
     {
         if (RoutePreferencePolicy.Matches(preferred, candidate))
             return "последний успешный";
+        if (EntryDependencyPriority(candidate) != 0)
+            return "зависимый аварийный резерв";
         if (IsComposedFromCachedEntry(candidate))
             return "составлен через сохранённый вход";
         if (candidate.Servers.Count > 1 &&

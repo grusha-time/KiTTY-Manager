@@ -4,7 +4,7 @@ namespace KiTTYManager.Core;
 
 public sealed class ManagerConfig
 {
-    public int SchemaVersion { get; set; } = 7;
+    public int SchemaVersion { get; set; } = 9;
     public List<ServerGroup> Groups { get; set; } = [];
     public List<ManagedServer> UngroupedServers { get; set; } = [];
     public List<ServerLink> Links { get; set; } = [];
@@ -12,22 +12,22 @@ public sealed class ManagerConfig
     public Guid? PreferredProxyId { get; set; }
     public string KittyPath { get; set; } = "KiTTY\\kitty.exe";
     public string FirefoxPath { get; set; } = "firefox.exe";
-    public string FirefoxProfile { get; set; } = "kitty-manager";
+    public string WinScpPath { get; set; } = "";
     public bool ClosePreferenceConfigured { get; set; }
     public bool CloseToTray { get; set; }
     public bool EnableLogging { get; set; }
     public bool WriteChangesImmediatelyToKitty { get; set; }
     public bool CloseWebTunnelWithFirefox { get; set; }
-    public bool TemporaryFirefoxProfiles { get; set; } = true;
-    public bool ShareFirefoxProfileByGroup { get; set; }
-    public bool UseInternalWebResolver { get; set; }
+    public bool AutoDiscoverFirefoxProfile { get; set; } = true;
     public string FirefoxTemplateProfile { get; set; } = "";
     public int ConnectionTimeoutSeconds { get; set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; set; } = 4;
+    public int TaskConnectionRecoveryMinutes { get; set; } = 1;
     public bool AutoConfirmHostKeys { get; set; } = true;
     public bool SuppressKittyChangeNotifications { get; set; } = true;
     public bool RaceBestEntryPoints { get; set; }
     public bool SkipExistingLinksInMapCheck { get; set; } = true;
+    public bool OfferStartMissingJumphosts { get; set; } = true;
 }
 
 public sealed class ServerGroup
@@ -58,6 +58,8 @@ public sealed class ManagedServer
     public bool IgnoreImportedCommand { get; set; }
     public KittySessionSnapshot? KittyBaseline { get; set; }
     public string HostKeyFingerprint { get; set; } = "";
+    public string HostKeyAlgorithm { get; set; } = "";
+    public int HostKeyBits { get; set; }
     public string? SourceSessionPath { get; set; }
     public string? SourceScriptPath { get; set; }
     public string SourceScriptContent { get; set; } = "";
@@ -239,10 +241,12 @@ public sealed record ConnectivityResult(
 public sealed class ServerEndpoint : IEquatable<ServerEndpoint>
 {
     public string Host { get; set; } = "";
-    public int Port { get; set; }
+    public int Port { get; set; } = 22;
+    /// <summary>Адрес доступен только после перехода через другой сервер.</summary>
+    public bool InternalOnly { get; set; }
 
     public ServerEndpoint() { }
-    public ServerEndpoint(string host, int port) { Host = host; Port = port; }
+    public ServerEndpoint(string host, int port, bool internalOnly = false) { Host = host; Port = port; InternalOnly = internalOnly; }
 
     public bool Equals(ServerEndpoint? other) =>
         other is not null &&

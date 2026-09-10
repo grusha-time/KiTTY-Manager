@@ -22,6 +22,13 @@ public static class ConfigTransfer
         PropertyNameCaseInsensitive = true
     };
 
+    public static ImportWizardPlan AnalyzeSmartImport(ManagerConfig current, ManagerConfig incoming) =>
+        ImportWizardEngine.Analyze(current, incoming);
+
+    public static ManagerConfig MergeSmartImport(
+        ManagerConfig current, ManagerConfig incoming, ImportWizardPlan plan) =>
+        ImportWizardEngine.Merge(current, incoming, plan);
+
     public static ManagerConfig CreateExport(
         ManagerConfig source,
         IEnumerable<Guid> selectedServerIds,
@@ -106,20 +113,20 @@ public static class ConfigTransfer
     {
         config.KittyPath = "KiTTY\\kitty.exe";
         config.FirefoxPath = "firefox.exe";
-        config.FirefoxProfile = "kitty-manager";
+        config.WinScpPath = "";
         config.ClosePreferenceConfigured = false;
         config.CloseToTray = false;
         config.EnableLogging = false;
         config.WriteChangesImmediatelyToKitty = false;
         config.CloseWebTunnelWithFirefox = false;
-        config.TemporaryFirefoxProfiles = true;
-        config.ShareFirefoxProfileByGroup = false;
-        config.UseInternalWebResolver = false;
+        config.AutoDiscoverFirefoxProfile = true;
         config.FirefoxTemplateProfile = "";
         config.ConnectionTimeoutSeconds = 10;
+        config.TaskConnectionRecoveryMinutes = 1;
         config.EndpointProbeTimeoutSeconds = 4;
         config.RaceBestEntryPoints = false;
         config.SkipExistingLinksInMapCheck = true;
+        config.OfferStartMissingJumphosts = true;
     }
 
     private static void SanitizeProxiesForExport(ManagerConfig config)

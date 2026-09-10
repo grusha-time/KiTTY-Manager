@@ -1,0 +1,387 @@
+---
+# Запуск и включение дополнительных проверок: wiki/Batch-Tasks.md.
+- name: KiTTY Manager — учебная проверка Ansible
+  hosts: all
+  gather_facts: true
+  become: false
+  vars:
+    # Включайте только после подготовки стенда по руководству.
+    smoke_test_become: false
+    smoke_test_windows_upload: false
+    smoke_test_remote_tunnel: false
+    smoke_test_vault: false
+    # Для Windows upload добавьте сюда список kitty_manager_windows_files
+    # с существующим абсолютным Windows-путём. Пример есть в руководстве.
+    sample_items:
+      - {name: alpha, value: 17}
+      - {name: beta, value: 29}
+      - {name: gamma, value: 41}
+
+  pre_tasks:
+    - name: Проверить Linux и переменную выгрузки менеджера
+      ansible.builtin.assert:
+        that:
+          - ansible_system == 'Linux'
+          - kitty_download_dir is defined
+          - kitty_download_dir is match('^/')
+        fail_msg: Нужен Linux-сервер; kitty_download_dir передаёт KiTTY Manager.
+
+  tasks:
+    - name: Выполнить проверки с очисткой временных файлов
+      block:
+        - name: Создать уникальный рабочий каталог на сервере
+          ansible.builtin.tempfile:
+            state: directory
+            path: /tmp
+            prefix: kitty-manager-ansible-example-
+          register: target_temp
+
+        - name: Запомнить рабочую папку этого сервера
+          ansible.builtin.set_fact:
+            smoke_root: "{{ target_temp.path }}"
+
+        - name: Создать уникальный рабочий каталог контроллера
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: kitty-manager-controller-example-
+          delegate_to: localhost
+          register: controller_temp
+
+        - name: Показать соответствие inventory и сессии
+          ansible.builtin.debug:
+            msg:
+              inventory: "{{ inventory_hostname }}"
+              session: "{{ kitty_server_display | default(inventory_hostname) }}"
+              group: "{{ kitty_group_display | default('external inventory') }}"
+              inventory_groups: "{{ group_names }}"
+              selected_hosts: "{{ ansible_play_hosts_all }}"
+              workspace: "{{ smoke_root }}"
+
+        - name: Загрузить соседний файл проекта через контроллер
+          ansible.builtin.copy:
+            src: files/payload.txt
+            dest: "{{ smoke_root }}/payload.txt"
+            mode: '0600'
+          register: first_copy
+
+        - name: Повторить загрузку одинакового файла
+          ansible.builtin.copy:
+            src: files/payload.txt
+            dest: "{{ smoke_root }}/payload.txt"
+            mode: '0600'
+          register: second_copy
+
+        - name: Проверить идемпотентность копирования
+          ansible.builtin.assert:
+            that:
+              - first_copy.changed
+              - not second_copy.changed
+
+        - name: Заменить текст с резервной копией
+          ansible.builtin.replace:
+            path: "{{ smoke_root }}/payload.txt"
+            regexp: initial_value
+            replace: updated_value
+            backup: true
+          register: replacement
+
+        - name: Прочитать исходное содержимое из backup
+          ansible.builtin.slurp:
+            src: "{{ replacement.backup_file }}"
+          register: original_payload
+
+        - name: Проверить резервную копию
+          ansible.builtin.assert:
+            that:
+              - "'initial_value=ready' in (original_payload.content | b64decode)"
+
+        - name: Сгенерировать записи циклом
+          ansible.builtin.copy:
+            dest: "{{ smoke_root }}/{{ item.name }}.json"
+            mode: '0600'
+            content: "{{ item | to_json }}\n"
+          loop: "{{ sample_items }}"
+          notify: Record generated files
+
+        - name: Загрузить обработчик из соседней папки files
+          ansible.builtin.copy:
+            src: files/process.py
+            dest: "{{ smoke_root }}/process.py"
+            mode: '0700'
+
+        - name: Выполнить обработчик с рабочей папкой и окружением
+          ansible.builtin.command:
+            argv: [python3, process.py]
+            chdir: "{{ smoke_root }}"
+          environment:
+            KITTY_EXAMPLE: enabled
+          register: processor
+          changed_when: true
+
+        - name: Выполнить shell pipeline
+          ansible.builtin.shell: printf '%s\n' alpha beta gamma | wc -l > shell-count.txt
+          args:
+            executable: /bin/sh
+            chdir: "{{ smoke_root }}"
+          changed_when: true
+
+        - name: Применить соседний Jinja-шаблон
+          ansible.builtin.template:
+            src: templates/report.j2
+            dest: "{{ smoke_root }}/report.txt"
+            mode: '0600'
+
+        - name: Выполнить соседнюю роль
+          ansible.builtin.include_role:
+            name: smoke_role
+
+        - name: Выполнить роль из поставляемой локальной коллекции
+          ansible.builtin.include_role:
+            name: kitty_examples.smoke.check
+
+        - name: Проверить пропуск по условию
+          ansible.builtin.command: /bin/false
+          when: sample_items | length == 0
+          register: skipped_probe
+          changed_when: false
+
+        - name: Проверить ожидаемую ошибку через block и rescue
+          block:
+            - name: ОЖИДАЕМАЯ ОШИБКА — exit 7
+              ansible.builtin.command: /bin/sh -c 'exit 7'
+              changed_when: false
+          rescue:
+            - name: Убедиться что перехвачена именно тестовая ошибка
+              ansible.builtin.assert:
+                that: ansible_failed_result.rc == 7
+            - name: Отметить успешное восстановление сценария
+              ansible.builtin.set_fact:
+                rescue_verified: true
+
+        - name: Запустить короткое асинхронное действие
+          ansible.builtin.shell: sleep 1; printf 'async=ok\n' > async.marker
+          args:
+            chdir: "{{ smoke_root }}"
+          async: 30
+          poll: 0
+          register: async_job
+          changed_when: true
+
+        - name: Дождаться асинхронного действия
+          ansible.builtin.async_status:
+            jid: "{{ async_job.ansible_job_id }}"
+          register: async_result
+          until: async_result.finished
+          retries: 15
+          delay: 1
+
+        - name: Проверить интерактивную программу через Python subprocess
+          ansible.builtin.script: files/interactive.py
+          args:
+            executable: python3
+          register: interactive_probe
+          changed_when: false
+
+        - name: Опционально проверить Windows upload
+          when: smoke_test_windows_upload | bool
+          block:
+            - name: Найти переданные Windows-файлы в VM
+              ansible.builtin.find:
+                paths: "{{ kitty_upload_dir }}"
+                file_type: file
+                get_checksum: true
+              delegate_to: localhost
+              register: windows_uploads
+            - name: Проверить наличие ровно одного тестового файла
+              ansible.builtin.assert:
+                that: windows_uploads.matched == 1
+            - name: Скопировать Windows-файл из VM на сервер
+              ansible.builtin.copy:
+                src: "{{ windows_uploads.files[0].path }}"
+                dest: "{{ smoke_root }}/windows-upload.txt"
+                mode: '0600'
+            - name: Вычислить checksum файла на сервере
+              ansible.builtin.stat:
+                path: "{{ smoke_root }}/windows-upload.txt"
+                checksum_algorithm: sha1
+              register: windows_target
+            - name: Сравнить размер и checksum
+              ansible.builtin.assert:
+                that:
+                  - windows_target.stat.size == windows_uploads.files[0].size
+                  - windows_target.stat.checksum == windows_uploads.files[0].checksum
+
+        - name: Опционально проверить Remote HTTP-туннель
+          when: smoke_test_remote_tunnel | bool
+          block:
+            - name: Найти туннель Example HTTP
+              ansible.builtin.set_fact:
+                http_tunnels: >-
+                  {{ kitty_manager_tunnels | default([])
+                     | selectattr('kind', 'equalto', 'remote')
+                     | selectattr('name', 'equalto', 'Example HTTP') | list }}
+            - name: Проверить настройку туннеля
+              ansible.builtin.assert:
+                that:
+                  - http_tunnels | length == 1
+                  - http_tunnels[0].bind_host == '127.0.0.1'
+            - name: Запросить тестовый файл через порт на сервере
+              ansible.builtin.uri:
+                url: "http://{{ http_tunnels[0].bind_host }}:{{ http_tunnels[0].bind_port }}/tunnel.txt"
+                return_content: true
+                use_proxy: false
+                timeout: 10
+              register: http_probe
+            - name: Проверить содержимое ответа
+              ansible.builtin.assert:
+                that: http_probe.content == 'kitty-tunnel-ok\n'
+
+        - name: Опционально проверить реальное повышение прав
+          when: smoke_test_become | bool
+          block:
+            - name: Узнать UID исходной SSH-учётки
+              ansible.builtin.command: id -u
+              register: session_uid
+              changed_when: false
+            - name: Убедиться что исходная учётка не root
+              ansible.builtin.assert:
+                that: session_uid.stdout | trim != '0'
+            - name: Выполнить команду с повышением прав
+              ansible.builtin.command: id -u
+              become: true
+              become_user: root
+              register: elevated_uid
+              changed_when: false
+            - name: Проверить UID после повышения
+              ansible.builtin.assert:
+                that: elevated_uid.stdout | trim == '0'
+
+        - name: Опционально загрузить зашифрованную переменную Vault
+          ansible.builtin.include_vars: files/demo-vault.yml
+          when: smoke_test_vault | bool
+          no_log: true
+
+        - name: Опционально проверить расшифровку без вывода значения
+          ansible.builtin.assert:
+            that: smoke_vault_value == 'public-demo-value'
+          when: smoke_test_vault | bool
+          no_log: true
+
+        - name: Выполнить handler до проверки результатов
+          ansible.builtin.meta: flush_handlers
+
+        - name: Прочитать результаты на сервере
+          ansible.builtin.slurp:
+            src: "{{ smoke_root }}/{{ item }}"
+          loop:
+            - result.json
+            - payload.txt
+            - shell-count.txt
+            - report.txt
+            - role.marker
+            - handler.marker
+            - async.marker
+          register: outputs
+
+        - name: Проверить результаты и ветви выполнения
+          ansible.builtin.assert:
+            that:
+              - processor.rc == 0
+              - (outputs.results[0].content | b64decode | from_json) == {'count':3, 'sum':87, 'names':['alpha','beta','gamma']}
+              - "'updated_value=ready' in (outputs.results[1].content | b64decode)"
+              - outputs.results[2].content | b64decode | trim == '3'
+              - "('host=' ~ inventory_hostname) in (outputs.results[3].content | b64decode)"
+              - "'values=87' in (outputs.results[3].content | b64decode)"
+              - outputs.results[4].content | b64decode | trim == 'role-ran=true'
+              - outputs.results[5].content | b64decode | trim == 'handler-ran=true'
+              - outputs.results[6].content | b64decode | trim == 'async=ok'
+              - collection_verified | bool
+              - skipped_probe is skipped
+              - rescue_verified | bool
+              - "'prompt-and-response-ok' in interactive_probe.stdout"
+
+        - name: Создать маркер на контроллере через delegate_to
+          ansible.builtin.copy:
+            dest: "{{ controller_temp.path }}/delegate.marker"
+            mode: '0600'
+            content: "{{ inventory_hostname }}\n"
+          delegate_to: localhost
+
+        - name: Прочитать маркер контроллера
+          ansible.builtin.slurp:
+            src: "{{ controller_temp.path }}/delegate.marker"
+          delegate_to: localhost
+          register: controller_marker
+
+        - name: Проверить результат delegate_to
+          ansible.builtin.assert:
+            that: controller_marker.content | b64decode | trim == inventory_hostname
+
+        - name: Подготовить итоговый отчёт с явным покрытием
+          ansible.builtin.copy:
+            dest: "{{ smoke_root }}/summary.json"
+            mode: '0600'
+            content: >-
+              {{ {'result':'PASS', 'host':inventory_hostname,
+                  'windows_upload':smoke_test_windows_upload | bool,
+                  'remote_tunnel':smoke_test_remote_tunnel | bool,
+                  'become':smoke_test_become | bool,
+                  'vault':smoke_test_vault | bool} | to_nice_json }}
+
+        - name: Создать архив результатов стандартным tar
+          ansible.builtin.command:
+            argv: [tar, -czf, results.tar.gz, summary.json, result.json, report.txt, smoke.log]
+            chdir: "{{ smoke_root }}"
+          changed_when: true
+
+        - name: Выгрузить результаты в отдельную папку запуска
+          ansible.builtin.fetch:
+            src: "{{ smoke_root }}/{{ item }}"
+            dest: "{{ kitty_download_dir }}/{{ smoke_root | basename }}/{{ item }}"
+            flat: true
+          loop: [summary.json, results.tar.gz, smoke.log]
+
+
+      always:
+        - name: Удалить запись завершённого async-действия
+          ansible.builtin.async_status:
+            jid: "{{ async_job.ansible_job_id }}"
+            mode: cleanup
+          when: async_job is defined and async_job.ansible_job_id is defined
+
+        - name: Удалить только созданную этим запуском папку сервера
+          ansible.builtin.file:
+            path: "{{ target_temp.path }}"
+            state: absent
+          when: target_temp is defined and target_temp.path is defined
+
+        - name: Удалить только созданную этим запуском папку контроллера
+          ansible.builtin.file:
+            path: "{{ controller_temp.path }}"
+            state: absent
+          delegate_to: localhost
+          when: controller_temp is defined and controller_temp.path is defined
+
+    - name: Проверить очистку сервера
+      ansible.builtin.stat:
+        path: "{{ smoke_root }}"
+      register: cleaned_target
+
+    - name: Проверить очистку контроллера
+      ansible.builtin.stat:
+        path: "{{ controller_temp.path }}"
+      delegate_to: localhost
+      register: cleaned_controller
+
+    - name: ANSIBLE_SMOKE_OK — проверки и очистка завершены
+      ansible.builtin.assert:
+        that:
+          - not cleaned_target.stat.exists
+          - not cleaned_controller.stat.exists
+
+  handlers:
+    - name: Record generated files
+      ansible.builtin.copy:
+        dest: "{{ smoke_root }}/handler.marker"
+        mode: '0600'
+        content: "handler-ran=true\n"

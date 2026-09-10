@@ -4,6 +4,8 @@ public static class TreeSelectionPolicy
 {
     public static bool NextBranchClick(bool? current) => current == false;
 
+    public static bool ShouldHandleRowClick(bool originatedInCheckBox) => !originatedInCheckBox;
+
     public static bool? Aggregate(IEnumerable<bool?> children)
     {
         var values = children.ToArray();

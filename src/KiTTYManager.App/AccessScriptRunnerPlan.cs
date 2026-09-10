@@ -104,7 +104,7 @@ internal sealed class AccessScriptRunnerPlan : IDisposable
         foreach (var argument in JumphostStartupPlan.KittyAuthenticationArguments(
                      server, preserveSavedAuthentication))
             info.ArgumentList.Add(argument);
-        var keyPath = ManagerPathResolver.ResolveOptionalFile(server.PrivateKeyPath, "SSH-ключ");
+        var keyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
         if (keyPath is not null)
         {
             info.ArgumentList.Add("-i");

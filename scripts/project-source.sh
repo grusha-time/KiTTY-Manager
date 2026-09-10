@@ -41,6 +41,9 @@ case "${1:-}" in
     tar -C "$PROJECT_DIR" \
       --exclude='src/*/bin' \
       --exclude='src/*/obj' \
+      --exclude='src/*/*_wpftmp.csproj' \
+      --exclude='*/__pycache__' \
+      --exclude='*.pyc' \
       --exclude='.dotnet' \
       --exclude='.dotnet_home' \
       --exclude='.nuget' \
@@ -50,7 +53,8 @@ case "${1:-}" in
       --exclude='downloads' \
       --exclude='Data' \
       --exclude='TestResults' \
-      -czf "$archive" src packaging scripts README.md install-instruction.md vendor/KITTY-LICENCE.TXT
+      -czf "$archive" src packaging scripts wiki README.md install-instruction.md \
+        .gitignore examples vendor/KITTY-LICENCE.TXT
     ls -lh -- "$archive"
     ;;
   install)

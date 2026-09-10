@@ -4,7 +4,32 @@ public static class ManagedServerDuplicator
 {
     public static ManagedServer Duplicate(ManagerConfig config, ManagedServer source)
     {
-        var copy = new ManagedServer
+        var copy = Create(config, source, resetRuntime: false);
+        AddToSourceGroup(config, source, copy);
+        return copy;
+    }
+
+    public static ManagedServer CreateQuickDuplicate(ManagerConfig config, ManagedServer source) =>
+        Create(config, source, resetRuntime: true);
+
+    public static void RefreshQuickDuplicateName(ManagerConfig config, ManagedServer source,
+        ManagedServer copy, string initiallyGeneratedName)
+    {
+        if (!copy.Name.Equals(initiallyGeneratedName, StringComparison.Ordinal) ||
+            config.AllServers().All(server => !server.Name.Equals(copy.Name, StringComparison.OrdinalIgnoreCase))) return;
+        copy.Name = UniqueName(config, source.Name);
+    }
+
+    public static void AddToSourceGroup(ManagerConfig config, ManagedServer source, ManagedServer copy)
+    {
+        var group = config.AllGroups().FirstOrDefault(candidate => candidate.Servers.Any(server => server.Id == source.Id));
+        if (group is null) config.UngroupedServers.Add(copy);
+        else group.Servers.Add(copy);
+    }
+
+    private static ManagedServer Create(ManagerConfig config, ManagedServer source, bool resetRuntime)
+    {
+        return new ManagedServer
         {
             Name = UniqueName(config, source.Name),
             Host = source.Host,
@@ -19,7 +44,9 @@ public static class ManagedServerDuplicator
             ShellPrompt = source.ShellPrompt,
             ImportedCommand = source.ImportedCommand,
             IgnoreImportedCommand = source.IgnoreImportedCommand,
-            HostKeyFingerprint = source.HostKeyFingerprint,
+            HostKeyFingerprint = resetRuntime ? "" : source.HostKeyFingerprint,
+            HostKeyAlgorithm = resetRuntime ? "" : source.HostKeyAlgorithm,
+            HostKeyBits = resetRuntime ? 0 : source.HostKeyBits,
             // A duplicate is manager-owned: loading the original KiTTY session would ignore its edited host/port.
             SourceSessionPath = null,
             SourceScriptPath = source.SourceScriptPath,
@@ -38,7 +65,7 @@ public static class ManagedServerDuplicator
             }).ToList(),
             RequiredPreviousServerId = source.RequiredPreviousServerId,
             TryDirectWithoutJumphost = source.TryDirectWithoutJumphost,
-            WebInterfaces = source.WebInterfaces.Select(web => new WebInterface
+            WebInterfaces = resetRuntime ? [] : source.WebInterfaces.Select(web => new WebInterface
             {
                 Name = web.Name,
                 Url = web.Url,
@@ -46,10 +73,12 @@ public static class ManagedServerDuplicator
                 Password = web.Password,
                 ResolverAddress = web.ResolverAddress
             }).ToList(),
-            BackupEndpoints = source.BackupEndpoints.Select(endpoint => new ServerEndpoint(endpoint.Host, endpoint.Port)).ToList(),
-            PreferredProxyId = source.PreferredProxyId,
-            PreferredEndpoint = source.PreferredEndpoint is null ? null : new ServerEndpoint(source.PreferredEndpoint.Host, source.PreferredEndpoint.Port),
-            EndpointPreferences = source.EndpointPreferences.Select(item => new EndpointPreference
+            BackupEndpoints = resetRuntime ? [] : source.BackupEndpoints.Select(endpoint => new ServerEndpoint(endpoint.Host, endpoint.Port, endpoint.InternalOnly)).ToList(),
+            PreferredProxyId = resetRuntime ? null : source.PreferredProxyId,
+            // Ordinary duplication historically did not copy a cached route.
+            PreferredRoute = null,
+            PreferredEndpoint = resetRuntime || source.PreferredEndpoint is null ? null : new ServerEndpoint(source.PreferredEndpoint.Host, source.PreferredEndpoint.Port),
+            EndpointPreferences = resetRuntime ? [] : source.EndpointPreferences.Select(item => new EndpointPreference
             {
                 ProxyId = item.ProxyId,
                 PreviousServerId = item.PreviousServerId,
@@ -57,11 +86,6 @@ public static class ManagedServerDuplicator
                 LastSuccessUtc = item.LastSuccessUtc
             }).ToList()
         };
-
-        var group = config.AllGroups().FirstOrDefault(candidate => candidate.Servers.Any(server => server.Id == source.Id));
-        if (group is null) config.UngroupedServers.Add(copy);
-        else group.Servers.Add(copy);
-        return copy;
     }
 
     private static string UniqueName(ManagerConfig config, string sourceName)
@@ -75,4 +99,20 @@ public static class ManagedServerDuplicator
             if (!names.Contains(name)) return name;
         }
     }
+}
+
+public static class QuickDuplicatePolicy
+{
+    public static IReadOnlyList<Guid> DefaultLinkSourceIds(ManagerConfig config, ManagedServer source)
+    {
+        var group = config.FindServerGroup(source.Id);
+        if (group is null)
+            return ConnectivityBatchPlanner.DirectlyReachable(config, [source.Id]);
+        return ConnectivityBatchPlanner.DirectlyReachable(config, NestedServers(group).Select(server => server.Id))
+            .Distinct()
+            .ToArray();
+    }
+
+    private static IEnumerable<ManagedServer> NestedServers(ServerGroup group) =>
+        group.Servers.Concat(group.Groups.SelectMany(NestedServers));
 }

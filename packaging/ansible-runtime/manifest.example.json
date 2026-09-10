@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "ansibleCoreVersion": "2.16.PATCH",
+  "components": [
+    {
+      "name": "QEMU for Windows",
+      "role": "qemu",
+      "relativePath": "qemu/qemu-system-x86_64.exe",
+      "sha256": "REPLACE_WITH_REAL_SHA256",
+      "licenseRelativePath": "licenses/QEMU.txt"
+    },
+    {
+      "name": "Immutable Linux base image",
+      "role": "linux-image",
+      "relativePath": "images/ansible-base.qcow2",
+      "sha256": "REPLACE_WITH_REAL_SHA256",
+      "licenseRelativePath": "licenses/Linux.txt"
+    },
+    {
+      "name": "Python inside Linux image",
+      "role": "python",
+      "relativePath": "metadata/python.version",
+      "sha256": "REPLACE_WITH_REAL_SHA256",
+      "licenseRelativePath": "licenses/Python.txt"
+    },
+    {
+      "name": "ansible-core inside Linux image",
+      "role": "ansible-core",
+      "relativePath": "metadata/ansible-core.version",
+      "sha256": "REPLACE_WITH_REAL_SHA256",
+      "licenseRelativePath": "licenses/Ansible.txt"
+    }
+  ]
+}

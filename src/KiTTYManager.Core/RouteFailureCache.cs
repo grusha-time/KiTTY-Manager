@@ -8,7 +8,7 @@ public sealed class RouteFailureCache
 
     public bool ShouldSkip(RouteCandidate candidate, DateTimeOffset now)
     {
-        if (candidate.Servers.Count != 1) return false;
+        if (candidate.Servers.Count == 0) return false;
         return failures.TryGetValue((candidate.Proxy.Id, candidate.Servers[0].Id), out var failedAt) &&
                now - failedAt < FailureTtl;
     }
@@ -21,7 +21,7 @@ public sealed class RouteFailureCache
 
     public void ClearSuccess(RouteCandidate candidate)
     {
-        if (candidate.Servers.Count == 1)
+        if (candidate.Servers.Count > 0)
             failures.TryRemove((candidate.Proxy.Id, candidate.Servers[0].Id), out _);
     }
 

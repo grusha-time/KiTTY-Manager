@@ -15,7 +15,16 @@ public static class RoutePreferencePolicy
         IReadOnlyList<RouteCandidate> rankedCandidates, RouteCandidate current)
     {
         var index = IndexOf(rankedCandidates, current);
-        return index <= 0 ? [] : rankedCandidates.Take(index).ToArray();
+        if (index < 0) return [];
+        var shorter = rankedCandidates
+            .Select((candidate, position) => (candidate, position))
+            .Where(item => item.candidate.Servers.Count < current.Servers.Count)
+            .OrderBy(item => item.candidate.Servers.Count)
+            .ThenBy(item => item.position)
+            .Select(item => item.candidate);
+        var equallyShortAndHigherRanked = rankedCandidates.Take(index)
+            .Where(candidate => candidate.Servers.Count == current.Servers.Count);
+        return shorter.Concat(equallyShortAndHigherRanked).ToArray();
     }
 
     public static bool Matches(CachedRoute? cached, RouteCandidate candidate) =>

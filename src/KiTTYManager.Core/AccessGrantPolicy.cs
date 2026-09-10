@@ -63,6 +63,11 @@ public static class AccessGrantPolicy
         (proxy.LastAccessScriptAttemptUtc is null ||
          now - proxy.LastAccessScriptAttemptUtc >= FailureRetryCooldown);
 
+    public static bool ShouldCheckControlsAfterRouteFailure(BaseProxy proxy) =>
+        proxy.EnableControlServerMechanism &&
+        !string.IsNullOrWhiteSpace(proxy.PostLoginCommand) &&
+        proxy.AccessProbeServerIds.Count > 0;
+
     public static void MarkScriptAttempt(BaseProxy proxy, DateTimeOffset now) =>
         (proxy.LastAccessScriptAttemptUtc, proxy.LastAccessScriptResult) = (now, "Attempted");
 
@@ -170,7 +175,12 @@ public static class AccessGrantPolicy
 
     private static DateTimeOffset ScheduledRunDueUtc(BaseProxy proxy)
     {
-        var confirmed = proxy.AccessScheduleBaselineUtc ?? LatestConfirmationUtc(proxy);
+        // Control-server checks confirm access, but must not postpone a configured
+        // periodic script run. Prefer real script success over old bad baselines.
+        var confirmed = proxy.LastAccessScriptResult == "AccessStillValid" &&
+                        proxy.LastAccessScriptSuccessUtc is not null
+            ? proxy.LastAccessScriptSuccessUtc
+            : proxy.AccessScheduleBaselineUtc ?? LatestConfirmationUtc(proxy);
         var scheduled = confirmed is { } success
             ? success + TimeSpan.FromMinutes(Math.Max(1, proxy.ScheduledRestartMinutes))
             : DateTimeOffset.MinValue;

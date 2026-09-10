@@ -35,6 +35,35 @@ public static class ConnectivityBatchExecutor
         return results;
     }
 
+    /// <summary>
+    /// Checks exactly the requested directed pairs. Each source is opened once
+    /// for all its targets; there is no reverse fallback or source reconnect.
+    /// </summary>
+    public static async Task<IReadOnlyList<ConnectivityResult>> CheckDirectedAsync(
+        IEnumerable<ConnectivityPairChoice> pairs,
+        CheckFrom checkFrom,
+        CancellationToken cancellationToken = default,
+        Action<ConnectivityResult>? resultObserved = null)
+    {
+        var directions = ConnectivityPairSelectionPolicy.Selected(pairs);
+        var results = new List<ConnectivityResult>();
+        foreach (var batch in directions.GroupBy(pair => pair.SourceId))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var targetIds = batch.Select(pair => pair.TargetId).Distinct().ToArray();
+            var batchResults = await checkFrom(batch.Key, targetIds, cancellationToken);
+            var requested = targetIds.ToHashSet();
+            foreach (var result in batchResults.Where(result =>
+                         result.SourceId == batch.Key && requested.Contains(result.TargetId))
+                     .DistinctBy(result => result.TargetId))
+            {
+                results.Add(result);
+                resultObserved?.Invoke(result);
+            }
+        }
+        return results;
+    }
+
     private static IEnumerable<ConnectivityBatch> Batches(
         IEnumerable<(ManagedServer Source, ManagedServer Target)> directions) =>
         directions

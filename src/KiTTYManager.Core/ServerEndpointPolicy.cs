@@ -23,6 +23,7 @@ public static class ServerEndpointPolicy
         foreach (var backup in server.BackupEndpoints)
         {
             if (backup.Port <= 0) continue;
+            if (backup.InternalOnly && context?.PreviousServerId is null) continue;
             var resolved = Resolve(server, backup);
             if (!ordered.Contains(resolved)) ordered.Add(resolved);
         }
@@ -83,5 +84,5 @@ public static class ServerEndpointPolicy
 
     private static ServerEndpoint Resolve(ManagedServer server, ServerEndpoint endpoint) =>
         new(string.IsNullOrWhiteSpace(endpoint.Host) ? server.CleanHost : endpoint.Host.Trim(),
-            endpoint.Port);
+            endpoint.Port, endpoint.InternalOnly);
 }

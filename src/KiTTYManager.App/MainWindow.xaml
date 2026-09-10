@@ -18,9 +18,9 @@
           <TextBlock Text="Сессии, маршруты и веб-интерфейсы" Foreground="#858585" FontSize="12"/>
         </StackPanel>
         <WrapPanel Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
-          <Button Click="Jumphosts_Click" Style="{StaticResource PrimaryButton}" Margin="0,0,8,0">Настроить точки входа</Button>
-          <Button Click="Settings_Click" Margin="0,0,8,0">Настройки</Button>
-          <Button Click="More_Click">⋯</Button>
+          <Button Click="ShowBatchTasks_Click" Margin="0,0,8,0">Массовые задачи</Button>
+          <Button Click="ShowLinkMap_Click" Margin="0,0,8,0">Карта связей</Button>
+          <Button Click="More_Click">Меню</Button>
         </WrapPanel>
       </Grid>
     </Border>
@@ -84,6 +84,7 @@
                     ClipboardCopyMode="ExcludeHeader"
                     MouseDoubleClick="SessionsGrid_MouseDoubleClick" PreviewMouseMove="SessionsGrid_PreviewMouseMove"
                     PreviewMouseLeftButtonDown="SessionsGrid_PreviewMouseLeftButtonDown"
+                    PreviewMouseRightButtonDown="SessionsGrid_PreviewMouseRightButtonDown"
                     ContextMenuOpening="SessionsGrid_ContextMenuOpening">
             <DataGrid.ColumnHeaderStyle>
               <Style TargetType="DataGridColumnHeader" BasedOn="{StaticResource {x:Type DataGridColumnHeader}}">
@@ -94,11 +95,13 @@
               <ContextMenu>
                 <MenuItem Header="Копировать строку" Command="ApplicationCommands.Copy"/>
                 <Separator/>
-                <MenuItem Header="Создать сессию вручную" Click="CreateSession_Click"/>
+                <MenuItem Header="Создать новую сессию" Click="CreateSession_Click"/>
                 <MenuItem Header="Дублировать сессию" Click="DuplicateSession_Click"/>
+                <MenuItem Header="Быстрый дубль" Click="QuickDuplicateSession_Click"/>
                 <Separator/>
                 <MenuItem Header="Подключиться" Click="OpenRoutedConsole_Click"/>
-                <MenuItem Header="Открыть сохранённую сессию KiTTY напрямую" Click="OpenOriginalSession_Click"/>
+                <MenuItem x:Name="SaveToKittyMenuItem" Header="Сохранить в KiTTY" Click="SaveToKitty_Click"/>
+                <MenuItem Header="Открыть в WinSCP" Click="OpenWinScp_Click"/>
                 <MenuItem Header="Проверить доступ к другим серверам…" Click="CheckConnectivity_Click"/>
                 <MenuItem Header="Сохранённые связи…" Click="ShowSavedLinks_Click"/>
                 <Separator/>
@@ -124,7 +127,6 @@
             <Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
               <TextBlock Text="Веб-интерфейсы" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center"/>
-              <Button Grid.Column="1" Click="AddWeb_Click">Добавить</Button>
             </Grid>
             <TextBlock Margin="0,7,0,0" Foreground="#858585" FontSize="12" TextWrapping="Wrap"
                        Text="Логин и пароль хранятся как подсказка. Firefox не заполняет их автоматически."/>
@@ -155,8 +157,8 @@
                 <DataGridTextColumn Header="URL" Binding="{Binding Url, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="2*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
                 <DataGridTextColumn Binding="{Binding ResolverAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}">
                   <DataGridTextColumn.Header>
-                    <TextBlock Text="Резолвить домен по адресу"
-                               ToolTip="Если поле пустое, используется адрес выбранной сессии."/>
+                    <TextBlock Text="Адрес DNS"
+                               ToolTip="Если указан IP, менеджер сам разрешает домен через веб-туннель. Если поле пустое, используется системное разрешение DNS и файл hosts."/>
                   </DataGridTextColumn.Header>
                 </DataGridTextColumn>
                 <DataGridTextColumn Header="Логин" Binding="{Binding Username, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
@@ -176,17 +178,19 @@
             </DataGrid>
             <WrapPanel Margin="0,10,0,0">
               <Button Click="OpenWeb_Click" Margin="0,0,8,0">Открыть веб-интерфейс</Button>
-              <Button Click="RemoveWeb_Click">Удалить выбранный интерфейс</Button>
+              <Button Click="AddWeb_Click" Style="{StaticResource SuccessButton}" Margin="0,0,8,0">Добавить</Button>
+              <Button Click="RemoveWeb_Click" Style="{StaticResource DangerButton}">Удалить</Button>
             </WrapPanel>
 
             <Border Margin="0,22,0,18" BorderBrush="#292929" BorderThickness="0,1,0,0"/>
             <WrapPanel>
               <Button Click="ApplyServer_Click" Height="38" Margin="0,0,8,8">Сохранить изменения</Button>
-              <Button x:Name="SaveToKittyButton" Click="SaveToKitty_Click" Height="38" Margin="0,0,8,8" Visibility="Collapsed">Сохранить в KiTTY</Button>
-              <Button Click="DuplicateSession_Click" Height="38" Margin="0,0,8,8">Дублировать</Button>
+              <Button Click="QuickDuplicateSession_Click" Height="38" Margin="0,0,8,8">Быстрый дубль</Button>
               <Button Click="OpenRoutedConsole_Click" Style="{StaticResource PrimaryButton}" Height="38" Margin="0,0,8,8">Подключиться</Button>
+              <Button Click="OpenWinScp_Click" Height="38" Margin="0,0,8,8"
+                      ToolTip="Открыть выбранную сессию в WinSCP через умный маршрут">Открыть в WinSCP</Button>
               <Button x:Name="StartJumphostButton" Click="StartJumphost_Click" Height="38" Margin="0,0,8,8" Visibility="Collapsed">Запустить как точку входа</Button>
-              <Button Click="CheckConnectivity_Click" Height="38" Margin="0,0,8,8">Проверить доступ к другим серверам…</Button>
+              <Button Click="CheckConnectivity_Click" Height="38" Margin="0,0,8,8">Построить связь с другими серверами…</Button>
               <Button Click="ShowSavedLinks_Click" Height="38" Margin="0,0,8,8">Сохранённые связи…</Button>
             </WrapPanel>
             <TextBlock x:Name="LastRouteText" Margin="0,4,0,0"
@@ -252,19 +256,22 @@
             <Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
               <TextBlock Text="Резервные адреса (ip:port)" FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center"/>
-              <Button Grid.Column="1" Click="AddBackupEndpoint_Click">Добавить</Button>
             </Grid>
             <TextBlock Margin="0,7,0,0" Foreground="#858585" FontSize="12" TextWrapping="Wrap"
-                       Text="Адреса, по которым сервер доступен, если основной порт не подошёл (например, другой SSH‑порт внутри подсети проекта). Менеджер стучится сначала по основному адресу, затем по резервным; последний рабочий запоминается и в следующий раз идёт первым, а при его отказе менеджер сам переключится обратно. Пустой IP = тот же хост, что и основной."/>
+                       Text="Адреса, по которым сервер доступен, если основной порт не подошёл. Внутренний адрес используется только после перехода через другой сервер; для первого подключения от ПК или точки входа он не применяется. Пустой IP = основной хост."/>
             <DataGrid x:Name="BackupGrid" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="False"
                       MinHeight="90" Margin="0,10,0,0" CellEditEnding="BackupGrid_CellEditEnding">
               <DataGrid.Columns>
                 <DataGridTextColumn Header="IP (необязательно)" Binding="{Binding Host, Mode=TwoWay, UpdateSourceTrigger=LostFocus}" Width="2*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
                 <DataGridTextColumn Header="Порт" Binding="{Binding Port, Mode=TwoWay, UpdateSourceTrigger=LostFocus}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                <DataGridCheckBoxColumn Header="Внутренняя подсеть" Binding="{Binding InternalOnly, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                        ElementStyle="{StaticResource DataGridCheckBoxStyle}"
+                                        EditingElementStyle="{StaticResource DataGridCheckBoxStyle}" Width="*"/>
               </DataGrid.Columns>
             </DataGrid>
             <WrapPanel Margin="0,10,0,0">
-              <Button Click="RemoveBackupEndpoint_Click">Удалить</Button>
+              <Button Click="AddBackupEndpoint_Click" Style="{StaticResource SuccessButton}" Margin="0,0,8,0">Добавить</Button>
+              <Button Click="RemoveBackupEndpoint_Click" Style="{StaticResource DangerButton}">Удалить</Button>
             </WrapPanel>
           </StackPanel>
         </ScrollViewer>
@@ -280,7 +287,7 @@
         </Grid.ColumnDefinitions>
         <TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="#8A8A8A" TextTrimming="CharacterEllipsis"/>
         <Button x:Name="CancelOperationButton" Grid.Column="1" Height="32" MinHeight="32" Padding="12,4" Margin="12,0"
-                Visibility="Collapsed" Click="CancelOperation_Click">Отменить</Button>
+                Visibility="Collapsed" Click="CancelOperation_Click">Остановить</Button>
         <TextBlock Grid.Column="2" VerticalAlignment="Center" Foreground="#707070" Text="Перетащите сессию на группу • Двойной клик — умное подключение"/>
       </Grid>
     </Border>

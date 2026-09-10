@@ -12,49 +12,44 @@
       <StackPanel Margin="0,0,10,0">
         <TextBlock Text="Путь к KiTTY" Margin="0,0,0,7"/><TextBox x:Name="KittyBox"/>
         <TextBlock Text="Путь к Firefox" Margin="0,18,0,7"/><TextBox x:Name="FirefoxBox"/>
-        <TextBlock Text="Имя отдельного Firefox-профиля" Margin="0,18,0,7"/><TextBox x:Name="ProfileBox"/>
-        <TextBlock Text="Шаблон профиля Firefox (папка, необязательно)" Margin="0,18,0,7"/>
+        <TextBlock Text="Путь к WinSCP (необязательно)" Margin="0,18,0,7"/><TextBox x:Name="WinScpBox" ToolTip="Пустое поле — автоматический поиск WinSCP.exe"/>
+        <CheckBox x:Name="AutoDiscoverFirefoxProfileBox" Margin="0,18,0,7"
+                  Content="Автоматический поиск профиля Firefox" Checked="AutoDiscoverFirefoxProfile_Changed" Unchecked="AutoDiscoverFirefoxProfile_Changed"/>
+        <TextBlock Text="Шаблон профиля Firefox (исходный профиль)" Margin="0,8,0,7"/>
         <DockPanel>
           <Button x:Name="BrowseTemplateButton" DockPanel.Dock="Right" Content="Выбрать…" Margin="8,0,0,0" Click="BrowseTemplate_Click" Padding="12,4"/>
-          <TextBox x:Name="TemplateProfileBox" ToolTip="Путь к настроенному профилю Firefox. Менеджер копирует его для каждого веб-интерфейса. Оставьте пустым для создания профиля с нуля."/>
+          <TextBox x:Name="TemplateProfileBox" ToolTip="В ручном режиме укажите исходный профиль Firefox. Менеджер создаёт из него отдельную копию для каждого веб-интерфейса."/>
         </DockPanel>
         <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="Укажите папку профиля Firefox, в котором отключён чекбокс «Отправлять DNS-запросы через прокси при использовании SOCKS 5» (Настройки Firefox → Основные → Параметры сети → Настроить… → раздел «Ручная настройка прокси», внизу списка). Менеджер будет копировать эту папку, не изменяя оригинал. Как найти папку: откройте Firefox, введите в адресную строку about:support, скопируйте путь из поля «Папка профиля» и выберите эту папку здесь."/>
+                   Text="Автопоиск читает %APPDATA%\Mozilla\Firefox\profiles.ini. Менеджер копирует исходный профиль (key4.db, cert9.db, logins.json и настройки) напрямую в отдельную временную папку для каждого веб-интерфейса. Исходный профиль не изменяется."/>
         <TextBlock Text="Таймаут одной попытки подключения, сек" Margin="0,18,0,7"/>
-        <TextBox x:Name="ConnectionTimeoutBox" MaxLength="3" ToolTip="Допустимое значение: от 10 до 600 секунд"/>
+        <TextBox x:Name="ConnectionTimeoutBox" MaxLength="3" ToolTip="Допустимое значение: от 3 до 600 секунд"/>
         <TextBlock Text="Лимит зонда одного адреса, сек" Margin="0,18,0,7"/>
         <TextBox x:Name="EndpointProbeTimeoutBox" MaxLength="2" ToolTip="Допустимое значение: от 1 до 30 секунд"/>
         <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="Короткая проверка доступности конкретного основного или резервного ip:port. Входит в общий таймаут попытки маршрута."/>
+        <TextBlock Text="Ожидание восстановления связи в задачах, мин" Margin="0,18,0,7"/>
+        <TextBox x:Name="TaskConnectionRecoveryBox" MaxLength="5"
+                 ToolTip="От 0 до 99999 минут. Массовая задача или Ansible повторяет подключение каждые 10 секунд и не переходит к следующему действию. После таймаута можно продлить ожидание или остановить задачу."/>
         <Border Margin="0,22,0,18" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"/>
         <CheckBox x:Name="CloseToTrayBox" Content="По крестику скрывать менеджер в системный трей"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="Обычные сессии KiTTY продолжают работать независимо. Автоматические маршруты требуют запущенного менеджера."/>
         <CheckBox x:Name="EnableLoggingBox" Margin="0,20,0,0" Content="Записывать журнал работы менеджера"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="По умолчанию журнал отключён. Единый отчёт run-tests.cmd создаётся независимо от этой настройки."/>
+                   Text="По умолчанию журнал отключён. Журналы массовых задач доступны отдельно в окне их выполнения."/>
         <CheckBox x:Name="WriteToKittyBox" Margin="0,20,0,0" Content="Записывать изменения сразу в KiTTY"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="Запись выполняется после кнопки «Сохранить изменения» и только в папку KiTTY рядом с менеджером."/>
         <CheckBox x:Name="CloseWebTunnelBox" Margin="0,20,0,0" Content="Закрывать консоль веб-туннеля после закрытия Firefox"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="По умолчанию выключено: консоль KiTTY остаётся открытой, пока вы не закроете её вручную."/>
-        <CheckBox x:Name="TemporaryFirefoxProfilesBox" Margin="0,20,0,0" Content="Использовать временные профили Firefox"/>
-        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="Если включено, профиль удаляется после закрытия Firefox. Если выключено, профиль сессии сохраняет сертификаты и настройки."/>
-        <CheckBox x:Name="ShareFirefoxProfileByGroupBox" Margin="0,20,0,0" Content="Один профиль Firefox для сессий одной группы"/>
-        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="Работает для постоянных профилей и экономит место. В одной группе одновременно используется один веб-туннель; для параллельной работы отключите эту настройку. При перемещении сессии лишние профили удаляются."/>
-        <CheckBox x:Name="UseInternalWebResolverBox" Margin="0,20,0,0"
-                  Content="Использовать внутренний DNS для веб-интерфейсов"/>
-        <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="По умолчанию выключено: используется системный DNS/hosts. Если включить, менеджер использует собственный HTTP/HTTPS-прокси и направляет настроенные домены через выбранную сессию. Адрес можно переопределить у веб-интерфейса."/>
         <CheckBox x:Name="AutoConfirmHostKeysBox" Margin="0,20,0,0" Content="Автоматически доверять новым и изменённым SSH host key"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="Новые и изменённые ключи принимаются без диалога и сохраняются после успешного подключения. Отключите настройку, если хотите сверять каждый новый или изменившийся отпечаток вручную."/>
         <CheckBox x:Name="SuppressKittyChangesBox" Margin="0,20,0,0" Content="Не показывать уведомления об изменениях KiTTY при запуске"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="Изменения по-прежнему доступны в меню ⋯ → «Изменения KiTTY…». Включите, если храните сессии только в менеджере."/>
+                   Text="Изменения по-прежнему доступны в меню «Меню → Изменения KiTTY…». Включите, если храните сессии только в менеджере."/>
         <CheckBox x:Name="RaceBestEntryPointsBox" Margin="0,20,0,0" Content="Параллельно проверять две лучшие точки входа"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="По умолчанию выключено. Если две лучшие JH уже запущены, менеджер одновременно проверит оба маршрута и возьмёт первый успешный. Это ускоряет отказ недоступной JH, но создаёт два одновременных SSH-подключения."/>
@@ -62,6 +57,8 @@
                   Content="В режиме карты проверять только новые связи"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="По умолчанию включено. При проверке выбранных узлов карты уже сохранённые пары пропускаются. Обычные проверки связей эта настройка не ограничивает."/>
+        <CheckBox x:Name="OfferStartMissingJumphostsBox" Margin="0,20,0,0"
+                  Content="При запуске предлагать включить незапущенные точки входа"/>
       </StackPanel>
     </ScrollViewer>
     <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">

@@ -74,7 +74,7 @@
       <DataGrid x:Name="Grid" AutoGenerateColumns="False" CanUserAddRows="False" RowHeight="38"
                 SelectionChanged="Grid_SelectionChanged">
         <DataGrid.Columns>
-          <DataGridCheckBoxColumn Header="Включён" Binding="{Binding Enabled}" Width="84"/>
+          <DataGridCheckBoxColumn Header="Включён" Binding="{Binding Enabled}" Width="84" ElementStyle="{StaticResource DataGridCheckBoxStyle}" EditingElementStyle="{StaticResource DataGridCheckBoxStyle}"/>
           <DataGridTextColumn Header="Название" Binding="{Binding Name}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
           <DataGridTemplateColumn Header="Сессия jumphost" Width="2*">
             <DataGridTemplateColumn.CellTemplate><DataTemplate>

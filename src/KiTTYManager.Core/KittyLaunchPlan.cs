@@ -133,7 +133,7 @@ public static class KittyLaunchPlan
 
     private static void AddPrivateKey(List<string> arguments, ManagedServer server)
     {
-        var keyPath = ManagerPathResolver.ResolveOptionalFile(server.PrivateKeyPath, "SSH-ключ");
+        var keyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
         if (keyPath is not null) arguments.AddRange(["-i", keyPath]);
     }
 

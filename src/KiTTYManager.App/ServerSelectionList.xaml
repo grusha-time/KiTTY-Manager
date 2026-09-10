@@ -1,0 +1,52 @@
+<UserControl x:Class="KiTTYManager.App.ServerSelectionList"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:KiTTYManager.App"
+             Background="Transparent">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+    <TextBox x:Name="SearchBox" TextChanged="SearchBox_TextChanged"
+             ToolTip="Поиск по имени, IP, логину или группе"/>
+    <WrapPanel Grid.Row="1" Margin="0,8,0,8">
+      <Button Click="SelectVisible_Click" Margin="0,0,8,0">Выбрать найденные</Button>
+      <Button Click="ClearAll_Click">Снять весь выбор</Button>
+      <TextBlock x:Name="SelectionText" Margin="12,0,0,0" VerticalAlignment="Center"
+                 FontWeight="SemiBold"/>
+    </WrapPanel>
+    <Grid Grid.Row="2">
+      <ListBox x:Name="ChoicesList" MinHeight="120"
+               PreviewMouseLeftButtonDown="ChoicesList_PreviewMouseLeftButtonDown"
+               local:ScrollWheelForwarding.Enabled="True">
+        <ListBox.ItemContainerStyle>
+          <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+            <Setter Property="Padding" Value="4,2"/>
+            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+          </Style>
+        </ListBox.ItemContainerStyle>
+        <ListBox.ItemTemplate>
+          <DataTemplate>
+            <Grid Margin="{Binding Indent}">
+              <CheckBox IsChecked="{Binding IsChecked, Mode=OneWay}"
+                        IsThreeState="{Binding IsGroup}" IsHitTestVisible="False"
+                        VerticalAlignment="Center">
+                <StackPanel Margin="6,3,0,3">
+                  <TextBlock Text="{Binding Name}" FontWeight="{Binding FontWeight}"
+                             Foreground="{Binding Foreground}" TextTrimming="CharacterEllipsis"/>
+                  <TextBlock Text="{Binding Details}" Margin="0,2,0,0" FontSize="12"
+                             Foreground="{StaticResource MutedTextBrush}" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+              </CheckBox>
+            </Grid>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
+      <TextBlock x:Name="EmptyText" Text="Ничего не найдено"
+                 HorizontalAlignment="Center" VerticalAlignment="Center"
+                 Foreground="{StaticResource MutedTextBrush}" Visibility="Collapsed"/>
+    </Grid>
+  </Grid>
+</UserControl>

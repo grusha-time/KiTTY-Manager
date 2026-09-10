@@ -4,7 +4,18 @@ public sealed record LinkMapNode(
     Guid ServerId, string Name, string GroupPath, double X, double Y, int LinkCount);
 
 public sealed record LinkMapEdge(
-    Guid ServerAId, Guid ServerBId, bool IsAvailable, DateTimeOffset? LastSuccessUtc);
+    Guid ServerAId,
+    Guid ServerBId,
+    bool IsAvailable,
+    DateTimeOffset? LastSuccessUtc,
+    bool AtoBAvailable = false,
+    bool BtoAAvailable = false,
+    DateTimeOffset? AtoBSuccessUtc = null,
+    DateTimeOffset? BtoASuccessUtc = null)
+{
+    public bool IsBidirectional => AtoBAvailable && BtoAAvailable;
+    public bool IsDirected => AtoBAvailable ^ BtoAAvailable;
+}
 
 public sealed record LinkMapModel(
     IReadOnlyList<LinkMapNode> Nodes, IReadOnlyList<LinkMapEdge> Edges,
@@ -34,10 +45,23 @@ public static class LinkMapLayout
                            servers.ContainsKey(link.FromServerId) &&
                            servers.ContainsKey(link.ToServerId))
             .GroupBy(link => OrderedPair(link.FromServerId, link.ToServerId))
-            .Select(group => new LinkMapEdge(
-                group.Key.A, group.Key.B,
-                group.Any(link => link.LastSuccessUtc is not null),
-                group.Max(link => link.LastSuccessUtc)))
+            .Select(group =>
+            {
+                var aId = group.Key.A;
+                var bId = group.Key.B;
+                var aToB = group.Where(l => l.FromServerId == aId && l.ToServerId == bId).OrderByDescending(l => l.LastSuccessUtc).FirstOrDefault();
+                var bToA = group.Where(l => l.FromServerId == bId && l.ToServerId == aId).OrderByDescending(l => l.LastSuccessUtc).FirstOrDefault();
+                var aToBAvailable = aToB?.LastSuccessUtc is not null;
+                var bToAAvailable = bToA?.LastSuccessUtc is not null;
+                return new LinkMapEdge(
+                    aId, bId,
+                    aToBAvailable || bToAAvailable,
+                    group.Max(link => link.LastSuccessUtc),
+                    aToBAvailable,
+                    bToAAvailable,
+                    aToB?.LastSuccessUtc,
+                    bToA?.LastSuccessUtc);
+            })
             .OrderBy(edge => servers[edge.ServerAId].Name, StringComparer.CurrentCultureIgnoreCase)
             .ThenBy(edge => servers[edge.ServerBId].Name, StringComparer.CurrentCultureIgnoreCase)
             .ToArray();
@@ -342,5 +366,47 @@ public static class LinkMapLayout
             if (nested is not null) return nested;
         }
         return null;
+    }
+
+    public static string FormatTooltip(LinkMapEdge edge, string? nameA = null, string? nameB = null)
+    {
+        var labelA = nameA ?? "Узел 1";
+        var labelB = nameB ?? "Узел 2";
+        if (edge.IsBidirectional)
+        {
+            var dateStr = edge.LastSuccessUtc?.LocalDateTime.ToString("g") ?? "—";
+            return $"Связь двусторонняя (доступна в обоих направлениях)\nПоследний успех: {dateStr}";
+        }
+        if (edge.IsDirected)
+        {
+            var (from, to, time) = edge.AtoBAvailable
+                ? (labelA, labelB, edge.AtoBSuccessUtc)
+                : (labelB, labelA, edge.BtoASuccessUtc);
+            var dateStr = time?.LocalDateTime.ToString("g") ?? "—";
+            return $"Связь односторонняя:\n• {from} → {to}: доступна ({dateStr})\n• {to} → {from}: не подтверждена";
+        }
+        return "Связь сохранена, но подтверждённого успешного состояния сейчас нет ни в одну сторону";
+    }
+}
+
+public static class SavedLinkDirectionPolicy
+{
+    public static (string Direction, string StatusDetail) Evaluate(bool outgoingSuccess, bool incomingSuccess)
+    {
+        var direction = (outgoingSuccess, incomingSuccess) switch
+        {
+            (true, true) => "↔",
+            (true, false) => "→",
+            (false, true) => "←",
+            _ => "•—•"
+        };
+        var status = (outgoingSuccess, incomingSuccess) switch
+        {
+            (true, true) => "Двусторонняя связь подтверждена",
+            (true, false) => "Исходящая связь подтверждена; обратная не подтверждена",
+            (false, true) => "Обратная связь подтверждена; исходящая не подтверждена",
+            _ => "Связь сохранена, но ни одно направление не подтверждено"
+        };
+        return (direction, status);
     }
 }

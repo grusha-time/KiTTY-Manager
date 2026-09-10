@@ -16,6 +16,7 @@ public sealed class ResolvingHttpProxy : IDisposable, IAsyncDisposable
     private readonly string upstreamHost;
     private readonly int upstreamPort;
     private readonly IReadOnlyDictionary<string, IPAddress> mappings;
+    private readonly bool resolveUnmappedLocally;
     private readonly Action<string>? log;
     private readonly TcpListener listener = new(IPAddress.Loopback, 0);
     private readonly CancellationTokenSource cancellation = new();
@@ -26,12 +27,14 @@ public sealed class ResolvingHttpProxy : IDisposable, IAsyncDisposable
     public int Port { get; }
 
     public ResolvingHttpProxy(string upstreamHost, int upstreamPort,
-        IEnumerable<KeyValuePair<string, string>> mappings, Action<string>? log = null)
+        IEnumerable<KeyValuePair<string, string>> mappings, Action<string>? log = null,
+        bool resolveUnmappedLocally = false)
     {
         this.upstreamHost = upstreamHost;
         this.upstreamPort = upstreamPort;
         this.mappings = BuildMappings(mappings);
         this.log = log;
+        this.resolveUnmappedLocally = resolveUnmappedLocally;
         listener.Start();
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
         acceptTask = AcceptAsync();
@@ -170,6 +173,13 @@ public sealed class ResolvingHttpProxy : IDisposable, IAsyncDisposable
                 ? null
                 : ResolvingSocks5Relay.NormalizeDomain(host);
             if (normalized is not null && mappings.TryGetValue(normalized, out var mapped)) literal = mapped;
+            if (normalized is not null && literal is null && resolveUnmappedLocally)
+            {
+                var addresses = await Dns.GetHostAddressesAsync(normalized, token).ConfigureAwait(false);
+                literal = addresses.FirstOrDefault(value => value.AddressFamily == AddressFamily.InterNetwork)
+                          ?? addresses.FirstOrDefault()
+                          ?? throw new IOException($"Не удалось разрешить DNS-имя {normalized} через системный DNS.");
+            }
             if (literal is not null)
                 address = literal.AddressFamily == AddressFamily.InterNetwork
                     ? [0x01, .. literal.GetAddressBytes()]
@@ -194,14 +204,16 @@ public sealed class ResolvingHttpProxy : IDisposable, IAsyncDisposable
         catch { upstream.Dispose(); throw; }
     }
 
-    private static bool TryParseAuthority(string value, int defaultPort, out string host, out int port)
+    internal static bool TryParseAuthority(string value, int defaultPort, out string host, out int port)
     {
         host = "";
         port = defaultPort;
         if (!Uri.TryCreate("http://" + value, UriKind.Absolute, out var uri)) return false;
         host = uri.DnsSafeHost;
-        port = uri.IsDefaultPort ? defaultPort : uri.Port;
-        return host.Length > 0 && port is > 0 and <= 65535;
+        var authority = value.StartsWith('[') ? value[(value.IndexOf(']') + 1)..] : value;
+        port = authority.Contains(':') ? uri.Port : defaultPort;
+        return uri.UserInfo.Length == 0 && !value.Contains('/') && !value.Contains('?') &&
+               !value.Contains('#') && !value.EndsWith(':') && host.Length > 0 && port is > 0 and <= 65535;
     }
 
     private static byte[] RewritePlainHttpHeader(
@@ -257,7 +269,7 @@ public sealed class ResolvingHttpProxy : IDisposable, IAsyncDisposable
         return buffer;
     }
 
-    private static async Task CopyAndHalfCloseAsync(
+    internal static async Task CopyAndHalfCloseAsync(
         Stream source, Stream destination, Socket destinationSocket, string direction,
         Action<string>? log, CancellationToken token, bool coalesceFirstTlsRecord)
     {
@@ -296,6 +308,8 @@ public sealed class ResolvingHttpProxy : IDisposable, IAsyncDisposable
         catch (IOException ex) when (!token.IsCancellationRequested)
         {
             log?.Invoke($"relay failed; direction={direction}; bytes={total}; error={ex.Message}");
+            destinationSocket.Dispose(); // Error tears down the pair; normal EOF still allows a response.
+            throw;
         }
         catch (ObjectDisposedException) when (token.IsCancellationRequested) { }
         finally { log?.Invoke($"relay ended; direction={direction}; bytes={total}"); }

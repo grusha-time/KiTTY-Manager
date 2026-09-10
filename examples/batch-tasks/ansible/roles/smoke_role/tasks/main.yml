@@ -1,0 +1,6 @@
+---
+- name: Записать маркер из соседней роли
+  ansible.builtin.copy:
+    dest: "{{ smoke_root }}/role.marker"
+    mode: '0600'
+    content: "role-ran=true\n"

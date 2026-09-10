@@ -7,9 +7,18 @@ using KiTTYManager.Core;
 
 Console.OutputEncoding = Encoding.UTF8;
 ConfigStore.SecretProtector = new TestConfigSecretProtector();
-var runner = new SelfTestRunner();
+var filter = GetOption(args, "--filter");
+if (args.Contains("--filter") && (string.IsNullOrWhiteSpace(filter) ||
+    filter.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Length == 0))
+{
+    Console.Error.WriteLine("--filter требует имя теста или список имён через запятую.");
+    return 2;
+}
+var listOnly = args.Contains("--list");
+var runner = new SelfTestRunner(filter, listOnly);
 var offlineOk = runner.RunOffline();
 var liveOk = true;
+if (listOnly) return offlineOk ? 0 : 1;
 
 if (args.Contains("--diagnostics", StringComparer.OrdinalIgnoreCase))
 {
@@ -37,25 +46,132 @@ static string? GetOption(string[] args, string name)
     return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
 }
 
-internal sealed class SelfTestRunner
+internal sealed partial class SelfTestRunner
 {
+    private readonly string[] filters;
+    private readonly bool listOnly;
+    private int selected;
+
+    public SelfTestRunner(string? filter = null, bool listOnly = false)
+    {
+        filters = (filter ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        this.listOnly = listOnly;
+    }
+
     private int passed;
     private int failed;
 
     public bool RunOffline()
     {
         Console.WriteLine("KiTTY Manager: автономные тесты");
+        Test("Поиск справки находит поля во всех разделах", HelpSearchFindsFieldsAcrossSections);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
+        Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
+        Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);
+        Test("Ansible отвергает опасные имена и удаляет архив после ошибки", AnsibleArchiveRejectsUnsafeNamesAndCleansFailure);
+        Test("Сравнение файлов учитывает короткие чтения, хвост и отмену", BatchFileComparisonWithFragmentedReads);
+        Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);
+        Test("Миграция schema 9 сохраняет данные и сбрасывает только старые InternalOnly", Schema9MigrationPreservesUserData);
+        Test("Версия продукта 2.0.0 и схема 9", Version2Metadata);
+        Test("Миграция схемы 7 в 8 сохраняет старые данные", Version2SchemaMigration);
+        Test("Таймаут подключения допускает минимум 3 секунды", Version2ConnectionTimeoutMinimum);
+        Test("WinSCP использует локальный маршрут и передаёт пароль напрямую", WinScpRouteArguments);
+        Test("WinSCP получает совместимый host key и поддерживает старый конфиг", WinScpLegacyHostKeyArgument);
+        Test("Стартовое предложение содержит только неработающие настроенные JH", MissingJumphostOffer);
+        Test("Умный импорт распознаёт ID и endpoint без сравнения секретов", SmartImportMatching);
+        Test("Умный импорт не удаляет локальные данные и связи", SmartImportIsNonDestructive);
+        Test("Умный импорт не изменяет оставленную локальную JH", SmartImportKeepsCurrentProxyReferences);
+        Test("Умный импорт не оставляет ссылки на пропущенные объекты", SmartImportClearsSkippedReferences);
+        Test("Умный импорт пересчитывает поля и связи после ручного сопоставления", SmartImportRefreshesManualMapping);
+        Test("Умный импорт запрещает два имени для одной группы", SmartImportRejectsConflictingGroupRenames);
+        Test("Умный импорт применяет выбранные поля и группу отдельно", SmartImportSelectedFieldsAndGroup);
+        Test("Умный импорт предлагает похожую группу с другим названием", SmartImportSimilarGroups);
+        Test("Неоднозначные сессии требуют ручного сопоставления", SmartImportAmbiguousSession);
+        Test("Транзакция импорта создаёт backup и поддерживает откат", SmartImportBackupRollback);
+        Test("Предрелизная регрессия: ShellPaths", PreReleaseShellPaths);
+        Test("Предрелизная регрессия: FileContextAndRunAs", PreReleaseFileContextAndRunAs);
+        Test("Предрелизная регрессия: PtyDispatchBoundary", PreReleasePtyDispatchBoundary);
+        Test("Предрелизная регрессия: PartialImportPreservesReferences", PreReleasePartialImportPreservesReferences);
+        Test("Предрелизная регрессия: EndpointPreferenceRemap", PreReleaseEndpointPreferenceRemap);
+        Test("Предрелизная регрессия: ConsoleIngressLifecycle", PreReleaseConsoleIngressLifecycle);
+        Test("Предрелизная регрессия: FirstHopCacheAndEmptyRoute", PreReleaseFirstHopCacheAndEmptyRoute);
+        Test("Предрелизная регрессия: ConnectAuthority", PreReleaseConnectAuthority);
+        Test("Предрелизная регрессия: RelayFailureUnblocksPeer", PreReleaseRelayFailureUnblocksPeer);
+        Test("Предрелизная регрессия: AtomicPackageReplacement", PreReleaseAtomicPackageReplacement);
+        Test("Файл массовой задачи проходит round-trip и маскирует секреты", BatchTaskRoundTripAndRedaction);
+        Test("Рабочая папка и режим прав массовой задачи совместимы со старыми файлами", BatchTaskExecutionContext);
+        Test("Валидация массовой задачи запрещает неполные опасные шаги", BatchTaskValidation);
+        Test("Массовая задача сохраняет local и remote туннели", BatchTunnelRoundTrip);
+        Test("Туннели выбирают все или конкретные серверы", BatchTunnelServerSelection);
+        Test("Local-туннель при запуске использует ровно один сервер", BatchLocalTunnelSingleServer);
+        Test("Валидация туннелей проверяет порты и конфликты", BatchTunnelValidation);
+        Test("Журналы массовой задачи разделяются по серверу и уровню", BatchTunnelLogViews);
+        Test("SSH-команды массовой задачи не требуют SFTP", BatchTaskSftpPolicy);
+        Test("Шаблон массовой задачи подставляет поля сервера", BatchTaskTemplateRendering);
+        Test("Маскирование массовой задачи включает TOTP и веб-пароли", BatchTaskConfigSecretRedaction);
+        Test("Триггер массовой задачи находит текст между частями вывода", BatchTaskOutputMatcher);
+        Test("Интерактивная консоль ждёт поток, учитывает гонку и корректно отменяется", BatchInteractiveOutputLifecycle);
+        Test("Интерактивная консоль скрывает ANSI и служебный маркер", BatchTerminalOutputIsReadable);
+        Test("Интерактивный ответ ждёт точное приглашение и скрытый маркер завершения", BatchInteractivePromptAndCompletionMarker);
+        Test("Интерактивный ввод не искажается глобальным sudo", BatchInteractiveIgnoresGlobalBecome);
+        Test("Шаг ожидания текста проверяет обязательные поля и таймаут", BatchTaskWaitValidation);
+        Test("Локальные шаблоны массовых задач сохраняются и удаляются безопасно", BatchTaskTemplateStoreRoundTrip);
+        Test("Шаблон массовой задачи переименовывается вместе с именем внутри пакета", BatchTaskTemplateRename);
+        Test("Массовая задача запоминает выбранные серверы и читает старые файлы", BatchTaskServerIdsRoundTrip);
+        Test("Проверка файлов задачи и выявление отсутствующих источников", BatchTaskHasFilesAndMissingSourcesDetection);
+        Test("Фильтры и форматирование журнала конструктора и Ansible", BatchAndAnsibleLogFilteringAndFormatting);
+        Test("Выбор действий по Shift и состояние чекбокса «Выбрать все»", BatchStepShiftAndMultiSelectionPolicy);
+        Test("Умный импорт заменяет название и команду входа выбранными полями", SmartImportSelectedFieldsReplaceCommand);
+        Test("Умный импорт: отказ от сопоставления и каскад «взять данные из файла»", SmartImportSentinelAndCascade);
+        Test("Действие задачи выбирает серверы и свою рабочую папку", BatchStepServerSubsetAndDirectory);
+        Test("Строка выбора включает группу целиком и затем снимает её", SelectionRowToggle);
+        Test("Единый список серверов сохраняет группы, поиск и tri-state", SharedServerSelectionPolicy);
+        Test("Пауза после шага и политика туннелей сохраняются в задаче", BatchStepWaitAndTunnelPolicy);
+        Test("Загрузка принимает несколько источников построчно", BatchUploadMultiSource);
+        Test("Скачивание раскрывает маску в каталоге сервера", BatchDownloadGlobDirectory);
+        Test("Архивное скачивание выбирает доступный формат и максимальное сжатие", BatchDownloadArchiveFormats);
+        Test("Скачивание разрешает относительный путь от рабочей папки", BatchDownloadWorkingDirectory);
+        Test("Пакет задачи различает внешние и вложенные файлы", BatchTaskExternalFilePackaging);
+        Test("Новый запуск задачи очищает старые временные каталоги", BatchTaskWorkspaceCleanup);
+        Test("Дублирование шага копирует все поля независимо", BatchStepDuplicate);
+        Test("Восстановление связи повторяет подключение каждые десять секунд", BatchConnectionRetryDelay);
+        Test("После обрыва без вопроса повторяются только безопасные действия", BatchConnectionRetrySafety);
+        Test("Умный импорт по умолчанию не заменяет путь к ключу", SmartImportKeepsCurrentKeyPath);
+        Test("RunAs генерирует su/sudo и экспорт без файлов содержит только yaml", BatchRunAsAndExportWithoutFiles);
+        Test("Пакет задачи по умолчанию не включает файлы, а список источников сохраняет пути", BatchPackageAndSourceListDefaults);
+        Test("Учебные задачи: все типы действий, актуальный пакет и материалы Ansible", SafeVerificationTaskPackage);
+        Test("Чекбокс ожидания завершения сохраняется и копируется", BatchStepWaitForExitPolicy);
+        Test("Ненулевой код возврата с выводом считается некритичным, без вывода — ошибкой", BatchCommandExitCodePolicy);
+        Test("Чтение вывода сохраняет CRLF, строки и незавершённый хвост", BatchCommandStreamLineStreaming);
+        Test("Итог массовой задачи перечисляет вердикты серверов и шаг остановки", BatchRunSummaryListsServerVerdicts);
+        Test("Пароль su передаётся через конвейер, рабочая папка проверяется до cd", PrivilegedSuPasswordDirectPipeAndTaskCommandChecksDirectory);
+        Test("Команда su с паролем исполняется через виртуальный терминал PTY", SuPasswordViaPtyTerminalExecution);
+        Test("Копия профиля Firefox сохраняет pkcs11 и принудительно поднимает версию миграции", FirefoxProfileCopyKeepsPkcs11AndForcesMigration);
+        Test("Подготовленный профиль веб-сессии не удаляется стартовым путём после передачи очистке", WebSessionCleanupPolicyGuardsHandedOffProfile);
+        Test("Умный импорт показывает и применяет решение по конфликту связи", SmartImportLinkDecision);
+        Test("Умный импорт добавляет сопоставленную сессию отдельной копией", SmartImportMatchedAddCreatesCopy);
+        Test("Умный импорт восстанавливает новую родительскую и вложенную группу", SmartImportRestoresNewNestedGroups);
+        Test("Журнал умного импорта не содержит секреты", SmartImportLogProjectionIsSafe);
+        Test("Поиск умного импорта находит названия, группы и пояснения", SmartImportSearchPolicy);
+        Test("Менеджер завершает только запомненный процесс JH", ManagedJumphostStop);
         Test("Вложенные группы", NestedGroups);
         Test("Дублирование сессии сохраняет данные и группу без связей", DuplicateManagedServer);
+        Test("Быстрый дубль до сохранения отделён и очищает runtime", QuickDuplicateIsDetachedAndClean);
+        Test("Немодальные быстрые дубли повторно уточняют автоматическое имя", QuickDuplicateRefreshesGeneratedName);
+        Test("Направленный успех не создаёт обратную связь", DirectedLinkSuccess);
+        Test("Встречные направления одной пары объединяются в одну связь", SavedLinksCollapseRelationship);
+        Test("Повторная фиксация связи не создаёт дубликат", RememberDirectedSuccessDoesNotDuplicate);
+        Test("Быстрый дубль выбирает только независимые узлы группы", QuickDuplicateDefaultSources);
         Test("config.json шифрует все секреты и восстанавливает их", JsonRoundTrip);
         Test("Старый открытый config.json мигрирует в зашифрованный", PlaintextConfigMigration);
         Test("Явный JSON-экспорт остаётся переносимым", PortableExportRemainsPlaintext);
         Test("Игнорирование KiTTY относится только к конкретной паре значений", KittyIgnoreSpecificChange);
-        Test("Временные Firefox-профили уникальны и отключают приветствие", FirefoxTemporaryProfiles);
+        Test("Firefox копирует рабочие данные в отдельные временные профили", FirefoxTemporaryProfiles);
+        Test("Firefox profiles.ini определяет профиль по умолчанию", FirefoxProfileDiscovery);
+        Test("Firefox profiles.ini предпочитает готовый профиль установки", FirefoxInstallProfileDiscovery);
         Test("Firefox launcher ждёт закрытия связанного браузера", FirefoxWaitsForBrowserExit);
         Test("Веб-туннель KiTTY использует конечный ingress и отдельный SOCKS", KittyWebTunnelArguments);
-        Test("Внутренний web resolver выключен по умолчанию и сохраняется", InternalWebResolverDefaultsAndRoundTrip);
+        Test("DNS веб-интерфейса определяется заполненным адресом", InternalWebResolverDefaultsAndRoundTrip);
         Test("Web resolver нормализует домены и запрещает конфликты", InternalWebResolverNormalizationAndConflicts);
         Test("Web resolver заменяет только явно сопоставленный домен", InternalWebResolverMapsExactDomain);
         Test("Web resolver передаёт неизвестный домен upstream без изменений", InternalWebResolverPassesUnmappedDomain);
@@ -63,6 +179,7 @@ internal sealed class SelfTestRunner
         Test("Web resolver изолирует одинаковый домен между сессиями", InternalWebResolverSessionIsolation);
         Test("План web resolver использует IP интерфейса и резервный IP сервера", InternalWebResolverMappingPlan);
         Test("HTTP resolver работает без Firefox SOCKS DNS", InternalHttpResolverWithoutFirefoxDns);
+        Test("HTTP resolver использует системный DNS без Firefox SOCKS", HttpResolverUsesSystemDns);
         Test("HTTP resolver сохраняет Host обычного HTTP", InternalHttpResolverPlainHttp);
         Test("Изменённый в менеджере пароль имеет приоритет над повторным импортом", ImportedSessionManagerOverride);
         Test("Трёхсторонняя синхронизация различает KiTTY, менеджер и конфликт", ImportedSessionThreeWayMerge);
@@ -78,6 +195,8 @@ internal sealed class SelfTestRunner
         Test("Loopback и сама jumphost-сессия не становятся контрольными серверами", AccessProbeExcludesLocalAndStartupServers);
         Test("Доступные контрольные серверы подтверждают запуск скрипта независимо от SSH-входа", AccessProbeConfirmsScriptRun);
         Test("Свежий подтверждённый доступ не запускает скрипт повторно", FreshAccessGrantSkipsScript);
+        Test("Проверка контроля не переносит просроченный запуск", ControlProbeDoesNotPostponeSchedule);
+        Test("Отказ фонового маршрута проверяет контрольные серверы", RouteFailureChecksAccessControls);
         Test("Недавняя попытка скрипта не повторяется после ошибки целевой авторизации", RecentAccessScriptAttemptSkipsRetry);
         Test("Импорт portable-сессии KiTTY", SessionImport);
         Test("Импорт явно указанного portable private key", SessionPrivateKeyImport);
@@ -105,7 +224,6 @@ internal sealed class SelfTestRunner
         Test("Root-данные читаются из UTF-16 файла Script", SessionUtf16RootScriptImport);
         Test("Импорт логина и пароля из файла login script", SessionScriptFileImport);
         Test("Импорт без группы и перенос в группу", UngroupedImportAndMove);
-        Test("Групповая карта проверяет каждую пару один раз", GroupConnectivityBatches);
         Test("Пакет связей переиспользует исходную сессию", ConnectivityBatchReusesSource);
         Test("Пакет связей продолжает непроверенные цели после переподключения", ConnectivityBatchReconnectsRemaining);
         Test("Пакет связей проверяет обратное направление только после отказа", ConnectivityBatchReversesFailures);
@@ -125,6 +243,7 @@ internal sealed class SelfTestRunner
         Test("Лимит endpoint-зонда по умолчанию 4 секунды и сохраняется в JSON", EndpointProbeTimeoutRoundTrip);
         Test("Отрицательный endpoint-кэш изолирован по JH и предыдущему серверу", EndpointFailureCacheContexts);
         Test("Фоновая проверка одной сессии имеет единственного владельца", BackgroundProbeRegistrySerializesPerServer);
+        Test("Фоновая проверка не пропускает короткий маршрут после текущего", BackgroundProbePrioritizesShorterRoute);
         Test("Параллельные сохранения config.json не конфликтуют", ConcurrentConfigSaveIsAtomic);
         Test("Маршрут с несколькими переходами", MultiHopRoute);
         Test("Нет маршрута к неизвестному серверу", MissingRoute);
@@ -138,7 +257,7 @@ internal sealed class SelfTestRunner
         Test("Startup preflight устанавливает базу расписания только один раз", AccessConfirmationEstablishesBaselineOnce);
         Test("Просроченная дата планового запуска не движется вместе с часами", AccessScriptOverdueTimeIsStable);
         Test("Плановый скрипт использует управляемую JH и спрашивает о неизвестной", AccessScriptScheduledConsolePolicy);
-        Test("Startup preflight переносит расписание от новой проверки", AccessStartupPreflightRebasesSchedule);
+        Test("Startup preflight не переносит расписание скрипта", AccessStartupPreflightRebasesSchedule);
         Test("Отмена неизвестной JH подавляет prompt на текущий интервал", AccessScriptPromptSnoozePolicy);
         Test("Успешный preflight усыновляет только живую KiTTY с верным title", AccessScriptPreflightAdoptionPolicy);
         Test("Усыновлённый PID сохраняется в реестре процесса JH", AdoptedJumphostProcessPersists);
@@ -165,6 +284,7 @@ internal sealed class SelfTestRunner
         Test("Из остановленных jumphost первым запускается вариант без OTP и скрипта", SimpleJumphostStartsFirst);
         Test("При равной длине выбирается маршрут с меньшей измеренной задержкой", FasterSavedRouteFirst);
         Test("Рабочая длинная цепочка идёт раньше непроверенного короткого варианта", LongPreferredBeatsUnprovenShorterRoute);
+        Test("Зависимый вход остаётся последним аварийным резервом", DependentEntryIsEmergencyFallback);
         Test("Сохранённый вход до опоры объединяется со связью до цели", CachedEntryPrefixIsComposed);
         Test("Внутренний сервер без доказанного входа остаётся теоретическим резервом", UnprovenEntryStaysFallback);
         Test("Статистика одной связи хранится отдельно для каждой JH", LinkStatisticsPerProxy);
@@ -175,6 +295,7 @@ internal sealed class SelfTestRunner
         Test("После отказа кэша идут худшие, затем лучшие маршруты", PreferredRouteFallbackOrder);
         Test("Фоновая проба сохраняет собственное обновление и не трогает чужое", BackgroundRouteCommitPolicy);
         Test("Запомненный длинный маршрут восстанавливается и идёт первым", OrderPreferredReconstructsTruncatedRoute);
+        Test("Восстановленный старый маршрут видит короткий составной префикс", ReconstructedRouteFindsShorterComposedPrefix);
         Test("Запомненный маршрут не дублируется, если уже есть среди кандидатов", OrderPreferredNoDuplicate);
         Test("Подтверждённый прямой путь не вытесняется длинной сохранённой цепочкой", ProvenDirectBeatsLongerSavedChain);
         Test("Запомненная точка входа выигрывает у равных прямых кандидатов", RememberedProxyWinsAmongEqualDirects);
@@ -183,6 +304,29 @@ internal sealed class SelfTestRunner
         Test("Проверка связей не понижает короткий сохранённый маршрут", ShouldReplacePreferredPolicy);
         Test("Восстановление маршрута учитывает отключённый proxy и удалённый сервер", CandidateFromCachedGuards);
         Test("Резервные адреса пробуются после основного, пустой хост берётся из сессии", BackupEndpointsOrder);
+        Test("Внутренний адрес доступен только после серверного перехода", InternalEndpointRequiresPreviousServer);
+        Test("Ansible inventory безопасен и не содержит секретов", AnsibleInventoryIsSafe);
+        Test("Ansible читает boot log при удерживаемом дескрипторе", AnsibleReadsSharedBootLog);
+        Test("Папка Ansible-задачи очищает только служебные файлы", AnsibleTaskWorkspaceCleanup);
+        Test("Внешний playbook переносит соседние файлы с относительными путями", AnsibleWorkspaceCopiesAdjacentDependencies);
+        Test("Ansible запрещает удалять существующую и внешнюю папку", AnsibleTaskDeletionGuard);
+        Test("Runtime Ansible проверяет SHA-256 и лицензии", AnsibleRuntimeManifestVerification);
+        Test("Диагностика Ansible различает настройку и неизвестную ошибку", AnsibleReadinessStates);
+        Test("Диагностика Ansible не зависит от языка Windows", AnsibleDiagnosticsAreLocaleIndependent);
+        Test("Папка шаблонов Ansible создаётся только при подготовке запуска", AnsibleWorkspaceIsLazyUntilPrepare);
+        Test("QEMU Ansible запускается скрыто через WHPX с временным overlay", AnsibleQemuArguments);
+        Test("Параметры Ansible ограничивают verbosity и используют локальную Downloads", AnsibleRunDefaults);
+        Test("Ansible читает локальные Windows-материалы из YAML", AnsibleWindowsMaterialsComeFromYaml);
+        Test("Пакет Ansible исключает служебные runtime-файлы", AnsibleArchiveExcludesServiceFiles);
+        Test("Событие прогресса Ansible допускает отсутствующие JSON-поля", AnsibleVmEventMissingFields);
+        Test("События Ansible форматируются для пользователя", AnsibleVmEventsAreReadable);
+        Test("Пакет Ansible потоково создаётся во временном файле", AnsibleArchiveTemporaryFile);
+        Test("Ansible передаёт абсолютные файлы без постоянной копии", AnsibleArchiveStreamsAbsoluteFilesWithoutPersistentCopy);
+        Test("Ansible заранее находит отсутствующие role и collection", AnsibleDependencyPreflight);
+        Test("План связей допускает исключение направления и всего сервера", ConnectivityPairExclusions);
+        Test("Направленные связи открывают исходную сессию один раз", DirectedConnectivityReusesEachSource);
+        Test("Направленные связи не пробуют обратное направление", DirectedConnectivityHasNoReverseFallback);
+        Test("Отмена направленной проверки оставляет уже полученные результаты", DirectedConnectivityCancellationKeepsObservedResults);
         Test("Запомненный рабочий адрес пробуется первым", PreferredEndpointFirst);
         Test("Endpoint запоминается отдельно для JH и предыдущего сервера", ContextualEndpointPreferences);
         Test("Резервный адрес, совпавший с основным, не дублируется", BackupEndpointDedup);
@@ -218,7 +362,7 @@ internal sealed class SelfTestRunner
         Test("Готовый маршрут содержит фактические endpoint каждого хопа", ActiveRouteReportsSelectedHops);
         Test("Направленная связь не создаёт обратный маршрут", SavedLinkDoesNotCreateReverseRoute);
         Test("Диагностика добавляет SOCKS 5555 и 5050 без дублей", DefaultDiagnosticProxies);
-        Test("Проверка SOCKS5 принимает только no-auth handshake", Socks5HandshakeReplyValidation);
+        Test("Диагностический SOCKS5-парсер принимает только no-auth handshake", Socks5HandshakeReplyValidation);
         Test("SOCKS5 CONNECT сохраняет домен для удалённого DNS", Socks5DomainConnectRequest);
         Test("Отмена SOCKS5-проверки не превращается в недоступность", Socks5ProbePropagatesCallerCancellation);
         Test("Отсутствие SOCKS отражается в SSH trace", MissingProxyTrace);
@@ -249,7 +393,8 @@ internal sealed class SelfTestRunner
         Test("Native Klink подтверждается только удалённым marker", NativeKlinkMarkerValidation);
         Test("user@host извлекает чистый хост и логин", UserAtHostParsing);
         Test("Пары для двунаправленной проверки уникальны", BidirectionalPairsUnique);
-        Test("FirefoxProfileLockedException содержит путь шаблона", FirefoxProfileLockedExceptionCarriesPath);
+        Test("FirefoxProfileLockedException содержит путь источника", FirefoxProfileLockedExceptionCarriesPath);
+        Test("Firefox отличает блокировку файла от прочих ошибок ввода-вывода", FirefoxSharingViolationClassification);
         Test("AutoConfirmHostKeys по умолчанию включён и сохраняется в JSON", AutoConfirmHostKeysDefaultAndRoundTrip);
         Test("Удаление связей внутри группы не трогает внешние связи", DeleteGroupLinksPreservesExternal);
         Test("Пути в конфиге переносятся между папками", PathPortabilityRoundTrip);
@@ -265,7 +410,18 @@ internal sealed class SelfTestRunner
         Test("Таймаут прямой цели не блокирует обход через ту же JH", DirectTimeoutDoesNotBlockSameProxyMultiHop);
         Test("ClearFailureCache сбрасывает весь кэш", ClearFailureCacheResetsAll);
         Test("CreateMinimal создаёт валидную сессию без Autocommand", RoutedSessionCreateMinimal);
+        Test("Умный импорт отдаёт приоритет более коротким сохранённым маршрутам", SmartImportAppliesShorterPreferredRoutes);
+        Test("Асимметричная проверка связей и инвалидация направления", AsymmetricLinkVerificationAndDirectedInvalidation);
+        Test("Определение односторонних и двусторонних связей на карте", AsymmetricLinkMapVisuals);
+        Test("Политика выбора пар с учётом асимметричных связей", AsymmetricConnectivityPairSelection);
+        Test("Отображение направлений связей в дереве сохранённых связей", AsymmetricSavedLinkTreeItemStatus);
+        Test("Адаптивное построение связей сохраняет известные односторонние связи", AsymmetricAdaptiveLinkDiscoveryPreservesKnownOneWay);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
+        if (selected == 0)
+        {
+            Console.Error.WriteLine("Не найдено ни одного теста по фильтру.");
+            return false;
+        }
         return failed == 0;
     }
 
@@ -799,8 +955,13 @@ internal sealed class SelfTestRunner
 
     private void Test(string name, Action action)
     {
+        if (filters.Length > 0 && !filters.Any(filter =>
+                action.Method.Name.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+                name.Contains(filter, StringComparison.OrdinalIgnoreCase))) return;
+        selected++;
+        if (listOnly) { Console.WriteLine($"{action.Method.Name}\t{name}"); return; }
         try { action(); passed++; Console.WriteLine($"PASS  {name}"); }
-        catch (Exception ex) { failed++; Console.WriteLine($"FAIL  {name}: {ex.Message}"); }
+        catch (Exception ex) { failed++; Console.WriteLine($"FAIL  {name} [{action.Method.Name}]: {ex}"); }
     }
 
     private static void NestedGroups()
@@ -854,6 +1015,130 @@ internal sealed class SelfTestRunner
         Equal(false, config.Links.Any(link => link.FromServerId == first.Id || link.ToServerId == first.Id));
     }
 
+    private static void QuickDuplicateIsDetachedAndClean()
+    {
+        var proxyId = Guid.NewGuid();
+        var source = new ManagedServer
+        {
+            Name = "Источник", Host = "10.0.0.1", HostKeyFingerprint = "SHA256:key",
+            HostKeyAlgorithm = "ssh-ed25519", HostKeyBits = 255, PreferredProxyId = proxyId,
+            PreferredRoute = new() { ProxyId = proxyId, ServerIds = [Guid.NewGuid()] },
+            PreferredEndpoint = new("10.0.0.2", 2222),
+            EndpointPreferences = [new() { ProxyId = proxyId, Endpoint = new("10.0.0.3", 22) }],
+            BackupEndpoints = [new("192.168.1.1", 22, true)],
+            WebInterfaces = [new() { Name = "Панель", Url = "https://host/" }]
+        };
+        var group = new ServerGroup { Servers = [source] };
+        var config = new ManagerConfig { Groups = [group] };
+
+        var draft = ManagedServerDuplicator.CreateQuickDuplicate(config, source);
+
+        Equal(1, group.Servers.Count);
+        Equal(false, config.AllServers().Any(server => server.Id == draft.Id));
+        Equal(false, draft.Id == source.Id);
+        Equal("", draft.HostKeyFingerprint);
+        Equal("", draft.HostKeyAlgorithm);
+        Equal(0, draft.HostKeyBits);
+        Equal<Guid?>(null, draft.PreferredProxyId);
+        Equal<CachedRoute?>(null, draft.PreferredRoute);
+        Equal<ServerEndpoint?>(null, draft.PreferredEndpoint);
+        Equal(0, draft.EndpointPreferences.Count);
+        Equal(0, draft.BackupEndpoints.Count);
+        Equal(0, draft.WebInterfaces.Count);
+
+        ManagedServerDuplicator.AddToSourceGroup(config, source, draft);
+        Equal(true, group.Servers.Contains(draft));
+    }
+
+    private static void QuickDuplicateRefreshesGeneratedName()
+    {
+        var firstSource = new ManagedServer { Name = "Сервер" };
+        var secondSource = new ManagedServer { Name = "Сервер" };
+        var config = new ManagerConfig { UngroupedServers = [firstSource, secondSource] };
+        var first = ManagedServerDuplicator.CreateQuickDuplicate(config, firstSource);
+        var second = ManagedServerDuplicator.CreateQuickDuplicate(config, secondSource);
+        var generated = second.Name;
+
+        ManagedServerDuplicator.AddToSourceGroup(config, firstSource, first);
+        ManagedServerDuplicator.RefreshQuickDuplicateName(config, secondSource, second, generated);
+        Equal("Сервер — копия 2", second.Name);
+
+        second.Name = "Моё имя";
+        config.UngroupedServers.Add(new ManagedServer { Name = "Моё имя" });
+        ManagedServerDuplicator.RefreshQuickDuplicateName(config, secondSource, second, generated);
+        Equal("Моё имя", second.Name);
+    }
+
+    private static void DirectedLinkSuccess()
+    {
+        var source = new ManagedServer();
+        var target = new ManagedServer();
+        var config = new ManagerConfig { UngroupedServers = [source, target] };
+        var result = new ConnectivityResult(target.Id, true, "ok", TimeSpan.FromMilliseconds(4), "route", Guid.NewGuid(), source.Id);
+
+        ServerLinkPairPolicy.RememberDirectedSuccess(config, result, DateTimeOffset.UtcNow);
+
+        Equal(true, config.Links.Any(link => link.FromServerId == source.Id && link.ToServerId == target.Id));
+        Equal(false, config.Links.Any(link => link.FromServerId == target.Id && link.ToServerId == source.Id));
+    }
+
+    private static void SavedLinksCollapseRelationship()
+    {
+        var selected = Guid.NewGuid();
+        var counterpart = Guid.NewGuid();
+        var other = Guid.NewGuid();
+        var relationship = ServerLinkPairPolicy.GroupAsRelationship(selected, counterpart, [
+            new() { FromServerId = selected, ToServerId = counterpart },
+            new() { FromServerId = counterpart, ToServerId = selected },
+            new() { FromServerId = selected, ToServerId = counterpart },
+            new() { FromServerId = selected, ToServerId = other }
+        ]);
+
+        Equal(3, relationship.Count);
+        Equal(false, relationship.Any(link => link.FromServerId == other || link.ToServerId == other));
+    }
+
+    private static void RememberDirectedSuccessDoesNotDuplicate()
+    {
+        var source = new ManagedServer();
+        var target = new ManagedServer();
+        var config = new ManagerConfig { UngroupedServers = [source, target] };
+        var first = new ConnectivityResult(target.Id, true, "ok", TimeSpan.FromMilliseconds(4),
+            "first", Guid.NewGuid(), source.Id);
+        var second = first with { Strategy = "second", Duration = TimeSpan.FromMilliseconds(2) };
+
+        ServerLinkPairPolicy.RememberDirectedSuccess(config, first, DateTimeOffset.UtcNow.AddMinutes(-1));
+        ServerLinkPairPolicy.RememberDirectedSuccess(config, second, DateTimeOffset.UtcNow);
+
+        Equal(1, config.Links.Count(link =>
+            link.FromServerId == source.Id && link.ToServerId == target.Id));
+        Equal("second", config.Links.Single().LastStrategy);
+    }
+
+    private static void QuickDuplicateDefaultSources()
+    {
+        var proxyId = Guid.NewGuid();
+        var entry = new ManagedServer();
+        entry.PreferredRoute = new CachedRoute { ProxyId = proxyId, ServerIds = [entry.Id] };
+        var dependent = new ManagedServer();
+        var config = new ManagerConfig { Groups = [new() { Servers = [entry, dependent] }] };
+
+        var selected = QuickDuplicatePolicy.DefaultLinkSourceIds(config, dependent);
+
+        Equal(true, selected.Contains(entry.Id));
+        Equal(false, selected.Contains(dependent.Id));
+        var ungrouped = QuickDuplicatePolicy.DefaultLinkSourceIds(
+            new ManagerConfig { UngroupedServers = [dependent] }, dependent);
+        Equal(0, ungrouped.Count);
+        var independentUngrouped = new ManagedServer();
+        independentUngrouped.PreferredRoute = new CachedRoute
+            { ProxyId = proxyId, ServerIds = [independentUngrouped.Id] };
+        var independentSources = QuickDuplicatePolicy.DefaultLinkSourceIds(
+            new ManagerConfig { UngroupedServers = [independentUngrouped] }, independentUngrouped);
+        Equal(1, independentSources.Count);
+        Equal(independentUngrouped.Id, independentSources[0]);
+    }
+
     private static void EmptyInitialConfig()
     {
         var config = new ManagerConfig();
@@ -861,8 +1146,7 @@ internal sealed class SelfTestRunner
         Equal(0, config.AllServers().Count());
         Equal(0, config.BaseProxies.Count);
         Equal(false, config.EnableLogging);
-        Equal(true, config.TemporaryFirefoxProfiles);
-        Equal(false, config.ShareFirefoxProfileByGroup);
+        Equal(true, config.AutoDiscoverFirefoxProfile);
         Equal(10, config.ConnectionTimeoutSeconds);
         Equal(4, config.EndpointProbeTimeoutSeconds);
     }
@@ -901,8 +1185,7 @@ internal sealed class SelfTestRunner
             {
                 Groups = [new() { Name = "Регион", Servers = [server] }],
                 EnableLogging = true,
-                TemporaryFirefoxProfiles = false,
-                ShareFirefoxProfileByGroup = true,
+                AutoDiscoverFirefoxProfile = false,
                 ConnectionTimeoutSeconds = 75,
                 EndpointProbeTimeoutSeconds = 7,
                 BaseProxies =
@@ -946,8 +1229,7 @@ internal sealed class SelfTestRunner
             Equal("totp-secret", loadedProxy.TotpSecret);
             Equal("post-login-secret-command", loadedProxy.PostLoginCommand);
             Equal(true, ConfigStore.Load(path).EnableLogging);
-            Equal(false, ConfigStore.Load(path).TemporaryFirefoxProfiles);
-            Equal(true, ConfigStore.Load(path).ShareFirefoxProfileByGroup);
+            Equal(false, ConfigStore.Load(path).AutoDiscoverFirefoxProfile);
             Equal(75, ConfigStore.Load(path).ConnectionTimeoutSeconds);
             Equal(7, ConfigStore.Load(path).EndpointProbeTimeoutSeconds);
             Equal(22, loaded.EndpointPreferences.Single().Endpoint.Port);
@@ -1032,51 +1314,147 @@ internal sealed class SelfTestRunner
         var root = Path.Combine(Path.GetTempPath(), "kitty-firefox-test-" + Guid.NewGuid().ToString("N"));
         try
         {
-            var first = FirefoxProfileWorkspace.Create(root, Guid.NewGuid(), Guid.NewGuid());
-            var second = FirefoxProfileWorkspace.Create(root, Guid.NewGuid(), Guid.NewGuid());
+            var source = Path.Combine(root, "source");
+            Directory.CreateDirectory(source);
+            File.WriteAllText(Path.Combine(source, "key4.db"), "key");
+            File.WriteAllText(Path.Combine(source, "cert9.db"), "cert");
+            File.WriteAllText(Path.Combine(source, "prefs.js"), "user_pref(\"keep.me\", true);\n");
+            File.WriteAllText(Path.Combine(source, "user.js"), "user_pref(\"source.behavior\", true);\n");
+            File.WriteAllText(Path.Combine(source, "cert_override.txt"), "source-risk");
+            File.WriteAllText(Path.Combine(source, "logins.json"), "{\"logins\":[{\"guid\":\"source-login\"}]}");
+            File.WriteAllText(Path.Combine(source, "sessionstore.jsonlz4"), "session");
+            File.WriteAllText(Path.Combine(source, "places.sqlite"), "history");
+            File.WriteAllText(Path.Combine(source, "places.sqlite-wal"), "wal-history");
+            File.WriteAllText(Path.Combine(source, "key4.db-wal"), "wal-key");
+            File.WriteAllText(Path.Combine(source, "cert9.db-shm"), "shm-index");
+            File.WriteAllText(Path.Combine(source, "pkcs11.txt"),
+                "library=\nname=NSS Internal PKCS #11 Module\nparameters=configdir='sql:C:\\\\OldPath' certPrefix='' keyPrefix=''\n");
+            Directory.CreateDirectory(Path.Combine(source, "extensions"));
+            Directory.CreateDirectory(Path.Combine(source, "startupCache"));
+            File.WriteAllText(Path.Combine(source, "startupCache", "stale.bin"), "stale");
+            File.WriteAllText(Path.Combine(source, "extensions", "addon.json"), "addon");
+            File.WriteAllText(Path.Combine(source, "parent.lock"), "locked");
+
+            FirefoxProfileWorkspace.ValidateSourceProfile(source);
+            var state = FirefoxProfileWorkspace.StateSummary(source);
+            Equal(true, state.Contains("логинов=1", StringComparison.Ordinal));
+            Equal(true, state.Contains("исключений=1", StringComparison.Ordinal));
+
+            var first = FirefoxProfileWorkspace.Create(Path.Combine(root, "runtime"), Guid.NewGuid(), Guid.NewGuid(), source);
+            var second = FirefoxProfileWorkspace.Create(Path.Combine(root, "runtime"), Guid.NewGuid(), Guid.NewGuid(), source);
             Equal(false, first == second);
-            var preferences = FirefoxProfileWorkspace.Preferences(54321);
-            Equal(true, preferences.Contains("network.proxy.socks_port\", 54321", StringComparison.Ordinal));
-            Equal(true, preferences.Contains("browser.aboutwelcome.enabled\", false", StringComparison.Ordinal));
-            Equal(true, preferences.Contains("browser.cache.disk.enable\", false", StringComparison.Ordinal));
-            Equal(true, preferences.Contains("network.proxy.socks_remote_dns\", false", StringComparison.Ordinal));
-            Equal(true, preferences.Contains("network.proxy.socks5_remote_dns\", false", StringComparison.Ordinal));
-            Equal(true, preferences.Contains("network.proxy.no_proxies_on\", \"\"", StringComparison.Ordinal));
+            Equal(false, File.Exists(Path.Combine(first, "places.sqlite")));
+            Equal(false, File.Exists(Path.Combine(first, "places.sqlite-wal")));
+            Equal(true, File.Exists(Path.Combine(first, "key4.db-wal")));
+            Equal(true, File.Exists(Path.Combine(first, "cert9.db-shm")));
+            Equal(false, File.Exists(Path.Combine(first, "parent.lock")));
+            Equal(false, File.Exists(Path.Combine(first, "sessionstore.jsonlz4")));
+            Equal(false, Directory.Exists(Path.Combine(first, "startupCache")));
+            Equal(true, File.Exists(Path.Combine(first, "extensions", "addon.json")));
+            Equal(File.ReadAllText(Path.Combine(source, "pkcs11.txt")),
+                File.ReadAllText(Path.Combine(first, "pkcs11.txt")));
+            foreach (var name in new[] { "key4.db", "logins.json", "cert9.db", "cert_override.txt" })
+                Equal(File.ReadAllText(Path.Combine(source, name)), File.ReadAllText(Path.Combine(first, name)));
+
+            using (var locked = new FileStream(Path.Combine(first, "key4.db"), FileMode.Open, FileAccess.Read, FileShare.Read))
+                Equal(false, FirefoxProfileWorkspace.CanMergeAndDelete(first));
+            Equal(true, FirefoxProfileWorkspace.CanMergeAndDelete(first));
+
             File.WriteAllText(Path.Combine(first, "prefs.js"),
                 "user_pref(\"network.proxy.socks_remote_dns\", true);\n" +
                 "user_pref(\"network.proxy.proxy_over_tls\", true);\n" +
                 "user_pref(\"keep.me\", true);\n");
+            Directory.CreateDirectory(Path.Combine(first, "startupCache"));
+            File.WriteAllText(Path.Combine(first, "startupCache", "stale.bin"), "stale");
             FirefoxProfileWorkspace.ApplyPreferences(first, 54321);
             var prefs = File.ReadAllText(Path.Combine(first, "prefs.js"));
-            Equal(false, prefs.Contains("socks_remote_dns\", true", StringComparison.Ordinal));
+            Equal(false, Directory.Exists(Path.Combine(first, "startupCache")));
+            Equal(true, prefs.Contains("network.proxy.type\", 1", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.proxy.http_port\", 0", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.proxy.ssl_port\", 0", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.proxy.socks\", \"127.0.0.1\"", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.proxy.socks_port\", 54321", StringComparison.Ordinal));
             Equal(true, prefs.Contains("socks_remote_dns\", false", StringComparison.Ordinal));
             Equal(true, prefs.Contains("socks5_remote_dns\", false", StringComparison.Ordinal));
+            Equal(false, prefs.Contains("security.enterprise_roots.enabled", StringComparison.Ordinal));
             Equal(true, prefs.Contains("keep.me", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("app.update.auto\", false", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("app.update.enabled\", false", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("app.update.service.enabled\", false", StringComparison.Ordinal));
+
+            var user = File.ReadAllText(Path.Combine(first, "user.js"));
+            Equal(false, user.Contains("network.proxy.type", StringComparison.Ordinal));
+            Equal(false, user.Contains("network.proxy.socks_port", StringComparison.Ordinal));
+            Equal(true, user.Contains("socks_remote_dns\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("socks5_remote_dns\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("browser.migration.version\", 999", StringComparison.Ordinal));
+            Equal(true, user.Contains("toolkit.asyncshutdown.crash_timeout\", 0", StringComparison.Ordinal));
+            Equal(true, user.Contains("messaging-system.rsexperimentloader.enabled\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("app.normandy.enabled\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("app.update.auto\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("app.update.service.enabled\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("app.update.doorhanger\", false", StringComparison.Ordinal));
+
             FirefoxProfileWorkspace.ApplyPreferences(first, 54322, true, ["panel.local", "alias.local"]);
             prefs = File.ReadAllText(Path.Combine(first, "prefs.js"));
-            Equal(true, prefs.Contains("network.proxy.type\", 2", StringComparison.Ordinal));
-            Equal(true, prefs.Contains("network.proxy.autoconfig_url\", \"data:application/x-ns-proxy-autoconfig,", StringComparison.Ordinal));
-            Equal(true, prefs.Contains("PROXY%20127.0.0.1%3A54322", StringComparison.Ordinal));
-            Equal(true, prefs.Contains("panel.local", StringComparison.Ordinal));
-            Equal(true, prefs.Contains("DIRECT", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.proxy.type\", 1", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.proxy.autoconfig_url\", \"\"", StringComparison.Ordinal));
             Equal(true, prefs.Contains("http_port\", 0", StringComparison.Ordinal));
             Equal(true, prefs.Contains("ssl_port\", 0", StringComparison.Ordinal));
-            Equal(true, prefs.Contains("socks_port\", 0", StringComparison.Ordinal));
-            Equal(false, prefs.Contains("socks_remote_dns\", true", StringComparison.Ordinal));
-            Equal(false, prefs.Contains("socks5_remote_dns\", true", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("socks_port\", 54322", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("socks_remote_dns\", false", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("socks5_remote_dns\", false", StringComparison.Ordinal));
             Equal(false, prefs.Contains("proxy_over_tls\", true", StringComparison.Ordinal));
             Equal(true, prefs.Contains("proxy_over_tls\", false", StringComparison.Ordinal));
-            Equal(true, File.ReadAllText(Path.Combine(first, "user.js"))
-                .Contains("socks_remote_dns\", false", StringComparison.Ordinal));
-            Equal(true, File.ReadAllText(Path.Combine(first, "user.js"))
-                .Contains("socks5_remote_dns\", false", StringComparison.Ordinal));
-            Equal(true, File.ReadAllText(Path.Combine(first, "user.js"))
-                .Contains("proxy_over_tls\", false", StringComparison.Ordinal));
-            var persistent = FirefoxProfileWorkspace.Persistent(root, "session-123");
-            Equal(persistent, FirefoxProfileWorkspace.Persistent(root, "session-123"));
+            Equal(true, prefs.Contains("network.proxy.allow_hijacking_localhost\", true", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("network.dns.localDomains\", \"panel.local,alias.local\"", StringComparison.Ordinal));
+            Equal(true, prefs.Contains("app.update.auto\", false", StringComparison.Ordinal));
+
+            user = File.ReadAllText(Path.Combine(first, "user.js"));
+            Equal(false, user.Contains("network.proxy.type", StringComparison.Ordinal));
+            Equal(false, user.Contains("network.proxy.socks_port", StringComparison.Ordinal));
+            Equal(true, user.Contains("socks_remote_dns\", false", StringComparison.Ordinal));
+            Equal(true, user.Contains("socks5_remote_dns\", false", StringComparison.Ordinal));
         }
         finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
+
+    private static void FirefoxProfileDiscovery()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "kitty-firefox-ini-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var firefox = Path.Combine(root, "Mozilla", "Firefox");
+            var profile = Path.Combine(firefox, "Profiles", "default");
+            Directory.CreateDirectory(profile);
+            File.WriteAllText(Path.Combine(profile, "key4.db"), "key");
+            File.WriteAllText(Path.Combine(profile, "cert9.db"), "cert");
+            File.WriteAllText(Path.Combine(firefox, "profiles.ini"), "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/default\nDefault=1\n");
+            Equal(profile, FirefoxProfileWorkspace.DiscoverDefaultProfile(root));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    private static void FirefoxInstallProfileDiscovery()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "kitty-firefox-install-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var firefox = Path.Combine(root, "Mozilla", "Firefox");
+            var stale = Path.Combine(firefox, "Profiles", "stale.default");
+            var active = Path.Combine(firefox, "Profiles", "active.default-release");
+            Directory.CreateDirectory(stale); Directory.CreateDirectory(active);
+            File.WriteAllText(Path.Combine(active, "key4.db"), "key");
+            File.WriteAllText(Path.Combine(active, "cert9.db"), "cert");
+            File.WriteAllText(Path.Combine(firefox, "profiles.ini"),
+                "[InstallABC]\nDefault=Profiles/active.default-release\nLocked=1\n\n" +
+                "[Profile1]\nName=default\nIsRelative=1\nPath=Profiles/stale.default\nDefault=1\n\n" +
+                "[Profile0]\nName=default-release\nIsRelative=1\nPath=Profiles/active.default-release\n");
+            Equal(active, FirefoxProfileWorkspace.DiscoverDefaultProfile(root));
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
 
     private static void KittyWebTunnelArguments()
     {
@@ -1101,10 +1479,13 @@ internal sealed class SelfTestRunner
         try
         {
             var config = new ManagerConfig();
-            Equal(false, config.UseInternalWebResolver);
-            config.UseInternalWebResolver = true;
+            Equal(true, config.AutoDiscoverFirefoxProfile);
             ConfigStore.Save(path, config);
-            Equal(true, ConfigStore.Load(path).UseInternalWebResolver);
+            Equal(true, ConfigStore.Load(path).AutoDiscoverFirefoxProfile);
+            File.WriteAllText(path, "{\"TemporaryFirefoxProfiles\":false,\"ShareFirefoxProfileByGroup\":true,\"UseInternalWebResolver\":true,\"FirefoxTemplateProfile\":\"legacy\"}");
+            var migrated = ConfigStore.Load(path);
+            Equal(true, migrated.AutoDiscoverFirefoxProfile);
+            Equal("", migrated.FirefoxTemplateProfile);
 
             var server = new ManagedServer
             {
@@ -1168,6 +1549,12 @@ internal sealed class SelfTestRunner
         Equal((byte)0x01, ipv4.Type);
         Equal("192.0.2.44", ipv4.Host);
 
+        var remappedLoopback = ExerciseResolvingRelayAsync(
+            [new("127.0.0.1", "192.0.2.45")], "127.0.0.1", "local-domain")
+            .GetAwaiter().GetResult();
+        Equal((byte)0x01, remappedLoopback.Type);
+        Equal("192.0.2.45", remappedLoopback.Host);
+
         var ipv6 = ExerciseResolvingRelayAsync(
             [new("panel.local", "2001:db8::42")], "panel.local", "ipv6")
             .GetAwaiter().GetResult();
@@ -1202,14 +1589,13 @@ internal sealed class SelfTestRunner
             ]
         };
         var mappings = WebResolverMappingPlan.Build(server);
-        Equal(3, mappings.Count);
-        Equal("panel.local", mappings[0].Key);
-        Equal("10.0.0.10", mappings[0].Value);
+        Equal(2, mappings.Count);
+        Equal("alias.local", mappings[0].Key);
+        Equal("10.0.0.20", mappings[0].Value);
         Equal("10.0.0.20", mappings[1].Value);
-        Equal("10.0.0.20", mappings[2].Value);
 
         server.Host = "ssh.local";
-        server.WebInterfaces[0].ResolverAddress = "";
+        server.WebInterfaces[0].ResolverAddress = "not-an-ip";
         var rejected = false;
         try { WebResolverMappingPlan.Build(server); }
         catch (InvalidOperationException ex) { rejected = ex.Message.Contains("Основной", StringComparison.Ordinal); }
@@ -1276,6 +1662,54 @@ internal sealed class SelfTestRunner
     private static void InternalHttpResolverPlainHttp()
     {
         ExercisePlainHttpResolverProxyAsync().GetAwaiter().GetResult();
+    }
+
+    private static void HttpResolverUsesSystemDns()
+    {
+        ExerciseHttpResolverSystemDnsAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task ExerciseHttpResolverSystemDnsAsync()
+    {
+        var upstream = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        upstream.Start();
+        var upstreamPort = ((System.Net.IPEndPoint)upstream.LocalEndpoint).Port;
+        var observed = new TaskCompletionSource<byte>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var upstreamTask = Task.Run(async () =>
+        {
+            using var client = await upstream.AcceptTcpClientAsync();
+            await using var stream = client.GetStream();
+            var greeting = new byte[3]; await stream.ReadExactlyAsync(greeting);
+            await stream.WriteAsync(new byte[] { 0x05, 0x00 });
+            var header = new byte[4]; await stream.ReadExactlyAsync(header);
+            observed.SetResult(header[3]);
+            var addressLength = header[3] switch
+            {
+                0x01 => 4,
+                0x04 => 16,
+                0x03 => await ReadLengthAsync(stream),
+                _ => throw new InvalidDataException("Некорректный SOCKS address type.")
+            };
+            var remainder = new byte[addressLength + 2]; await stream.ReadExactlyAsync(remainder);
+            await stream.WriteAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80 });
+        });
+        await using var proxy = new ResolvingHttpProxy("127.0.0.1", upstreamPort, [],
+            resolveUnmappedLocally: true);
+        using var browser = new System.Net.Sockets.TcpClient();
+        await browser.ConnectAsync(System.Net.IPAddress.Loopback, proxy.Port);
+        await browser.GetStream().WriteAsync(
+            "CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n"u8.ToArray());
+        Equal(true, await observed.Task is 0x01 or 0x04);
+        browser.Dispose();
+        await upstreamTask;
+        upstream.Stop();
+
+        static async Task<int> ReadLengthAsync(Stream stream)
+        {
+            var length = new byte[1];
+            await stream.ReadExactlyAsync(length);
+            return length[0];
+        }
     }
 
     private static async Task ExercisePlainHttpResolverProxyAsync()
@@ -1593,28 +2027,26 @@ internal sealed class SelfTestRunner
             BaseProxies = [proxy],
             KittyPath = @"C:\custom\kitty.exe",
             FirefoxPath = @"D:\firefox\firefox.exe",
-            FirefoxProfile = "my-profile",
             CloseToTray = true,
             EnableLogging = true,
             ConnectionTimeoutSeconds = 120,
             EndpointProbeTimeoutSeconds = 12,
             RaceBestEntryPoints = true,
             SkipExistingLinksInMapCheck = false,
-            UseInternalWebResolver = false
+            AutoDiscoverFirefoxProfile = false
         };
 
         var exported = ConfigTransfer.CreateExport(config, [server.Id], true);
 
         Equal("KiTTY\\kitty.exe", exported.KittyPath);
         Equal("firefox.exe", exported.FirefoxPath);
-        Equal("kitty-manager", exported.FirefoxProfile);
         Equal(false, exported.CloseToTray);
         Equal(false, exported.EnableLogging);
         Equal(10, exported.ConnectionTimeoutSeconds);
         Equal(4, exported.EndpointProbeTimeoutSeconds);
         Equal(false, exported.RaceBestEntryPoints);
         Equal(true, exported.SkipExistingLinksInMapCheck);
-        Equal(false, exported.UseInternalWebResolver);
+        Equal(true, exported.AutoDiscoverFirefoxProfile);
         Equal("", exported.BaseProxies[0].TotpSecret);
         Equal("SHA256", exported.BaseProxies[0].TotpAlgorithm);
         Equal(8, exported.BaseProxies[0].TotpDigits);
@@ -1780,6 +2212,33 @@ internal sealed class SelfTestRunner
         // Exactly 23h55m after success: interval expired
         Equal(true, AccessGrantPolicy.ShouldRunAccessScript(
             proxy, DateTimeOffset.Parse("2026-07-19T09:55:00Z")));
+    }
+
+    private static void ControlProbeDoesNotPostponeSchedule()
+    {
+        var success = DateTimeOffset.Parse("2026-08-26T14:52:45Z");
+        var proxy = new BaseProxy
+        {
+            Enabled = true, EnableScheduledRestart = true, ScheduledRestartMinutes = 1400,
+            PostLoginCommand = "./access.sh", LastAccessScriptSuccessUtc = success,
+            LastAccessConfirmedUtc = DateTimeOffset.Parse("2026-08-28T14:07:07Z"),
+            AccessScheduleBaselineUtc = DateTimeOffset.Parse("2026-08-28T14:07:07Z"),
+            LastAccessScriptResult = "AccessStillValid"
+        };
+        Equal(success.AddMinutes(1400), AccessGrantPolicy.NextScheduledRunUtc(proxy));
+        Equal(true, AccessGrantPolicy.ShouldRunScheduledRestart(
+            proxy, DateTimeOffset.Parse("2026-08-28T14:55:00Z")));
+    }
+
+    private static void RouteFailureChecksAccessControls()
+    {
+        var proxy = new BaseProxy
+        {
+            EnableControlServerMechanism = true, PostLoginCommand = "./access.sh",
+            AccessProbeServerIds = [Guid.NewGuid()], LastAccessScriptAttemptUtc = DateTimeOffset.UtcNow
+        };
+        Equal(true, AccessGrantPolicy.ShouldCheckControlsAfterRouteFailure(proxy));
+        Equal(false, AccessGrantPolicy.ShouldCheckControlsOnFailure(proxy, DateTimeOffset.UtcNow));
     }
 
     private static void AccessProbeExcludesLocalAndStartupServers()
@@ -2474,21 +2933,6 @@ internal sealed class SelfTestRunner
         Equal(0, group.Servers.Count);
     }
 
-    private static void GroupConnectivityBatches()
-    {
-        var servers = new[]
-        {
-            new ManagedServer { Name = "A" },
-            new ManagedServer { Name = "B" },
-            new ManagedServer { Name = "C" }
-        };
-        var batches = ConnectivityBatchPlanner.OneDirectionPerPair(servers.Concat([servers[0]]));
-        Equal(2, batches.Count);
-        Equal(3, batches.Sum(batch => batch.TargetIds.Count));
-        Equal(true, batches.All(batch => batch.TargetIds.All(targetId => targetId != batch.Source.Id)));
-        Equal(1, ConnectivityBatchPlanner.OneDirectionPerPair(servers.Take(2)).Sum(batch => batch.TargetIds.Count));
-    }
-
     private static void ConnectivityBatchReusesSource()
     {
         var source = Server("A");
@@ -2947,6 +3391,20 @@ internal sealed class SelfTestRunner
         Equal(true, afterCancelAll is not null);
     }
 
+    private static void BackgroundProbePrioritizesShorterRoute()
+    {
+        var proxy = new BaseProxy { Name = "proxy" };
+        var target = Server("target");
+        var viaA = Server("via-a");
+        var viaB = Server("via-b");
+        var current = new RouteCandidate(proxy, [viaA, viaB, target]);
+        var sameLength = new RouteCandidate(proxy, [viaB, viaA, target]);
+        var direct = new RouteCandidate(proxy, [target]);
+        var better = RoutePreferencePolicy.BetterCandidates([current, sameLength, direct], current);
+        Equal(1, better.Count);
+        Equal("proxy:target", CandidateName(better[0]));
+    }
+
     private static void ConcurrentConfigSaveIsAtomic()
     {
         var directory = Path.Combine(Path.GetTempPath(), $"kitty-manager-config-{Guid.NewGuid():N}");
@@ -2954,10 +3412,10 @@ internal sealed class SelfTestRunner
         try
         {
             var writes = Enumerable.Range(0, 32).Select(index => Task.Run(() =>
-                ConfigStore.Save(path, new ManagerConfig { FirefoxProfile = $"profile-{index}" }))).ToArray();
+                ConfigStore.Save(path, new ManagerConfig { WinScpPath = $"winscp-{index}" }))).ToArray();
             Task.WaitAll(writes);
             var loaded = ConfigStore.Load(path);
-            Equal(true, loaded.FirefoxProfile.StartsWith("profile-", StringComparison.Ordinal));
+            Equal(true, loaded.WinScpPath.StartsWith("winscp-", StringComparison.Ordinal));
             Equal(0, Directory.EnumerateFiles(directory, "*.tmp").Count());
         }
         finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
@@ -3247,17 +3705,30 @@ internal sealed class SelfTestRunner
         Equal(false, new JumphostProcessRegistry().Restore(selfRecord));
         Equal(false, new JumphostProcessRegistry().Restore(selfRecord with { ProcessId = int.MaxValue }));
 
-        // «Левая» KiTTY: исполняемый файл с именем kitty (sleep под shebang).
+        // Собственный тестовый процесс с именем kitty, без установки настоящей KiTTY.
         var dir = Path.Combine(Path.GetTempPath(), "km-selftest-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         Process? fakeKitty = null;
         try
         {
-            var kittyPath = Path.Combine(dir, "kitty");
-            File.WriteAllText(kittyPath, "#!/bin/sh\nsleep 20\n");
-            File.SetUnixFileMode(kittyPath,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-            fakeKitty = Process.Start(kittyPath)!;
+            ProcessStartInfo startInfo;
+            if (OperatingSystem.IsWindows())
+            {
+                var kittyPath = Path.Combine(dir, "kitty.exe");
+                File.Copy(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"), kittyPath);
+                startInfo = new ProcessStartInfo(kittyPath) { UseShellExecute = false, CreateNoWindow = true };
+                startInfo.ArgumentList.Add("/d"); startInfo.ArgumentList.Add("/c");
+                startInfo.ArgumentList.Add("ping -n 21 127.0.0.1 >nul");
+            }
+            else
+            {
+                var kittyPath = Path.Combine(dir, "kitty");
+                File.WriteAllText(kittyPath, "#!/bin/sh\nsleep 20\n");
+                File.SetUnixFileMode(kittyPath,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                startInfo = new ProcessStartInfo(kittyPath) { UseShellExecute = false };
+            }
+            fakeKitty = Process.Start(startInfo)!;
             fakeKitty.Refresh();
             var started = fakeKitty.StartTime.ToUniversalTime();
             var good = new JumphostConsoleRecord(proxyId, JumphostConsoleKind.Entry, fakeKitty.Id,
@@ -3277,8 +3748,15 @@ internal sealed class SelfTestRunner
         }
         finally
         {
-            try { fakeKitty?.Kill(); fakeKitty?.Dispose(); } catch { }
-            Directory.Delete(dir, true);
+            try
+            {
+                if (fakeKitty is not null)
+                {
+                    if (!fakeKitty.HasExited) fakeKitty.Kill(entireProcessTree: true);
+                    fakeKitty.WaitForExit(5000);
+                }
+            }
+            finally { fakeKitty?.Dispose(); Directory.Delete(dir, true); }
         }
     }
 
@@ -3312,8 +3790,8 @@ internal sealed class SelfTestRunner
         AccessGrantPolicy.RebaseAccessConfirmation(proxy, startup);
         Equal(script, proxy.LastAccessScriptSuccessUtc);
         Equal(startup, proxy.LastAccessConfirmedUtc);
-        Equal(startup.AddHours(1), AccessGrantPolicy.NextScheduledRunUtc(proxy));
-        Equal(false, AccessGrantPolicy.ShouldRunScheduledRestart(proxy, startup));
+        Equal(script.AddHours(1), AccessGrantPolicy.NextScheduledRunUtc(proxy));
+        Equal(true, AccessGrantPolicy.ShouldRunScheduledRestart(proxy, startup));
         Equal(true, AccessGrantPolicy.ShouldRunStartupPreflight(proxy));
     }
 
@@ -3861,6 +4339,48 @@ internal sealed class SelfTestRunner
         Equal(true, ordered.Skip(1).Any(candidate => candidate.Servers.Count == 2));
     }
 
+    private static void DependentEntryIsEmergencyFallback()
+    {
+        var root = Server("root");
+        var dependent = Server("dependent");
+        var independent = Server("independent");
+        var target = Server("target");
+        var proxy = new BaseProxy { Name = "proxy", Port = 5555 };
+        dependent.PreferredRoute = new CachedRoute
+        {
+            ProxyId = proxy.Id,
+            ServerIds = [root.Id, dependent.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        var config = Config(root, dependent, independent, target);
+        config.BaseProxies = [proxy];
+        config.Links =
+        [
+            new ServerLink { FromServerId = root.Id, ToServerId = dependent.Id, LastSuccessUtc = DateTimeOffset.UtcNow },
+            new ServerLink { FromServerId = dependent.Id, ToServerId = target.Id },
+            new ServerLink { FromServerId = independent.Id, ToServerId = target.Id }
+        ];
+
+        var candidates = RoutePlanner.Candidates(config, target.Id);
+        var independentIndex = Array.FindIndex(candidates.ToArray(), candidate =>
+            candidate.Servers.Select(server => server.Id).SequenceEqual([independent.Id, target.Id]));
+        var dependentRawIndex = Array.FindIndex(candidates.ToArray(), candidate =>
+            candidate.Servers.Select(server => server.Id).SequenceEqual([dependent.Id, target.Id]));
+        var composed = candidates.Single(candidate =>
+            candidate.Servers.Select(server => server.Id).SequenceEqual([root.Id, dependent.Id, target.Id]));
+        Equal(true, independentIndex >= 0 && dependentRawIndex > independentIndex);
+        Equal("составлен через сохранённый вход",
+            RoutePlanner.CandidateReason(config, target.Id, composed, null));
+        Equal("зависимый аварийный резерв",
+            RoutePlanner.CandidateReason(config, target.Id, candidates[dependentRawIndex], null));
+
+        dependent.PreferredRoute.ServerIds = [dependent.Id];
+        var reranked = RoutePlanner.Candidates(config, target.Id);
+        Equal(false, RoutePlanner.CandidateReason(config, target.Id,
+            reranked.Single(candidate => candidate.Servers.Select(server => server.Id)
+                .SequenceEqual([dependent.Id, target.Id])), null) == "зависимый аварийный резерв");
+    }
+
     private static void CachedEntryPrefixIsComposed()
     {
         var outside = Server("Server-C");
@@ -4047,6 +4567,49 @@ internal sealed class SelfTestRunner
 
         // Восстановлен из кэша и, как единственный проверенный, идёт первым.
         Equal("proxy:z-entry/target", ordered[0]);
+    }
+
+    private static void ReconstructedRouteFindsShorterComposedPrefix()
+    {
+        var newEntry = Server("new-entry");
+        var anchor = Server("anchor");
+        var oldEntry = Server("old-entry");
+        var oldMiddleA = Server("old-middle-a");
+        var oldMiddleB = Server("old-middle-b");
+        var target = Server("target");
+        var proxy = new BaseProxy { Name = "proxy", Port = 5555 };
+        anchor.PreferredRoute = new CachedRoute
+        {
+            ProxyId = proxy.Id,
+            ServerIds = [newEntry.Id, anchor.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        var preferred = new CachedRoute
+        {
+            ProxyId = proxy.Id,
+            ServerIds = [oldEntry.Id, oldMiddleA.Id, oldMiddleB.Id, target.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        var config = Config(newEntry, anchor, oldEntry, oldMiddleA, oldMiddleB, target);
+        config.BaseProxies = [proxy];
+        config.Links =
+        [
+            new ServerLink { FromServerId = newEntry.Id, ToServerId = anchor.Id, LastSuccessUtc = DateTimeOffset.UtcNow },
+            new ServerLink { FromServerId = anchor.Id, ToServerId = target.Id, LastSuccessUtc = DateTimeOffset.UtcNow },
+            new ServerLink { FromServerId = oldEntry.Id, ToServerId = oldMiddleA.Id, LastSuccessUtc = DateTimeOffset.UtcNow },
+            new ServerLink { FromServerId = oldMiddleA.Id, ToServerId = oldMiddleB.Id, LastSuccessUtc = DateTimeOffset.UtcNow },
+            new ServerLink { FromServerId = oldMiddleB.Id, ToServerId = target.Id, LastSuccessUtc = DateTimeOffset.UtcNow }
+        ];
+        var rankedWithoutOld = RoutePlanner.Candidates(config, target.Id)
+            .Where(candidate => !RoutePreferencePolicy.Matches(preferred, candidate))
+            .ToArray();
+        var actualCandidates = RoutePlanner.OrderPreferred(config, rankedWithoutOld, preferred);
+        var current = actualCandidates[0];
+        var better = RoutePreferencePolicy.BetterCandidates(actualCandidates, current);
+
+        Equal(true, RoutePreferencePolicy.Matches(preferred, current));
+        Equal(true, better.Any(candidate => candidate.Servers.Select(server => server.Id)
+            .SequenceEqual([newEntry.Id, anchor.Id, target.Id])));
     }
 
     private static void OrderPreferredNoDuplicate()
@@ -4243,6 +4806,16 @@ internal sealed class SelfTestRunner
         Equal("10.0.0.1:22", ordered[0]);
         Equal("10.0.0.1:2222", ordered[1]);
         Equal("10.0.0.99:22", ordered[2]);
+    }
+
+    private static void InternalEndpointRequiresPreviousServer()
+    {
+        var server = Server("target");
+        server.Host = "198.51.100.8"; server.Port = 22;
+        server.BackupEndpoints = [new ServerEndpoint("10.0.0.8", 22, true)];
+        Equal("198.51.100.8:22", string.Join(",", ServerEndpointPolicy.Ordered(server).Select(Ep)));
+        Equal("198.51.100.8:22,10.0.0.8:22",
+            string.Join(",", ServerEndpointPolicy.Ordered(server, EndpointContext.Via(Guid.NewGuid())).Select(Ep)));
     }
 
     private static void PreferredEndpointFirst()
@@ -4788,6 +5361,8 @@ internal sealed class SelfTestRunner
         Equal(true, TreeSelectionPolicy.NextBranchClick(false));
         Equal(false, TreeSelectionPolicy.NextBranchClick(true));
         Equal(false, TreeSelectionPolicy.NextBranchClick(null));
+        Equal(true, TreeSelectionPolicy.ShouldHandleRowClick(false));
+        Equal(false, TreeSelectionPolicy.ShouldHandleRowClick(true));
         var progress = ConnectivityPhasePresentation.Progress(2, 2, 6, 7, 5, 13, 14);
         Equal(true, progress.Contains("Этап 2 из 2: 6 из 7", StringComparison.Ordinal));
         Equal(true, progress.Contains("Всего проверено 13 из 14", StringComparison.Ordinal));
@@ -4813,6 +5388,13 @@ internal sealed class SelfTestRunner
         {
             Equal(true, ex.Message.Contains(ManagerPathResolver.Resolve(missing), StringComparison.Ordinal));
         }
+        var server = new ManagedServer { PrivateKeyPath = missing };
+        Equal(true, ManagerPathResolver.MissingConfiguredFileMessage(missing, "SSH-ключ")!
+            .Contains(ManagerPathResolver.Resolve(missing), StringComparison.Ordinal));
+        Equal<string?>(null, ManagerPathResolver.MissingConfiguredFileMessage("", "SSH-ключ"));
+        Equal(false, KittyLaunchPlan.DirectConsoleArguments(server, "host", 22, false).Contains("-i"));
+        Equal(false, WinScpLaunchPlan.BuildArguments(server, 2222)
+            .Any(x => x.StartsWith("/privatekey=", StringComparison.Ordinal)));
     }
 
     private static void ManagerRelativeAndAbsolutePaths()
@@ -5630,8 +6212,8 @@ internal sealed class SelfTestRunner
         var proxy = new BaseProxy { StartupServerId = server.Id };
 
         var arguments = JumphostStartupPlan.KittyAuthenticationArguments(server);
-        Equal(true, new[] { "-pw", "key-secret" }.SequenceEqual(arguments));
-        Equal(false, arguments.Contains("-pass"));
+        Equal(true, new[] { "-pw", "key-secret", "-pass", "account-secret" }.SequenceEqual(arguments));
+        Equal(true, arguments.Contains("-pass"));
         Equal("account-secret", JumphostStartupPlan.Build(proxy, server, DateTimeOffset.UnixEpoch)[0].Response);
     }
 
@@ -5822,30 +6404,27 @@ internal sealed class SelfTestRunner
     private static void FirefoxProfileLockedExceptionCarriesPath()
     {
         var templatePath = Path.Combine(Path.GetTempPath(), "test-firefox-profile-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(templatePath);
-        var lockFile = Path.Combine(templatePath, "parent.lock");
-        // Hold the file open to simulate a running Firefox
-        using var lockStream = new FileStream(lockFile, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
-        try
+        var ex = new FirefoxProfileLockedException(templatePath, new IOException("locked"));
+        Equal(templatePath, ex.TemplateProfilePath);
+        Equal(true, ex.InnerException is IOException);
+    }
+
+    private static void FirefoxSharingViolationClassification()
+    {
+        if (OperatingSystem.IsWindows())
         {
-            var runtimeRoot = Path.Combine(Path.GetTempPath(), "test-runtime-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(runtimeRoot);
-            try
-            {
-                FirefoxProfileWorkspace.Create(runtimeRoot, Guid.NewGuid(), Guid.NewGuid(), templatePath);
-                throw new Exception("Expected FirefoxProfileLockedException");
-            }
-            catch (FirefoxProfileLockedException ex)
-            {
-                Equal(templatePath, ex.TemplateProfilePath);
-                Equal(true, ex.InnerException is IOException);
-            }
+            Equal(true, FirefoxProfileWorkspace.IsSharingViolation(new IOException("sharing", 32)));
+            Equal(true, FirefoxProfileWorkspace.IsSharingViolation(new IOException("lock", 33)));
+            Equal(false, FirefoxProfileWorkspace.IsSharingViolation(new IOException("busy", 16)));
         }
-        finally
+        else
         {
-            lockStream.Dispose();
-            try { Directory.Delete(templatePath, true); } catch { }
+            Equal(true, FirefoxProfileWorkspace.IsSharingViolation(new IOException("wouldblock", 11)));
+            Equal(true, FirefoxProfileWorkspace.IsSharingViolation(new IOException("busy", 16)));
+            Equal(false, FirefoxProfileWorkspace.IsSharingViolation(new IOException("pipe", 32)));
         }
+        Equal(false, FirefoxProfileWorkspace.IsSharingViolation(new IOException("disk", 112)));
+        Equal(false, FirefoxProfileWorkspace.IsSharingViolation(new UnauthorizedAccessException("acl")));
     }
 
     private static void AutoConfirmHostKeysDefaultAndRoundTrip()
@@ -6088,28 +6667,35 @@ internal sealed class SelfTestRunner
 
     private static void FailureCacheBlocksDirectRetries()
     {
-        var ssh = new SshConnectionService();
-        var server = Server("target");
-        var proxy = new BaseProxy { Name = "proxy", Port = 5555 };
-        var config = Config(server);
-        config.BaseProxies = [proxy];
-
-        // Simulate a direct failure by checking connectivity (will fail since
-        // no real SSH server).  The failure cache should record it.
-        // We can't easily test the full flow without a real server, but we
-        // can test the cache methods directly.
-        // Use reflection or public API to test cache behavior.
-        // Since the cache is private, we test indirectly via ClearFailureCache.
-        ssh.ClearFailureCache(); // should not throw
+        var cache = new RouteFailureCache();
+        var target = Server("target"); var proxy = new BaseProxy { Name = "proxy" };
+        var candidate = new RouteCandidate(proxy, [target]);
+        var now = DateTimeOffset.Parse("2026-01-01T00:00:00Z");
+        Equal(false, cache.ShouldSkip(candidate, now));
+        cache.RememberDirectFailure(candidate, now);
+        Equal(true, cache.ShouldSkip(candidate, now));
+        Equal(true, cache.ShouldSkip(candidate, now.AddSeconds(89)));
+        Equal(false, cache.ShouldSkip(candidate, now.AddSeconds(90)));
+        Equal(false, cache.ShouldSkip(new(new BaseProxy(), [target]), now));
+        Equal(false, cache.ShouldSkip(new(proxy, [Server("other")]), now));
+        cache.ClearSuccess(candidate);
+        Equal(false, cache.ShouldSkip(candidate, now));
     }
 
     private static void FailureCacheDoesNotBlockMultiHop()
     {
-        // The failure cache only blocks direct candidates (Servers.Count == 1).
-        // Multi-hop candidates are never blocked by the cache.
-        // This is verified by the CandidateClass test and the code logic.
-        var ssh = new SshConnectionService();
-        ssh.ClearFailureCache(); // should not throw
+        var cache = new RouteFailureCache();
+        var source = Server("source"); var target = Server("target");
+        var proxy = new BaseProxy(); var now = DateTimeOffset.UtcNow;
+        var direct = new RouteCandidate(proxy, [target]);
+        var indirect = new RouteCandidate(proxy, [source, target]);
+        cache.RememberDirectFailure(indirect, now);
+        Equal(false, cache.ShouldSkip(direct, now));
+        Equal(false, cache.ShouldSkip(indirect, now));
+        cache.RememberDirectFailure(direct, now);
+        cache.ClearSuccess(indirect);
+        Equal(true, cache.ShouldSkip(direct, now));
+        Equal(false, cache.ShouldSkip(indirect, now));
     }
 
     private static void DirectTimeoutDoesNotBlockSameProxyMultiHop()
@@ -6131,9 +6717,23 @@ internal sealed class SelfTestRunner
     private static void ClearFailureCacheResetsAll()
     {
         var ssh = new SshConnectionService();
-        // Multiple calls should not throw
+        // Inspect the service-owned caches without exposing production test hooks.
+        var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var routes = (RouteFailureCache)typeof(SshConnectionService).GetField("failureCache", flags)!.GetValue(ssh)!;
+        var endpoints = (EndpointFailureCache)typeof(SshConnectionService).GetField("endpointFailureCache", flags)!.GetValue(ssh)!;
+        var server = Server("target"); var proxy = new BaseProxy();
+        var candidate = new RouteCandidate(proxy, [server]);
+        var context = new EndpointContext(proxy.Id, null);
+        var endpoint = new ServerEndpoint("192.0.2.1", 22); var now = DateTimeOffset.UtcNow;
+        routes.RememberDirectFailure(candidate, now);
+        endpoints.RememberFailure(server.Id, context, endpoint, now);
+        Equal(true, routes.ShouldSkip(candidate, now));
+        Equal(true, endpoints.ShouldSkip(server.Id, context, endpoint, now));
         ssh.ClearFailureCache();
+        Equal(false, routes.ShouldSkip(candidate, now));
+        Equal(false, endpoints.ShouldSkip(server.Id, context, endpoint, now));
         ssh.ClearFailureCache();
+        Equal(false, routes.ShouldSkip(candidate, now));
     }
 
     private static void RoutedSessionCreateMinimal()

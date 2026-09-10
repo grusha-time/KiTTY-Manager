@@ -31,7 +31,8 @@
           <Button Content="Снять выбор" Click="Clear_Click"/>
         </StackPanel>
         <CheckBox x:Name="EntryPointsCheckBox" Content="Добавить точки входа и настройки jumphost"
-                  IsChecked="True" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                  IsChecked="True" HorizontalAlignment="Right" VerticalAlignment="Center"
+                  ToolTip="Включает в экспорт сессии-точки входа (jumphost-серверы, через которые идёт маршрут) и их настройки. Без них импортирующая сторона не сможет восстановить маршруты через jumphost."/>
       </DockPanel>
       <TextBox x:Name="SearchBox" Grid.Row="1" Margin="0,12,0,0"
                TextChanged="SearchBox_TextChanged"
@@ -41,11 +42,15 @@
     <DataGrid x:Name="ServersGrid" Grid.Row="2" ItemsSource="{Binding RowsView}" AutoGenerateColumns="False"
               CanUserAddRows="False" CanUserDeleteRows="False" SelectionMode="Extended">
       <DataGrid.Columns>
-        <DataGridCheckBoxColumn Header="Экспорт" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="86"/>
+        <DataGridCheckBoxColumn Header="Экспорт" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="86" ElementStyle="{StaticResource DataGridCheckBoxStyle}" EditingElementStyle="{StaticResource DataGridCheckBoxStyle}"/>
         <DataGridTextColumn Header="Сессия" Binding="{Binding Name}" Width="2*" IsReadOnly="True"/>
         <DataGridTextColumn Header="Сервер" Binding="{Binding Endpoint}" Width="*" IsReadOnly="True"/>
         <DataGridTextColumn Header="Группа" Binding="{Binding GroupPath}" Width="2*" IsReadOnly="True"/>
-        <DataGridCheckBoxColumn Header="Jumphost" Binding="{Binding IsJumphost}" Width="90" IsReadOnly="True"/>
+        <DataGridCheckBoxColumn Binding="{Binding IsJumphost}" Width="90" IsReadOnly="True" ElementStyle="{StaticResource DataGridCheckBoxStyle}" EditingElementStyle="{StaticResource DataGridCheckBoxStyle}">
+          <DataGridCheckBoxColumn.Header>
+            <TextBlock Text="Jumphost" ToolTip="Отмечены сессии, которые являются точками входа (jumphost). Через них строится маршрут к целевым серверам. Для корректного импорта маршрутов включите чекбокс «Добавить точки входа»."/>
+          </DataGridCheckBoxColumn.Header>
+        </DataGridCheckBoxColumn>
       </DataGrid.Columns>
     </DataGrid>
 

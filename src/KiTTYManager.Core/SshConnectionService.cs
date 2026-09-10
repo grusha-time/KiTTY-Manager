@@ -33,6 +33,19 @@ public static class SshRouteStrategy
         : [DirectTcpIp, RemoteCommand];
 }
 
+public sealed class SshHopException : InvalidOperationException
+{
+    public Guid SourceId { get; }
+    public Guid TargetId { get; }
+
+    public SshHopException(Guid sourceId, Guid targetId, string message, Exception innerException)
+        : base(message, innerException)
+    {
+        SourceId = sourceId;
+        TargetId = targetId;
+    }
+}
+
 public sealed class ActiveRoute : IDisposable
 {
     private readonly List<IDisposable> resources;
@@ -43,6 +56,14 @@ public sealed class ActiveRoute : IDisposable
     public IReadOnlyList<RouteHop> Hops { get; }
     public bool CanDetachDirectConsole { get; }
     internal SshClient? Client { get; }
+
+    public void AddForwardedPort(ForwardedPort port)
+    {
+        if (Client is null) throw new InvalidOperationException("Маршрут не предоставляет SSH-канал для туннеля.");
+        Client.AddForwardedPort(port);
+    }
+
+    public void RemoveForwardedPort(ForwardedPort port) => Client?.RemoveForwardedPort(port);
     internal ActiveRoute(ManagedServer target, int sshPort, int socksPort, string strategy,
         SshClient? client, List<IDisposable> resources, IReadOnlyList<RouteHop> hops,
         bool canDetachDirectConsole = false) =>
@@ -187,9 +208,8 @@ public sealed class SshConnectionService
                 new InvalidOperationException("No enabled global SOCKS route candidates."));
         foreach (var candidate in candidateList)
         {
-            // Кэш: пропускаем недавно провалившиеся пары (proxy, server)
-            // только для прямых маршрутов — multi-hop неудачи не кэшируем,
-            // т.к. причина может быть в промежуточном сервере, а не в proxy.
+            // Кэш относится к входу proxy -> первый сервер, в том числе в длинной цепочке.
+            // Неудачу multi-hop целиком не запоминаем: сбой мог произойти на другом переходе.
             if (failureCache.ShouldSkip(candidate, DateTimeOffset.UtcNow))
             {
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "SKIP_CACHED_FAILURE");
@@ -199,7 +219,7 @@ public sealed class SshConnectionService
             using var attempt = CreateAttemptCancellation(cancellationToken);
             var sw = Stopwatch.StartNew();
             var originalHostKeys = candidate.Servers
-                .Select(server => (Server: server, Fingerprint: server.HostKeyFingerprint))
+                .Select(server => (Server: server, Key: CaptureHostKey(server)))
                 .ToArray();
             Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "START");
             try
@@ -226,7 +246,7 @@ public sealed class SshConnectionService
             catch (SshAuthenticationException ex)
             {
                 foreach (var item in originalHostKeys)
-                    item.Server.HostKeyFingerprint = item.Fingerprint;
+                    RestoreHostKey(item.Server, item.Key);
                 failures.Add(new InvalidOperationException(
                     $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}", ex));
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "FAIL", ex);
@@ -240,7 +260,7 @@ public sealed class SshConnectionService
             {
                 var timeout = AttemptTimeout(ProxyLabel(candidate.Proxy), ex);
                 foreach (var item in originalHostKeys)
-                    item.Server.HostKeyFingerprint = item.Fingerprint;
+                    RestoreHostKey(item.Server, item.Key);
                 failures.Add(timeout);
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
@@ -249,7 +269,7 @@ public sealed class SshConnectionService
             {
                 var timeout = AttemptTimeout(ProxyLabel(candidate.Proxy), ex);
                 foreach (var item in originalHostKeys)
-                    item.Server.HostKeyFingerprint = item.Fingerprint;
+                    RestoreHostKey(item.Server, item.Key);
                 failures.Add(timeout);
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
@@ -258,7 +278,7 @@ public sealed class SshConnectionService
             {
                 var timeout = AttemptTimeout(ProxyLabel(candidate.Proxy), ex);
                 foreach (var item in originalHostKeys)
-                    item.Server.HostKeyFingerprint = item.Fingerprint;
+                    RestoreHostKey(item.Server, item.Key);
                 failures.Add(timeout);
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
@@ -266,7 +286,7 @@ public sealed class SshConnectionService
             catch (Exception ex)
             {
                 foreach (var item in originalHostKeys)
-                    item.Server.HostKeyFingerprint = item.Fingerprint;
+                    RestoreHostKey(item.Server, item.Key);
                 failures.Add(new InvalidOperationException(
                     $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}", ex));
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
@@ -291,7 +311,7 @@ public sealed class SshConnectionService
             cancellationToken.ThrowIfCancellationRequested();
             using var attempt = CreateAttemptCancellation(cancellationToken);
             var routeTarget = candidate.Servers[^1];
-            var originalHostKey = routeTarget.HostKeyFingerprint;
+            var originalHostKey = CaptureHostKey(routeTarget);
             var sw = Stopwatch.StartNew();
             try
             {
@@ -316,7 +336,7 @@ public sealed class SshConnectionService
                 foreach (var result in results.Where(r => r.Success))
                 {
                     var target = config.FindServer(result.TargetId);
-                    if (target is null) continue;
+                    if (target is null || candidate.Servers.Any(server => server.Id == target.Id)) continue;
                     var fullChain = candidate.Servers.Append(target).Select(s => s.Id).ToList();
                     if (!RoutePreferencePolicy.ShouldReplacePreferred(target.PreferredRoute, fullChain))
                         continue;
@@ -332,7 +352,7 @@ public sealed class SshConnectionService
             }
             catch (SshAuthenticationException ex)
             {
-                routeTarget.HostKeyFingerprint = originalHostKey;
+                RestoreHostKey(routeTarget, originalHostKey);
                 failures.Add(new InvalidOperationException(
                     $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}", ex));
             }
@@ -343,28 +363,28 @@ public sealed class SshConnectionService
             }
             catch (OperationCanceledException ex) when (attempt.IsCancellationRequested)
             {
-                routeTarget.HostKeyFingerprint = originalHostKey;
+                RestoreHostKey(routeTarget, originalHostKey);
                 var timeout = AttemptTimeout(ProxyLabel(candidate.Proxy), ex);
                 failures.Add(timeout);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
             }
             catch (SshOperationTimeoutException ex)
             {
-                routeTarget.HostKeyFingerprint = originalHostKey;
+                RestoreHostKey(routeTarget, originalHostKey);
                 var timeout = AttemptTimeout(ProxyLabel(candidate.Proxy), ex);
                 failures.Add(timeout);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested && attempt.IsCancellationRequested)
             {
-                routeTarget.HostKeyFingerprint = originalHostKey;
+                RestoreHostKey(routeTarget, originalHostKey);
                 var timeout = AttemptTimeout(ProxyLabel(candidate.Proxy), ex);
                 failures.Add(timeout);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
             }
             catch (Exception ex)
             {
-                routeTarget.HostKeyFingerprint = originalHostKey;
+                RestoreHostKey(routeTarget, originalHostKey);
                 failures.Add(new InvalidOperationException(
                     $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}", ex));
             }
@@ -385,7 +405,7 @@ public sealed class SshConnectionService
         if (!RoutePlanner.SatisfiesRouteConstraints(new RouteCandidate(proxy, [source])))
             throw new InvalidOperationException(
                 "Исходная сессия требует обязательный предыдущий переход и не может быть открыта напрямую.");
-        var originalHostKey = source.HostKeyFingerprint;
+        var originalHostKey = CaptureHostKey(source);
         var sw = Stopwatch.StartNew();
         using var attempt = CreateAttemptCancellation(cancellationToken);
         try
@@ -403,28 +423,28 @@ public sealed class SshConnectionService
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && attempt.IsCancellationRequested)
         {
-            source.HostKeyFingerprint = originalHostKey;
+            RestoreHostKey(source, originalHostKey);
             var timeout = AttemptTimeout(ProxyLabel(proxy));
             Emit(SshTraceStage.RouteCandidate, ProxyLabel(proxy), "TIMEOUT", timeout);
             throw timeout;
         }
         catch (SshOperationTimeoutException ex)
         {
-            source.HostKeyFingerprint = originalHostKey;
+            RestoreHostKey(source, originalHostKey);
             var timeout = AttemptTimeout(ProxyLabel(proxy), ex);
             Emit(SshTraceStage.RouteCandidate, ProxyLabel(proxy), "TIMEOUT", timeout);
             throw timeout;
         }
         catch (Exception ex) when (!cancellationToken.IsCancellationRequested && attempt.IsCancellationRequested)
         {
-            source.HostKeyFingerprint = originalHostKey;
+            RestoreHostKey(source, originalHostKey);
             var timeout = AttemptTimeout(ProxyLabel(proxy), ex);
             Emit(SshTraceStage.RouteCandidate, ProxyLabel(proxy), "TIMEOUT", timeout);
             throw timeout;
         }
         catch
         {
-            source.HostKeyFingerprint = originalHostKey;
+            RestoreHostKey(source, originalHostKey);
             throw;
         }
     }
@@ -444,7 +464,7 @@ public sealed class SshConnectionService
             if (!sourceClient.IsConnected) break;
             var target = config.FindServer(id);
             if (target is null || target.Id == sourceId) continue;
-            var originalHostKey = target.HostKeyFingerprint;
+            var originalHostKey = CaptureHostKey(target);
             // Пробуем основной адрес и все резервные настоящей попыткой; у каждого
             // свой таймаут, поэтому «молчащий» основной адрес не лишает времени
             // резервный. Неуспех по сети → следующий адрес; по учётке → стоп.
@@ -524,7 +544,7 @@ public sealed class SshConnectionService
                         {
                             Emit(SshTraceStage.RemoteCommandFallback, target.Name, "FAIL", fallbackError);
                             if (!CanUsePrivilegeFallback(source))
-                                throw new InvalidOperationException(
+                                throw new SshHopException(sourceId, target.Id,
                                     "direct-tcpip and remote command fallback both failed.",
                                     new AggregateException(directError, forwardFailure ?? directError, fallbackError));
 
@@ -548,7 +568,7 @@ public sealed class SshConnectionService
                             catch (Exception privilegedError)
                             {
                                 Emit(SshTraceStage.PrivilegedCommandFallback, target.Name, "FAIL", privilegedError);
-                                throw new InvalidOperationException(
+                                throw new SshHopException(sourceId, target.Id,
                                     "direct-tcpip, remote command and su command strategies failed.",
                                     new AggregateException(directError, forwardFailure ?? directError,
                                         fallbackError, privilegedError));
@@ -566,13 +586,13 @@ public sealed class SshConnectionService
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    target.HostKeyFingerprint = originalHostKey;
+                    RestoreHostKey(target, originalHostKey);
                     throw;
                 }
                 catch (SshAuthenticationException ex)
                 {
                     // Учётные данные одинаковы для всех адресов — остальные не пробуем.
-                    target.HostKeyFingerprint = originalHostKey;
+                    RestoreHostKey(target, originalHostKey);
                     lastFailureMessage = SafeMessage(ex);
                     lastFailureDuration = sw.Elapsed;
                     break;
@@ -581,7 +601,7 @@ public sealed class SshConnectionService
                 {
                     endpointFailureCache.RememberFailure(
                         target.Id, endpointContext, endpoint, DateTimeOffset.UtcNow);
-                    target.HostKeyFingerprint = originalHostKey;
+                    RestoreHostKey(target, originalHostKey);
                     var timeout = AttemptTimeout(target.Name, ex);
                     Emit(SshTraceStage.TargetAuthentication, target.Name, "TIMEOUT", timeout);
                     lastFailureMessage = timeout.Message;
@@ -591,7 +611,7 @@ public sealed class SshConnectionService
                 {
                     endpointFailureCache.RememberFailure(
                         target.Id, endpointContext, endpoint, DateTimeOffset.UtcNow);
-                    target.HostKeyFingerprint = originalHostKey;
+                    RestoreHostKey(target, originalHostKey);
                     var timeout = AttemptTimeout(target.Name, ex);
                     Emit(SshTraceStage.TargetAuthentication, target.Name, "TIMEOUT", timeout);
                     lastFailureMessage = timeout.Message;
@@ -601,7 +621,7 @@ public sealed class SshConnectionService
                 {
                     endpointFailureCache.RememberFailure(
                         target.Id, endpointContext, endpoint, DateTimeOffset.UtcNow);
-                    target.HostKeyFingerprint = originalHostKey;
+                    RestoreHostKey(target, originalHostKey);
                     var timeout = AttemptTimeout(target.Name, ex);
                     Emit(SshTraceStage.TargetAuthentication, target.Name, "TIMEOUT", timeout);
                     lastFailureMessage = timeout.Message;
@@ -611,7 +631,7 @@ public sealed class SshConnectionService
                 {
                     endpointFailureCache.RememberFailure(
                         target.Id, endpointContext, endpoint, DateTimeOffset.UtcNow);
-                    target.HostKeyFingerprint = originalHostKey;
+                    RestoreHostKey(target, originalHostKey);
                     lastFailureMessage = SafeMessage(ex);
                     lastFailureDuration = sw.Elapsed;
                     if (!sourceClient.IsConnected) break;
@@ -706,6 +726,18 @@ public sealed class SshConnectionService
         return !string.IsNullOrEmpty(server.RootPassword);
     }
 
+    internal static int ReleaseProbeForConsole(IDisposable probe, List<IDisposable> resources,
+        int ingressPort, IDisposable? spentBridge, Func<(IDisposable Resource, int Port)>? recreate)
+    {
+        resources.Remove(probe);
+        probe.Dispose();
+        if (recreate is null) return ingressPort; // A direct-tcpip listener accepts another connection.
+        if (spentBridge is not null) { resources.Remove(spentBridge); spentBridge.Dispose(); }
+        var fresh = recreate();
+        resources.Add(fresh.Resource);
+        return fresh.Port;
+    }
+
     private ActiveRoute Connect(
         RouteCandidate candidate, bool exposePorts = true,
         CancellationToken cancellationToken = default, bool consoleOnly = false)
@@ -716,6 +748,8 @@ public sealed class SshConnectionService
         ManagedServer? previousServer = null;
         int? finalIngressPort = null;
         SshClient? finalIngressOwner = null;
+        IDisposable? finalCommandBridge = null;
+        Func<(IDisposable Resource, int Port)>? recreateConsoleIngress = null;
         var strategy = SshRouteStrategy.DirectTcpIp;
         void RememberHop(ManagedServer server, ServerEndpoint endpoint, EndpointContext context)
         {
@@ -803,6 +837,8 @@ public sealed class SshConnectionService
                         resources.Add(client);
                         finalIngressPort = checked((int)forward.BoundPort);
                         finalIngressOwner = ingressOwner;
+                        finalCommandBridge = null;
+                        recreateConsoleIngress = null;
                         previous = client;
                         previousServer = server;
                         RememberHop(server, hopEndpoint, hopContext);
@@ -830,15 +866,21 @@ public sealed class SshConnectionService
                         Emit(SshTraceStage.RemoteCommandFallback, server.Name, "START", forwardFailure);
                         try
                         {
-                            var bridge = new RemoteCommandBridge(
-                                previous, hopEndpoint.Host, hopEndpoint.Port, cancellationToken: cancellationToken,
-                                privilegeTimeout: Timeout);
+                            (IDisposable Resource, int Port) CreateIngress()
+                            {
+                                var fresh = new RemoteCommandBridge(ingressOwner, hopEndpoint.Host, hopEndpoint.Port,
+                                    cancellationToken: cancellationToken, privilegeTimeout: Timeout);
+                                return (fresh, fresh.LocalPort);
+                            }
+                            var bridge = (RemoteCommandBridge)CreateIngress().Resource;
                             resources.Add(bridge);
                             client = CreateDirect(server, "127.0.0.1", bridge.LocalPort);
                             ConnectClient(client, cancellationToken);
                             resources.Add(client);
                             finalIngressPort = bridge.LocalPort;
                             finalIngressOwner = ingressOwner;
+                            finalCommandBridge = bridge;
+                            recreateConsoleIngress = CreateIngress;
                             previous = client;
                             previousServer = server;
                             RememberHop(server, hopEndpoint, hopContext);
@@ -866,7 +908,7 @@ public sealed class SshConnectionService
                             if (!CanUsePrivilegeFallback(previousServer))
                             {
                                 Emit(SshTraceStage.TargetAuthentication, server.Name, "FAIL", fallbackError);
-                                throw new InvalidOperationException(
+                                throw new SshHopException(previousServer!.Id, server.Id,
                                     "direct-tcpip and remote command fallback both failed.",
                                     new AggregateException(directError, forwardFailure ?? directError, fallbackError));
                             }
@@ -874,16 +916,23 @@ public sealed class SshConnectionService
                             Emit(SshTraceStage.PrivilegedCommandFallback, server.Name, "START");
                             try
                             {
-                                var rootBridge = new RemoteCommandBridge(
-                                    previous, hopEndpoint.Host, hopEndpoint.Port,
-                                    previousServer!.RootPassword, previousServer.RootLogin,
-                                    cancellationToken, Timeout);
+                                var rootPassword = previousServer!.RootPassword;
+                                var rootLogin = previousServer.RootLogin;
+                                (IDisposable Resource, int Port) CreatePrivilegedIngress()
+                                {
+                                    var fresh = new RemoteCommandBridge(ingressOwner, hopEndpoint.Host, hopEndpoint.Port,
+                                        rootPassword, rootLogin, cancellationToken, Timeout);
+                                    return (fresh, fresh.LocalPort);
+                                }
+                                var rootBridge = (RemoteCommandBridge)CreatePrivilegedIngress().Resource;
                                 resources.Add(rootBridge);
                                 client = CreateDirect(server, "127.0.0.1", rootBridge.LocalPort);
                                 ConnectClient(client, cancellationToken);
                                 resources.Add(client);
                                 finalIngressPort = rootBridge.LocalPort;
                                 finalIngressOwner = ingressOwner;
+                                finalCommandBridge = rootBridge;
+                                recreateConsoleIngress = CreatePrivilegedIngress;
                                 previous = client;
                                 previousServer = server;
                                 RememberHop(server, hopEndpoint, hopContext);
@@ -902,7 +951,7 @@ public sealed class SshConnectionService
                                 client?.Dispose();
                                 Emit(SshTraceStage.PrivilegedCommandFallback, server.Name, "FAIL", privilegedError);
                                 Emit(SshTraceStage.TargetAuthentication, server.Name, "FAIL", privilegedError);
-                                throw new InvalidOperationException(
+                                throw new SshHopException(previousServer!.Id, server.Id,
                                     "direct-tcpip, remote command and su command strategies failed.",
                                     new AggregateException(directError, forwardFailure ?? directError,
                                         fallbackError, privilegedError));
@@ -958,8 +1007,8 @@ public sealed class SshConnectionService
                 // The authentication above verifies the final hop. Some servers
                 // reject a second concurrent SSH login for the same account, so
                 // release the probe connection before KiTTY takes its place.
-                resources.Remove(previous);
-                previous.Dispose();
+                finalIngressPort = ReleaseProbeForConsole(previous, resources, finalIngressPort.Value,
+                    finalCommandBridge, recreateConsoleIngress);
                 previous = finalIngressOwner;
                 Emit(SshTraceStage.ChannelForward, target.Name, "CONSOLE_INGRESS_READY");
                 return new ActiveRoute(target, finalIngressPort.Value, 0, strategy, previous, resources, hops);
@@ -1205,9 +1254,33 @@ public sealed class SshConnectionService
         return [.. methods];
     }
 
+    internal SftpClient CreateSftpClient(ManagedServer server, ActiveRoute route)
+    {
+        var info = new ConnectionInfo("127.0.0.1", route.LocalSshPort, server.EffectiveUsername,
+            CreateAuthenticationMethods(server)) { Timeout = Timeout };
+        var client = new SftpClient(info);
+        client.HostKeyReceived += (_, args) =>
+        {
+            var fingerprint = "SHA256:" + args.FingerPrintSHA256;
+            var saved = NormalizeFingerprint(server.HostKeyFingerprint);
+            if (saved.Length > 0)
+            {
+                args.CanTrust = string.Equals(saved, fingerprint, StringComparison.Ordinal) ||
+                                HostKeyMismatchVerifier?.Invoke(server, saved, fingerprint) == true;
+                if (args.CanTrust) SaveHostKey(server, fingerprint, args.HostKeyName, args.KeyLength);
+                return;
+            }
+            args.CanTrust = HostKeyVerifier?.Invoke(server, fingerprint) == true;
+            if (args.CanTrust) SaveHostKey(server, fingerprint, args.HostKeyName, args.KeyLength);
+        };
+        return client;
+    }
+
     private static bool CanUsePrivateKey(ManagedServer server)
     {
-        var keyPath = ManagerPathResolver.ResolveOptionalFile(server.PrivateKeyPath, "SSH-ключ");
+        string? keyPath;
+        try { keyPath = ManagerPathResolver.ResolveOptionalFile(server.PrivateKeyPath, "SSH-ключ"); }
+        catch (FileNotFoundException) { return false; }
         if (keyPath is null) return false;
         var metadata = PrivateKeyInspector.Inspect(keyPath);
         return metadata.Resolved &&
@@ -1235,23 +1308,38 @@ public sealed class SshConnectionService
                 if (string.Equals(saved, fingerprint, StringComparison.Ordinal))
                 {
                     args.CanTrust = true;
+                    SaveHostKey(server, fingerprint, args.HostKeyName, args.KeyLength);
                     Emit(SshTraceStage.HostKey, server.Name, "MATCH");
                     return;
                 }
 
                 args.CanTrust = HostKeyMismatchVerifier?.Invoke(server, saved, fingerprint) == true;
-                if (args.CanTrust) server.HostKeyFingerprint = fingerprint;
+                if (args.CanTrust) SaveHostKey(server, fingerprint, args.HostKeyName, args.KeyLength);
                 Emit(SshTraceStage.HostKey, server.Name,
                     args.CanTrust ? "REPLACED_CONFIRMED" : "REJECTED_CHANGED");
                 return;
             }
 
             args.CanTrust = HostKeyVerifier?.Invoke(server, fingerprint) == true;
-            if (args.CanTrust) server.HostKeyFingerprint = fingerprint;
+            if (args.CanTrust) SaveHostKey(server, fingerprint, args.HostKeyName, args.KeyLength);
             Emit(SshTraceStage.HostKey, server.Name, args.CanTrust ? "ACCEPTED_NEW" : "REJECTED_NEW");
         };
         return client;
     }
+
+    private static void SaveHostKey(ManagedServer server, string fingerprint, string algorithm, int bits)
+    {
+        server.HostKeyFingerprint = fingerprint;
+        server.HostKeyAlgorithm = algorithm;
+        server.HostKeyBits = bits;
+    }
+
+    private readonly record struct HostKeySnapshot(string Fingerprint, string Algorithm, int Bits);
+    private static HostKeySnapshot CaptureHostKey(ManagedServer server) =>
+        new(server.HostKeyFingerprint, server.HostKeyAlgorithm, server.HostKeyBits);
+    private static void RestoreHostKey(ManagedServer server, HostKeySnapshot value) =>
+        (server.HostKeyFingerprint, server.HostKeyAlgorithm, server.HostKeyBits) =
+            (value.Fingerprint, value.Algorithm, value.Bits);
 
     private void Emit(SshTraceStage stage, string subject, string status, Exception? error = null) =>
         Trace?.Invoke(new SshTraceEvent(stage, subject, status, error));
@@ -1264,8 +1352,9 @@ public sealed class SshConnectionService
     private static string NormalizeFingerprint(string? fingerprint)
     {
         var value = fingerprint?.Trim() ?? "";
-        return value.Length == 0 || value.StartsWith("SHA256:", StringComparison.Ordinal)
-            ? value
+        if (value.Length == 0) return value;
+        return value.StartsWith("SHA256:", StringComparison.OrdinalIgnoreCase)
+            ? "SHA256:" + value[7..]
             : "SHA256:" + value;
     }
 

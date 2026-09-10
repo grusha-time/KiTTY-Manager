@@ -51,6 +51,13 @@ public static class DarkWindowChrome
         _ = DwmFlush();
     }
 
+    public static void ApplyApplicationStyle(Window window)
+    {
+        if (window.ReadLocalValue(FrameworkElement.StyleProperty) == DependencyProperty.UnsetValue)
+            window.SetResourceReference(FrameworkElement.StyleProperty, typeof(Window));
+        Apply(window);
+    }
+
     private static void EnabledChanged(DependencyObject value, DependencyPropertyChangedEventArgs args)
     {
         if (value is not Window window || args.NewValue is not true) return;

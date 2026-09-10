@@ -280,7 +280,7 @@ internal static class KittyCredentialDecoder
     {
         if (string.IsNullOrWhiteSpace(value)) return null;
         var firstCommand = value.Replace("\\n", "\n", StringComparison.Ordinal)
-            .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
             .Select(command => command.Trim())
             .FirstOrDefault(command => command.Length > 0);
         if (firstCommand is null) return null;

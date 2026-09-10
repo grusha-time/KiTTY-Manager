@@ -27,7 +27,7 @@
     <DataGrid x:Name="ConflictsGrid" Grid.Row="2" ItemsSource="{Binding Rows}" AutoGenerateColumns="False"
               CanUserAddRows="False" CanUserDeleteRows="False">
       <DataGrid.Columns>
-        <DataGridCheckBoxColumn Header="Новые данные" Binding="{Binding UseIncoming, UpdateSourceTrigger=PropertyChanged}" Width="112"/>
+        <DataGridCheckBoxColumn Header="Новые данные" Binding="{Binding UseIncoming, UpdateSourceTrigger=PropertyChanged}" Width="112" ElementStyle="{StaticResource DataGridCheckBoxStyle}" EditingElementStyle="{StaticResource DataGridCheckBoxStyle}"/>
         <DataGridTextColumn Header="Тип" Binding="{Binding KindText}" Width="120" IsReadOnly="True"/>
         <DataGridTextColumn Header="Название" Binding="{Binding Name}" Width="*" IsReadOnly="True"/>
         <DataGridTextColumn Header="Сейчас" Binding="{Binding CurrentSummary}" Width="2*" IsReadOnly="True"/>

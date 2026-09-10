@@ -1,11 +1,14 @@
 {
-  "SchemaVersion": 3,
+  "SchemaVersion": 9,
   "Groups": [],
   "UngroupedServers": [],
   "Links": [],
   "BaseProxies": [],
   "KittyPath": "KiTTY\\kitty.exe",
   "FirefoxPath": "firefox.exe",
+  "WinScpPath": "",
   "FirefoxProfile": "kitty-manager",
-  "ConnectionTimeoutSeconds": 60
+  "ConnectionTimeoutSeconds": 10,
+  "TaskConnectionRecoveryMinutes": 1,
+  "OfferStartMissingJumphosts": true
 }

@@ -10,14 +10,11 @@ public static class WebResolverMappingPlan
         foreach (var web in server.WebInterfaces)
         {
             if (!Uri.TryCreate(web.Url, UriKind.Absolute, out var uri) ||
-                IPAddress.TryParse(uri.Host, out _)) continue;
-            var address = string.IsNullOrWhiteSpace(web.ResolverAddress)
-                ? server.CleanHost
-                : web.ResolverAddress.Trim();
+                IPAddress.TryParse(uri.Host, out _) || string.IsNullOrWhiteSpace(web.ResolverAddress)) continue;
+            var address = web.ResolverAddress.Trim();
             if (!IPAddress.TryParse(address, out _))
                 throw new InvalidOperationException(
-                    $"Для веб-интерфейса «{web.Name}» укажите IP в поле «Резолвить домен по адресу». " +
-                    $"Адрес сервера «{server.CleanHost}» также не является IP.");
+                    $"Для веб-интерфейса «{web.Name}» укажите IP в поле «Адрес DNS».");
             result.Add(new(uri.DnsSafeHost, address));
         }
         return result;

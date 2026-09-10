@@ -19,9 +19,11 @@ public static class JumphostStartupPlan
 
         // KiTTY login scripts only see terminal output after SSH authentication.
         // Authentication secrets must therefore use KiTTY's native switches.
-        if (server.PrivateKeyPath.Length > 0 && server.PrivateKeyPassphrase.Length > 0)
-            return ["-pw", server.PrivateKeyPassphrase];
-        return server.Password.Length > 0 ? ["-pass", server.Password] : [];
+        var arguments = new List<string>();
+        if (server.PrivateKeyPassphrase.Length > 0)
+            arguments.AddRange(["-pw", server.PrivateKeyPassphrase]);
+        if (server.Password.Length > 0) arguments.AddRange(["-pass", server.Password]);
+        return arguments;
     }
 
     public static IReadOnlyList<JumphostPromptResponse> Build(

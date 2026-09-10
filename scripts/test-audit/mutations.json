@@ -1,0 +1,303 @@
+[
+  {
+    "id": "file-tail",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "if (leftCount == 0) return true;",
+    "after": "if (leftCount >= 0) return true;",
+    "tests": "BatchFileComparisonWithFragmentedReads"
+  },
+  {
+    "id": "file-short-read",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "total += count;",
+    "after": "total += count; break;",
+    "tests": "BatchFileComparisonWithFragmentedReads"
+  },
+  {
+    "id": "file-length",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "if (leftCount != rightCount) return false;",
+    "after": "if (leftCount != rightCount) return true;",
+    "tests": "BatchFileComparisonWithFragmentedReads"
+  },
+  {
+    "id": "zip-traversal",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase))",
+    "after": "if (false)",
+    "tests": "BatchPackageRejectsTraversal"
+  },
+  {
+    "id": "interactive-become",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "step.Kind is not BatchTaskStepKind.InteractiveSend &&",
+    "after": "true &&",
+    "tests": "BatchInteractiveIgnoresGlobalBecome"
+  },
+  {
+    "id": "step-subset",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "step.ServerIds.Count == 0 || step.ServerIds.Contains(serverId)",
+    "after": "step.ServerIds.Count == 0",
+    "tests": "BatchStepServerSubsetAndDirectory"
+  },
+  {
+    "id": "step-copy-alias",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "ServerIds = item.ServerIds.ToList(), WorkingDirectory = item.WorkingDirectory",
+    "after": "ServerIds = item.ServerIds, WorkingDirectory = item.WorkingDirectory",
+    "tests": "BatchStepDuplicate"
+  },
+  {
+    "id": "cwd-override",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "? task.WorkingDirectory : step.WorkingDirectory.Trim()",
+    "after": "? task.WorkingDirectory : task.WorkingDirectory",
+    "tests": "BatchStepServerSubsetAndDirectory"
+  },
+  {
+    "id": "local-tunnel-selection",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "if (selectedServerIds.Count(id => AppliesTo(tunnel, id)) != 1)",
+    "after": "if (false)",
+    "tests": "BatchLocalTunnelSingleServer"
+  },
+  {
+    "id": "template-user",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": ".Replace(\"{{server.username}}\", server.EffectiveUsername, StringComparison.Ordinal)",
+    "after": ".Replace(\"{{server.username}}\", \"\", StringComparison.Ordinal)",
+    "tests": "BatchTaskTemplateRendering"
+  },
+  {
+    "id": "shift-last-row",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "for (var i = start; i <= end; i++)",
+    "after": "for (var i = start; i < end; i++)",
+    "tests": "BatchStepShiftAndMultiSelectionPolicy"
+  },
+  {
+    "id": "log-errors",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "result = result.Where(x => x.Level is BatchLogLevel.Warning or BatchLogLevel.Error);",
+    "after": "result = result.Where(x => x.Level is BatchLogLevel.Warning);",
+    "tests": "BatchAndAnsibleLogFilteringAndFormatting"
+  },
+  {
+    "id": "migration-reset",
+    "file": "src/KiTTYManager.Core/ProductInfo.cs",
+    "before": "endpoint.InternalOnly = false;",
+    "after": "endpoint.InternalOnly = true;",
+    "tests": "Schema9MigrationPreservesUserData"
+  },
+  {
+    "id": "migration-repeat",
+    "file": "src/KiTTYManager.Core/ProductInfo.cs",
+    "before": "if (config.SchemaVersion >= 9) return false;",
+    "after": "if (config.SchemaVersion > 9) return false;",
+    "tests": "Schema9MigrationPreservesUserData"
+  },
+  {
+    "id": "internal-first-hop",
+    "file": "src/KiTTYManager.Core/ServerEndpointPolicy.cs",
+    "before": "if (backup.InternalOnly && context?.PreviousServerId is null) continue;",
+    "after": "if (false) continue;",
+    "tests": "Internal"
+  },
+  {
+    "id": "handoff",
+    "file": "src/KiTTYManager.App/WebSessionCleanupPolicy.cs",
+    "before": "!handedOffToCleanup && (profileAttached || preparationSucceeded)",
+    "after": "(profileAttached || preparationSucceeded)",
+    "tests": "WebSessionCleanupPolicyGuardsHandedOffProfile"
+  },
+  {
+    "id": "asymmetric-preserve",
+    "file": "src/KiTTYManager.Core/ServerLinkPairPolicy.cs",
+    "before": "if (wasAsymmetric)",
+    "after": "if (false)",
+    "tests": "AsymmetricAdaptiveLinkDiscoveryPreservesKnownOneWay"
+  },
+  {
+    "id": "import-backup",
+    "file": "src/KiTTYManager.Core/ImportWizardTransaction.cs",
+    "before": "if (File.Exists(fullPath)) File.Copy(fullPath, backupPath, overwrite: false);",
+    "after": "if (false) File.Copy(fullPath, backupPath, overwrite: false);",
+    "tests": "SmartImportBackupRollback"
+  },
+  {
+    "id": "import-rollback",
+    "file": "src/KiTTYManager.Core/ImportWizardTransaction.cs",
+    "before": "File.Copy(backupPath, Path.GetFullPath(configPath), overwrite: true);",
+    "after": "File.Copy(configPath, Path.GetFullPath(configPath) + \".wrong\", overwrite: true);",
+    "tests": "SmartImportBackupRollback"
+  },
+  {
+    "id": "winscp-port",
+    "file": "src/KiTTYManager.Core/WinScpLaunchPlan.cs",
+    "before": "127.0.0.1:{localPort}/",
+    "after": "127.0.0.1:22/",
+    "tests": "WinScpRouteArguments"
+  },
+  {
+    "id": "ansible-callback-null",
+    "file": "src/KiTTYManager.Core/AnsibleVm.cs",
+    "before": "Message = item.Message ?? \"\",",
+    "after": "Message = item.Message!,",
+    "tests": "AnsibleVmEventMissingFields"
+  },
+  {
+    "id": "config-plaintext",
+    "file": "src/KiTTYManager.Core/ConfigStore.cs",
+    "before": "ConfigSecrets.Protect(portable, SecretProtector);",
+    "after": "// mutation: omitted encryption",
+    "tests": "JsonRoundTrip,PlaintextConfigMigration"
+  },
+  {
+    "id": "secret-leak",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "text = text.Replace(secret, \"***\", StringComparison.Ordinal);",
+    "after": "text = text.Replace(secret, secret, StringComparison.Ordinal);",
+    "tests": "BatchTaskConfigSecretRedaction"
+  },
+  {
+    "id": "totp-counter",
+    "file": "src/KiTTYManager.Core/TotpGenerator.cs",
+    "before": "time.ToUnixTimeSeconds() / periodSeconds",
+    "after": "time.ToUnixTimeSeconds() / periodSeconds + 1",
+    "tests": "TotpRfcVectors"
+  },
+  {
+    "id": "route-longer",
+    "file": "src/KiTTYManager.Core/RoutePreferencePolicy.cs",
+    "before": "existing is null || newServerIds.Count < existing.ServerIds.Count",
+    "after": "existing is null || newServerIds.Count > existing.ServerIds.Count",
+    "tests": "Shorter,Preferred"
+  },
+  {
+    "id": "ansible-route-port",
+    "file": "src/KiTTYManager.Core/AnsibleRuntime.cs",
+    "before": ".Append(\"          ansible_port: \").Append(row.LocalPort)",
+    "after": ".Append(\"          ansible_port: \").Append(22)",
+    "tests": "AnsibleInventoryIsSafe"
+  },
+  {
+    "id": "ansible-delete-existing",
+    "file": "src/KiTTYManager.Core/AnsibleRuntime.cs",
+    "before": "if (!workspace.CreatedForRun) throw new InvalidOperationException",
+    "after": "if (false) throw new InvalidOperationException",
+    "tests": "AnsibleTaskDeletionGuard"
+  },
+  {
+    "id": "ansible-upload-omitted",
+    "file": "src/KiTTYManager.Core/AnsibleVm.cs",
+    "before": "await AddFileAsync(archive, source, \".kitty-uploads/\" + name, token);",
+    "after": "// mutation: omit supplied file",
+    "tests": "AnsibleArchiveStreamsAbsoluteFilesWithoutPersistentCopy"
+  },
+  {
+    "id": "firefox-source-db",
+    "file": "src/KiTTYManager.Core/FirefoxProfileWorkspace.cs",
+    "before": "foreach (var name in new[] { \"key4.db\", \"cert9.db\" })",
+    "after": "foreach (var name in new[] { \"key4.db\" })",
+    "tests": "FirefoxRejectsIncompleteSource"
+  },
+  {
+    "id": "firefox-lock-handoff",
+    "file": "src/KiTTYManager.App/WebSessionCleanupPolicy.cs",
+    "before": "!handedOffToCleanup && (profileAttached || preparationSucceeded)",
+    "after": "!handedOffToCleanup && profileAttached",
+    "tests": "WebSessionCleanupPolicyGuardsHandedOffProfile"
+  },
+  {
+    "id": "runner-validation",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "BatchTunnelPolicy.ValidateRunSelection(task, ids);",
+    "after": "// mutation: skip runner validation",
+    "tests": "BatchRunnerRejectsSelectionBeforeConnecting"
+  },
+  {
+    "id": "runner-step-selection",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "if (unknownStepServers.Length > 0)",
+    "after": "if (false)",
+    "tests": "BatchRunnerRejectsSelectionBeforeConnecting"
+  },
+  {
+    "id": "cache-ttl",
+    "file": "src/KiTTYManager.Core/RouteFailureCache.cs",
+    "before": "now - failedAt < FailureTtl",
+    "after": "now - failedAt <= FailureTtl",
+    "tests": "FailureCacheBlocksDirectRetries"
+  },
+  {
+    "id": "cache-clear-routes",
+    "file": "src/KiTTYManager.Core/SshConnectionService.cs",
+    "before": "        failureCache.Clear();",
+    "after": "        // mutation: route cache not cleared",
+    "tests": "ClearFailureCacheResetsAll"
+  },
+  {
+    "id": "cache-clear-endpoints",
+    "file": "src/KiTTYManager.Core/SshConnectionService.cs",
+    "before": "        endpointFailureCache.Clear();",
+    "after": "        // mutation: endpoint cache not cleared",
+    "tests": "ClearFailureCacheResetsAll"
+  },
+  {
+    "id": "release-delete-quoting",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "\"rm -rf -- \" + ShellPathPattern(step.Destination)",
+    "after": "\"rm -rf -- \" + step.Destination",
+    "tests": "PreReleaseShellPaths"
+  },
+  {
+    "id": "release-file-cwd",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "result.Destination = ResolveRemoteDownloadPath(step.Destination, workingDirectory);",
+    "after": "result.Destination = step.Destination;",
+    "tests": "PreReleaseFileContextAndRunAs"
+  },
+  {
+    "id": "release-pty-repeat",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "catch (PtyUnavailableException ex) { unavailable(ex); return null; }",
+    "after": "catch (Exception ex) { unavailable(ex); return null; }",
+    "tests": "PreReleasePtyDispatchBoundary"
+  },
+  {
+    "id": "release-import-reference",
+    "file": "src/KiTTYManager.Core/ImportWizardEngine.cs",
+    "before": "bool Imported(string field) => importedServerIds.Contains(server.Id) ||",
+    "after": "bool Imported(string field) => true || importedServerIds.Contains(server.Id) ||",
+    "tests": "PreReleasePartialImportPreservesReferences"
+  },
+  {
+    "id": "release-console-reuse",
+    "file": "src/KiTTYManager.Core/SshConnectionService.cs",
+    "before": "if (recreate is null) return ingressPort;",
+    "after": "if (true) return ingressPort;",
+    "tests": "PreReleaseConsoleIngressLifecycle"
+  },
+  {
+    "id": "release-archive-atomic",
+    "file": "src/KiTTYManager.Core/BatchTasks.cs",
+    "before": "            write(temporary);",
+    "after": "            File.Delete(packagePath); write(temporary);",
+    "tests": "PreReleaseAtomicPackageReplacement"
+  },
+  {
+    "id": "release-http-port",
+    "file": "src/KiTTYManager.Core/ResolvingHttpProxy.cs",
+    "before": "port = authority.Contains(':') ? uri.Port : defaultPort;",
+    "after": "port = uri.IsDefaultPort ? defaultPort : uri.Port;",
+    "tests": "PreReleaseConnectAuthority"
+  },
+  {
+    "id": "release-relay-close",
+    "file": "src/KiTTYManager.Core/ResolvingSocks5Relay.cs",
+    "before": "destinationSocket.Dispose(); // Unblock",
+    "after": "// destinationSocket.Dispose(); // Unblock",
+    "tests": "PreReleaseRelayFailureUnblocksPeer"
+  }
+]

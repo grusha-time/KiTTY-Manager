@@ -53,6 +53,8 @@ internal sealed class JumphostProcessRegistry
         }
         catch (ArgumentException) { return false; }
         catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+        catch (NotSupportedException) { return false; }
     }
 
     public bool Restore(JumphostConsoleRecord record)
@@ -108,6 +110,24 @@ internal sealed class JumphostProcessRegistry
 
     public bool TryGetAliveManaged(BaseProxy proxy, out ManagedJumphostProcess identity) =>
         TryGetAlive(proxy, JumphostConsoleKind.Entry, out identity);
+
+    public bool TryStopAliveManaged(BaseProxy proxy)
+    {
+        if (!TryGetAliveManaged(proxy, out var identity)) return false;
+        try
+        {
+            using var process = Process.GetProcessById(identity.ProcessId);
+            if (process.StartTime.ToUniversalTime() != identity.ProcessStartTimeUtc) return false;
+            process.Kill(true);
+            process.WaitForExit(5000);
+            managed.TryRemove(new Key(proxy.Id, JumphostConsoleKind.Entry), out _);
+            return true;
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+        catch (NotSupportedException) { return false; }
+    }
 
     public bool TryGetAlive(BaseProxy proxy, JumphostConsoleKind kind, out ManagedJumphostProcess identity)
     {

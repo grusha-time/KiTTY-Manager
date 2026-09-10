@@ -1,0 +1,5 @@
+host={{ inventory_hostname }}
+session={{ kitty_server_display | default(inventory_hostname) }}
+group={{ kitty_group_display | default('external inventory') }}
+distribution={{ ansible_distribution }}
+values={{ sample_items | map(attribute='value') | sum }}

@@ -32,4 +32,17 @@ public static class ManagerPathResolver
                 $"{description} не найден. Проверьте путь: {resolved}", resolved);
         return resolved;
     }
+
+    public static string? ResolveOptionalExistingFile(string? path, string description)
+    {
+        try { return ResolveOptionalFile(path, description); }
+        catch (FileNotFoundException) { return null; }
+    }
+
+    public static string? MissingConfiguredFileMessage(string? path, string description)
+    {
+        if (string.IsNullOrWhiteSpace(path) || ResolveOptionalExistingFile(path, description) is not null)
+            return null;
+        return $"{description} не найден. Проверьте путь:\n{Resolve(path)}";
+    }
 }

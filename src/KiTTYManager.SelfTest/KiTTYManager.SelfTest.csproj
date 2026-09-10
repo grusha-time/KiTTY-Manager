@@ -9,5 +9,7 @@
     <ProjectReference Include="..\KiTTYManager.Core\KiTTYManager.Core.csproj" />
     <Compile Include="..\KiTTYManager.App\JumphostProcessIdentity.cs" Link="JumphostProcessIdentity.cs" />
     <Compile Include="..\KiTTYManager.App\AccessScriptRunnerPlan.cs" Link="AccessScriptRunnerPlan.cs" />
+    <Compile Include="..\KiTTYManager.App\WebSessionCleanupPolicy.cs" Link="WebSessionCleanupPolicy.cs" />
+    <Compile Include="..\KiTTYManager.App\HelpContent.cs" Link="HelpContent.cs" />
   </ItemGroup>
 </Project>

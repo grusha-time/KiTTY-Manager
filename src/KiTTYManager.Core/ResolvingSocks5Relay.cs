@@ -114,8 +114,10 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
         }
         var destination = await ReadAddressAsync(browserStream, header[3], cancellationToken).ConfigureAwait(false);
         var portBytes = await ReadExactAsync(browserStream, 2, cancellationToken).ConfigureAwait(false);
-        if (destination.Domain is not null &&
-            mappings.TryGetValue(NormalizeDomain(destination.Domain), out var mapped))
+        var mappingKey = destination.Domain is not null
+            ? NormalizeDomain(destination.Domain)
+            : destination.Literal?.ToString();
+        if (mappingKey is not null && mappings.TryGetValue(mappingKey, out var mapped))
             destination = Address.From(mapped);
 
         using var upstream = new TcpClient();
@@ -199,7 +201,7 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
     private static Task WriteFailureAsync(Stream stream, byte reply, CancellationToken token) =>
         stream.WriteAsync(new byte[] { 0x05, reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0 }, token).AsTask();
 
-    private static async Task CopyAndHalfCloseAsync(
+    internal static async Task CopyAndHalfCloseAsync(
         Stream source, Stream destination, Socket destinationSocket, CancellationToken token)
     {
         try
@@ -209,7 +211,11 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
             catch (SocketException) { }
             catch (ObjectDisposedException) { }
         }
-        catch (IOException) when (!token.IsCancellationRequested) { }
+        catch (IOException) when (!token.IsCancellationRequested)
+        {
+            destinationSocket.Dispose(); // Unblock the other direction after an error, not after normal EOF.
+            throw;
+        }
         catch (ObjectDisposedException) when (token.IsCancellationRequested) { }
     }
 
@@ -228,12 +234,12 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
         cancellation.Dispose();
     }
 
-    private sealed record Address(byte Type, byte[] Bytes, string? Domain)
+    private sealed record Address(byte Type, byte[] Bytes, string? Domain, IPAddress? Literal = null)
     {
         public static Address From(IPAddress address) => address.AddressFamily switch
         {
-            AddressFamily.InterNetwork => new(0x01, address.GetAddressBytes(), null),
-            AddressFamily.InterNetworkV6 => new(0x04, address.GetAddressBytes(), null),
+            AddressFamily.InterNetwork => new(0x01, address.GetAddressBytes(), null, address),
+            AddressFamily.InterNetworkV6 => new(0x04, address.GetAddressBytes(), null, address),
             _ => throw new ArgumentException("Неподдерживаемое семейство IP-адреса.", nameof(address))
         };
     }
