@@ -38,12 +38,3 @@ Data/
 # OS files
 Thumbs.db
 .DS_Store
-
-# Local planning and session history (keep outside the published tree)
-/FIREFOX-ROLLBACK-PLAN.md
-/HISTORY-v2.0-SESSIONS.MD
-/PLAN.MD
-/PLAN 2.MD
-/PRE_RELEASE_BUGS_REPORT.md
-/RELEASE_NOTES_GITHUB.md
-/RELEASE-2.0.MD
