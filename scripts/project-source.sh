@@ -53,7 +53,7 @@ case "${1:-}" in
       --exclude='downloads' \
       --exclude='Data' \
       --exclude='TestResults' \
-      -czf "$archive" src packaging scripts wiki README.md install-instruction.md \
+      -czf "$archive" src packaging scripts wiki README.md \
         .gitignore examples vendor/KITTY-LICENCE.TXT
     ls -lh -- "$archive"
     ;;
