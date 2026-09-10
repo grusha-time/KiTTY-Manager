@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:KiTTYManager.App"
         Style="{StaticResource {x:Type Window}}"
-        Title="KiTTY Manager" Height="820" Width="1420" MinHeight="650" MinWidth="1050" WindowState="Maximized"
+        Title="KiTTY Manager — Firefox Containers TEST" Height="820" Width="1420" MinHeight="650" MinWidth="1050" WindowState="Maximized"
         Icon="Assets/kitty-manager.ico" Closing="Window_Closing"
         Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}"
         FontFamily="Segoe UI" FontSize="14">
@@ -14,7 +14,7 @@
       <Grid>
         <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment="Center">
-          <TextBlock Text="KiTTY Manager" Foreground="White" FontSize="22" FontWeight="SemiBold"/>
+          <TextBlock Text="KiTTY Manager — TEST" Foreground="White" FontSize="22" FontWeight="SemiBold"/>
           <TextBlock Text="Сессии, маршруты и веб-интерфейсы" Foreground="#858585" FontSize="12"/>
         </StackPanel>
         <WrapPanel Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">

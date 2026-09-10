@@ -15,6 +15,7 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
 {
     private readonly string upstreamHost;
     private readonly int upstreamPort;
+    private readonly bool resolveUnmappedLocally;
     private readonly IReadOnlyDictionary<string, IPAddress> mappings;
     private readonly TcpListener listener = new(IPAddress.Loopback, 0);
     private readonly CancellationTokenSource cancellation = new();
@@ -25,7 +26,7 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
     public int Port { get; }
 
     public ResolvingSocks5Relay(string upstreamHost, int upstreamPort,
-        IEnumerable<KeyValuePair<string, string>> mappings)
+        IEnumerable<KeyValuePair<string, string>> mappings, bool resolveUnmappedLocally = false)
     {
         if (string.IsNullOrWhiteSpace(upstreamHost))
             throw new ArgumentException("Не указан upstream SOCKS5.", nameof(upstreamHost));
@@ -33,6 +34,7 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(upstreamPort));
         this.upstreamHost = upstreamHost;
         this.upstreamPort = upstreamPort;
+        this.resolveUnmappedLocally = resolveUnmappedLocally;
         this.mappings = BuildMappings(mappings);
         listener.Start();
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -119,6 +121,15 @@ public sealed class ResolvingSocks5Relay : IDisposable, IAsyncDisposable
             : destination.Literal?.ToString();
         if (mappingKey is not null && mappings.TryGetValue(mappingKey, out var mapped))
             destination = Address.From(mapped);
+        else if (resolveUnmappedLocally && destination.Domain is not null)
+        {
+            // Container proxyDNS sends names here, so explicit per-route mappings
+            // run before system DNS. Preserve the old browser's local DNS behaviour.
+            var addresses = await Dns.GetHostAddressesAsync(destination.Domain, cancellationToken).ConfigureAwait(false);
+            var address = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
+                ?? addresses.FirstOrDefault() ?? throw new IOException("DNS не вернул адрес.");
+            destination = Address.From(address);
+        }
 
         using var upstream = new TcpClient();
         clients.TryAdd(upstream, 0);
