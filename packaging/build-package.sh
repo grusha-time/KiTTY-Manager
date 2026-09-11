@@ -12,11 +12,9 @@ python3 "$ROOT/packaging/verify-ansible-runtime.py" "$ANSIBLE_RUNTIME"
 
 BRANCH_RAW="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'release')"
 BRANCH_SAFE="$(echo "$BRANCH_RAW" | tr '/' '-')"
-ISSUE_DIR="$ROOT/dist/$BRANCH_SAFE"
 
-mkdir -p "$ROOT/build/package/KiTTY" "$ROOT/build/package/Runtime" "$ISSUE_DIR"
-rm -rf "$ROOT/build/package" "$ROOT/build/app"
-mkdir -p "$ROOT/build/package/KiTTY" "$ROOT/build/package/Runtime"
+rm -rf "$ROOT/build/package" "$ROOT/build/app" "$ROOT/dist"
+mkdir -p "$ROOT/build/package/KiTTY" "$ROOT/build/package/Runtime" "$ROOT/dist"
 
 "$DOTNET" publish "$ROOT/src/KiTTYManager.App/KiTTYManager.App.csproj" -c Release -r win-x64 --self-contained true \
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "$ROOT/build/app"
@@ -38,7 +36,7 @@ if [[ "$ZIP_NAME" != *.zip ]]; then
   ZIP_NAME="${ZIP_NAME}.zip"
 fi
 
-ZIP_PATH="$ISSUE_DIR/$ZIP_NAME"
+ZIP_PATH="$ROOT/dist/$ZIP_NAME"
 echo "==> Creating package archive: $ZIP_PATH"
 jar --create --no-manifest --file "$ZIP_PATH" -C "$ROOT/build/package" .
 echo "==> Built: $ZIP_PATH"
