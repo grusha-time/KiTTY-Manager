@@ -98,6 +98,37 @@ internal static class FirefoxContainerSmoke
                     throw new Exception("Cookie isolation failed: " + string.Join(" / ", results));
                 if (pass == 1 && (!results[0].Contains("before=flavor=A") || !results[1].Contains("before=flavor=B")))
                     throw new Exception("Cookies were not preserved across Firefox restart");
+                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("KITTY_SMOKE_XDOTOOL")))
+                {
+                    var windowId = (await XdoAsync("search", "--onlyvisible", "--class", "firefox")).Split('\n', StringSplitOptions.RemoveEmptyEntries)[0];
+                    foreach (var panel in new[] {a, b})
+                    {
+                        var ui = await browser.ChromeForSmokeAsync($$"""
+                            const win = Services.wm.getMostRecentWindow("navigator:browser").wrappedJSObject;
+                            const index = [...win.gBrowser.tabs].findIndex(t => t.label === "{{panel.Flavor}}");
+                            const button = [...win.document.querySelectorAll("#tabs-newtab-button, #new-tab-button")]
+                              .find(b => b.getBoundingClientRect().width > 0);
+                            const r = button.getBoundingClientRect();
+                            return {index, x:Math.round(win.mozInnerScreenX+r.x+r.width/2), y:Math.round(win.mozInnerScreenY+r.y+r.height/2)};
+                            """);
+                        var index = ui.GetProperty("index").GetInt32();
+                        if (index < 0) throw new Exception("Panel tab not found");
+                        await XdoAsync("windowfocus", "--sync", windowId);
+                        await XdoAsync("key", "--clearmodifiers", "ctrl+" + (index + 1));
+                        await Task.Delay(300);
+                        if (panel == a)
+                            await XdoAsync("mousemove", "--sync", ui.GetProperty("x").ToString(), ui.GetProperty("y").ToString(), "click", "1");
+                        else await XdoAsync("key", "--clearmodifiers", "ctrl+t");
+                        await Task.Delay(500);
+                        await XdoAsync("key", "--clearmodifiers", "ctrl+l");
+                        await XdoAsync("type", "--clearmodifiers", "--delay", "1", "http://same.test/inherited");
+                        await XdoAsync("key", "--clearmodifiers", "Return");
+                        await panel.Inherited.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    }
+                    if (await browser.TabCountForSmokeAsync() != 4)
+                        throw new Exception("New-tab replacement left duplicate tabs");
+                    Console.WriteLine("PASS: mouse new-tab button inherits A, Ctrl+T inherits B; requests reached their respective SOCKS servers.");
+                }
                 // A live page keeps fetching. After route removal it must stop
                 // reaching this proxy, even though its tab is still open.
                 await Task.Delay(1200);
@@ -115,6 +146,7 @@ internal static class FirefoxContainerSmoke
             {
                 failed = true;
                 Console.Error.WriteLine("SMOKE FAILURE: " + ex);
+                try { await browser.SaveScreenshotForSmokeAsync(Path.Combine(root, "failure.png")); } catch { }
                 throw;
             }
             finally
@@ -126,6 +158,20 @@ internal static class FirefoxContainerSmoke
         }
         Console.WriteLine("PASS: cookies and container identities survived Firefox restart; original profile not re-read.");
         return 0;
+    }
+
+    private static async Task<string> XdoAsync(params string[] args)
+    {
+        var start = new System.Diagnostics.ProcessStartInfo(Environment.GetEnvironmentVariable("KITTY_SMOKE_XDOTOOL")!)
+            {UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true};
+        foreach (var arg in args) start.ArgumentList.Add(arg);
+        using var process = System.Diagnostics.Process.Start(start)!;
+        var output = process.StandardOutput.ReadToEndAsync();
+        var error = process.StandardError.ReadToEndAsync();
+        try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(15)); }
+        catch { process.Kill(true); throw; }
+        if (process.ExitCode != 0) throw new Exception("xdotool: " + await error);
+        return await output;
     }
 
     private sealed class DirectTrap : IDisposable
@@ -160,11 +206,13 @@ internal static class FirefoxContainerSmoke
         private readonly TcpListener listener = new(IPAddress.Loopback, 0);
         private readonly CancellationTokenSource stop = new();
         private readonly string flavor;
+        public string Flavor => flavor;
         private readonly int directPort;
         private int requestCount;
         public int RequestCount => Volatile.Read(ref requestCount);
         public int Port { get; }
         public TaskCompletionSource<string> Seen { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Inherited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public FakePanel(string flavor, int directPort)
         {
             this.directPort = directPort;
@@ -202,6 +250,7 @@ internal static class FirefoxContainerSmoke
                 await stream.WriteAsync(new byte[] {5, 0, 0, 1, 127, 0, 0, 1, 0, 80}, stop.Token);
                 using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
                 var request = await reader.ReadLineAsync(stop.Token) ?? "";
+                if (request.StartsWith("GET /inherited ", StringComparison.Ordinal)) Inherited.TrySetResult(true);
                 Interlocked.Increment(ref requestCount);
                 while (!string.IsNullOrEmpty(await reader.ReadLineAsync(stop.Token))) { }
                 if (request.StartsWith("GET /seen?", StringComparison.Ordinal)) Seen.TrySetResult(Uri.UnescapeDataString(request));

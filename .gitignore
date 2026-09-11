@@ -38,3 +38,6 @@ Data/
 # OS files
 Thumbs.db
 .DS_Store
+
+# Agent state
+.agent-state/

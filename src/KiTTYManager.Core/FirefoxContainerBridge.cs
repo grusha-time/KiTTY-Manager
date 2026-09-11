@@ -13,6 +13,7 @@ public sealed class FirefoxContainerBridge : IDisposable
     private readonly TcpListener listener = new(IPAddress.Loopback, 0);
     private readonly TcpListener blockedListener = new(IPAddress.Loopback, 0);
     private readonly CancellationTokenSource stop = new();
+    private readonly object stateGate = new();
     private readonly ConcurrentDictionary<string, Route> routes = new();
     private readonly ConcurrentDictionary<string, Pending> commands = new();
     private readonly ConcurrentDictionary<TcpClient, byte> clients = new();
@@ -43,11 +44,14 @@ public sealed class FirefoxContainerBridge : IDisposable
     {
         if (port is < 1 or > 65535 || !Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
             uri.Scheme is not ("http" or "https")) throw new ArgumentException("Ожидается HTTP(S) URL и порт прокси.");
-        routes.AddOrUpdate(key, new Route(key, name, port), (_, old) => old.Port == port
-            ? old : throw new InvalidOperationException("Контейнер уже связан с другим туннелем."));
         var id = Guid.NewGuid().ToString("N");
         var command = new Pending(key, url);
-        commands[id] = command;
+        lock (stateGate)
+        {
+            routes.AddOrUpdate(key, new Route(key, name, port), (_, old) => old.Port == port
+                ? old : throw new InvalidOperationException("Контейнер уже связан с другим туннелем."));
+            commands[id] = command;
+        }
         try { await command.Done.Task.WaitAsync(TimeSpan.FromSeconds(20), token); }
         catch { Remove(key); throw; }
         finally { commands.TryRemove(id, out _); }
@@ -55,10 +59,13 @@ public sealed class FirefoxContainerBridge : IDisposable
 
     public void Remove(string key)
     {
-        routes.TryRemove(key, out _);
-        foreach (var pair in commands.Where(p => p.Value.Key == key))
-            if (commands.TryRemove(pair.Key, out var command))
-                command.Done.TrySetException(new IOException("Подключение контейнера закрыто."));
+        lock (stateGate)
+        {
+            routes.TryRemove(key, out _);
+            foreach (var pair in commands.Where(p => p.Value.Key == key))
+                if (commands.TryRemove(pair.Key, out var command))
+                    command.Done.TrySetException(new IOException("Подключение контейнера закрыто."));
+        }
     }
 
     private async Task AcceptAsync(TcpListener source, bool reject)
@@ -112,32 +119,37 @@ public sealed class FirefoxContainerBridge : IDisposable
                 using var json = JsonDocument.Parse(body);
                 var active = json.RootElement.GetProperty("activeKeys").EnumerateArray()
                     .Select(v => v.GetString()!).ToHashSet();
-                // Closure detection precedes acknowledgement: the first open ack
-                // was computed from tabs BEFORE that command was executed.
-                foreach (var pair in routes)
-                    if (pair.Value.Opened && !active.Contains(pair.Key) &&
-                        !commands.Values.Any(c => c.Key == pair.Key))
-                    {
-                        if (routes.TryRemove(pair.Key, out _)) Closed?.Invoke(pair.Key);
-                    }
-                foreach (var ack in json.RootElement.GetProperty("acks").EnumerateArray())
+                string response;
+                // Publish commands and their routes as one consistent snapshot.
+                lock (stateGate)
                 {
-                    if (!commands.TryRemove(ack.GetProperty("id").GetString()!, out var pending)) continue;
-                    var error = ack.GetProperty("error");
-                    if (error.ValueKind != JsonValueKind.Null)
-                        pending.Done.TrySetException(new IOException(error.GetString()));
-                    else
+                    // Closure detection precedes acknowledgement: the first open ack
+                    // was computed from tabs BEFORE that command was executed.
+                    foreach (var pair in routes)
+                        if (pair.Value.Opened && !active.Contains(pair.Key) &&
+                            !commands.Values.Any(c => c.Key == pair.Key))
+                        {
+                            if (routes.TryRemove(pair.Key, out _)) Closed?.Invoke(pair.Key);
+                        }
+                    foreach (var ack in json.RootElement.GetProperty("acks").EnumerateArray())
                     {
-                        if (routes.TryGetValue(pending.Key, out var route)) route.Opened = true;
-                        pending.Done.TrySetResult(true);
+                        if (!commands.TryRemove(ack.GetProperty("id").GetString()!, out var pending)) continue;
+                        var error = ack.GetProperty("error");
+                        if (error.ValueKind != JsonValueKind.Null)
+                            pending.Done.TrySetException(new IOException(error.GetString()));
+                        else
+                        {
+                            if (routes.TryGetValue(pending.Key, out var route)) route.Opened = true;
+                            pending.Done.TrySetResult(true);
+                        }
                     }
+                    Interlocked.Exchange(ref lastPollTicks, DateTime.UtcNow.Ticks);
+                    response = JsonSerializer.Serialize(new
+                    {
+                        routes = routes.Values.Select(r => new {key = r.Key, name = r.Name, port = r.Port}),
+                        commands = commands.Select(p => new {id = p.Key, key = p.Value.Key, url = p.Value.Url})
+                    });
                 }
-                Interlocked.Exchange(ref lastPollTicks, DateTime.UtcNow.Ticks);
-                var response = JsonSerializer.Serialize(new
-                {
-                    routes = routes.Values.Select(r => new {key = r.Key, name = r.Name, port = r.Port}),
-                    commands = commands.Select(p => new {id = p.Key, key = p.Value.Key, url = p.Value.Url})
-                });
                 await RespondAsync(stream, "200 OK", response, deadline.Token);
             }
             catch (Exception ex) when (ex is IOException or OperationCanceledException or JsonException or

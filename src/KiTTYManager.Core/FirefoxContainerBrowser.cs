@@ -50,11 +50,22 @@ public sealed class FirefoxContainerBrowser : IDisposable
         var port = ((IPEndPoint)portReservation.LocalEndpoint).Port;
         portReservation.Stop();
         FirefoxProfileWorkspace.ConfigureContainers(profile, Bridge.BlockedPort, port, new Uri(Bridge.Url).Port);
+        if (headless) File.AppendAllText(Path.Combine(profile, "user.js"),
+            "\nuser_pref(\"toolkit.cosmeticAnimations.enabled\", false);\n" +
+            "user_pref(\"focusmanager.testmode\", true);\n" +
+            "user_pref(\"termsofuse.bypassNotification\", true);\n" +
+            "user_pref(\"browser.aboutwelcome.enabled\", false);\n");
         var addonPath = Path.Combine(root, "containers-test.xpi");
         WriteAddon(addonPath);
         var start = new ProcessStartInfo(executable) { UseShellExecute = false };
         foreach (var arg in new[] { "-wait-for-browser", "-no-remote", "-new-instance", "-profile", profile, "-marionette" }) start.ArgumentList.Add(arg);
-        if (headless) start.ArgumentList.Add("-headless");
+        if (headless)
+        {
+            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY")))
+                start.ArgumentList.Add("-headless");
+            // Only the artificial smoke profile needs native UI commands.
+            start.ArgumentList.Add("--remote-allow-system-access");
+        }
         start.ArgumentList.Add(startupUrl);
         browser?.Dispose();
         browser = Process.Start(start) ?? throw new IOException("Firefox не запущен.");
@@ -125,7 +136,26 @@ public sealed class FirefoxContainerBrowser : IDisposable
         var stream = smokeClient!.GetStream();
         var response = await CommandAsync(stream, 4, "WebDriver:GetWindowHandles", new { }, deadline.Token);
         var handles = response.ValueKind == JsonValueKind.Array ? response : response.GetProperty("value");
+        await CommandAsync(stream, 5, "WebDriver:SwitchToWindow",
+            new {handle = handles[0].GetString(), focus = false}, deadline.Token);
         return handles.GetArrayLength();
+    }
+
+    internal async Task<JsonElement> ChromeForSmokeAsync(string script)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var stream = smokeClient!.GetStream();
+        await CommandAsync(stream, 7, "Marionette:SetContext", new {value = "chrome"}, deadline.Token);
+        var result = await CommandAsync(stream, 8, "WebDriver:ExecuteScript",
+            new {script, args = Array.Empty<object>(), sandbox = "system", newSandbox = true}, deadline.Token);
+        return result.GetProperty("value").Clone();
+    }
+
+    internal async Task SaveScreenshotForSmokeAsync(string path)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var value = await CommandAsync(smokeClient!.GetStream(), 9, "WebDriver:TakeScreenshot", new {full = true}, timeout.Token);
+        await File.WriteAllBytesAsync(path, Convert.FromBase64String(value.GetProperty("value").GetString()!));
     }
 
     private static async Task<JsonElement> CommandAsync(Stream stream, int id, string command, object parameters, CancellationToken token)
