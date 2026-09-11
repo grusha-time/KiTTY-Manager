@@ -22,12 +22,14 @@ else
   MAIN_REPO="$(cd "$MAIN_REPO/.." && pwd)"
 fi
 
-TARGET_DIR="$(cd "$MAIN_REPO/.." && pwd)/test4-$BRANCH"
+TARGET_DIR="$(cd "$MAIN_REPO/.." && pwd)/test4-worktree/$BRANCH"
 
 if [ -d "$TARGET_DIR" ]; then
   echo "Error: Directory $TARGET_DIR already exists."
   exit 1
 fi
+
+mkdir -p "$(dirname "$TARGET_DIR")"
 
 echo "==> Creating worktree at: $TARGET_DIR (branch: $BRANCH from $BASE)"
 if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
@@ -41,18 +43,18 @@ mkdir -p "$TARGET_DIR/vendor"
 
 for item in .dotnet .dotnet_home .dotnet-home .nuget .tools downloads; do
   if [ -e "$MAIN_REPO/$item" ]; then
-    ln -s "$MAIN_REPO/$item" "$TARGET_DIR/$item"
+    ln -sf "$MAIN_REPO/$item" "$TARGET_DIR/$item"
     echo "  Linked: $item"
   fi
 done
 
 if [ -e "$MAIN_REPO/vendor/ansible-runtime" ]; then
-  ln -s "$MAIN_REPO/vendor/ansible-runtime" "$TARGET_DIR/vendor/ansible-runtime"
+  ln -sf "$MAIN_REPO/vendor/ansible-runtime" "$TARGET_DIR/vendor/ansible-runtime"
   echo "  Linked: vendor/ansible-runtime"
 fi
 
 if [ -e "$MAIN_REPO/vendor/KITTY-LICENCE.TXT" ]; then
-  ln -s "$MAIN_REPO/vendor/KITTY-LICENCE.TXT" "$TARGET_DIR/vendor/KITTY-LICENCE.TXT"
+  ln -sf "$MAIN_REPO/vendor/KITTY-LICENCE.TXT" "$TARGET_DIR/vendor/KITTY-LICENCE.TXT"
   echo "  Linked: vendor/KITTY-LICENCE.TXT"
 fi
 
