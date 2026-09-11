@@ -134,6 +134,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var stream = smokeClient!.GetStream();
+        await CommandAsync(stream, 7, "Marionette:SetContext", new {value = "content"}, deadline.Token);
         var response = await CommandAsync(stream, 4, "WebDriver:GetWindowHandles", new { }, deadline.Token);
         var handles = response.ValueKind == JsonValueKind.Array ? response : response.GetProperty("value");
         await CommandAsync(stream, 5, "WebDriver:SwitchToWindow",

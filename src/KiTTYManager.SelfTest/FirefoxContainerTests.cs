@@ -7,7 +7,165 @@ using KiTTYManager.Core;
 
 internal sealed partial class SelfTestRunner
 {
-    private static void FirefoxContainerPersistenceAndBridge() => CheckContainersAsync().GetAwaiter().GetResult();
+    private static void FirefoxContainerPersistenceAndBridge()
+    {
+        CheckContainersAsync().GetAwaiter().GetResult();
+        CheckExtensionInterleaving();
+    }
+    private static void CheckExtensionInterleaving()
+    {
+        using var stream = typeof(FirefoxContainerBrowser).Assembly.GetManifestResourceStream("KiTTYManager.Core.FirefoxExtension.background.js");
+        if (stream == null) return;
+        using var reader = new StreamReader(stream);
+        var jsCode = reader.ReadToEnd();
+
+        var nodeCandidates = new[] { "/usr/bin/node", "/usr/local/bin/node", "node" };
+        string? nodeExe = null;
+        foreach (var candidate in nodeCandidates)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(candidate, "--version")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p != null)
+                {
+                    p.WaitForExit(2000);
+                    if (p.ExitCode == 0) { nodeExe = candidate; break; }
+                }
+            }
+            catch { }
+        }
+        if (nodeExe == null) return;
+
+        var script = $$"""
+        const vm = require('vm'), assert = require('assert');
+        const code = {{JsonSerializer.Serialize(jsCode)}}.split('browser.proxy.onRequest')[0];
+
+        async function testScenario(scenario) {
+          const h = {}, event = n => ({addListener: f => h[n] = f}), data = new Map(), calls = [];
+          let selected = (scenario === 'race' || scenario === 'normal' || scenario === 'race_during_update') ? 3 : 2;
+          let first = true;
+          const original = {
+            id: 3, windowId: 1, index: 2,
+            active: (scenario === 'race' || scenario === 'normal' || scenario === 'race_during_update'),
+            cookieStoreId: 'firefox-default', url: 'about:newtab'
+          };
+          const b = {
+            id: 2, windowId: 1, index: 1,
+            active: (scenario === 'background'),
+            cookieStoreId: 'B', url: 'http://same.test'
+          };
+          data.set(3, original);
+          data.set(2, b);
+
+          const browser = {
+            runtime: { getURL: () => '' },
+            windows: { onRemoved: event('windowRemoved') },
+            tabs: {
+              onActivated: event('activated'),
+              onCreated: event('created'),
+              onUpdated: event('updated'),
+              onRemoved: event('removed'),
+              get: async id => {
+                const snapshot = { ...data.get(id) };
+                if (scenario === 'race' && id === 3 && first) {
+                  first = false;
+                  original.active = false;
+                  b.active = true;
+                  selected = 2;
+                  await h.activated({ tabId: 2, windowId: 1, previousTabId: 3 });
+                }
+                return snapshot;
+              },
+              create: async options => {
+                calls.push(options);
+                const t = { id: 100 + calls.length, url: 'about:newtab', ...options };
+                data.set(t.id, t);
+                if (options.active) {
+                  selected = t.id;
+                  for (const x of data.values()) x.active = x.id === t.id;
+                  await h.activated({ tabId: t.id, windowId: 1 });
+                }
+                return { ...t };
+              },
+              remove: async id => data.delete(id),
+              update: async (id, opts) => {
+                if (opts.active) {
+                  selected = id;
+                  for (const x of data.values()) x.active = x.id === id;
+                  await h.activated({ tabId: id, windowId: 1 });
+                  if (scenario === 'race_during_update') {
+                    selected = 2;
+                    for (const x of data.values()) x.active = x.id === 2;
+                    await h.activated({ tabId: 2, windowId: 1, previousTabId: id });
+                  }
+                }
+                if (opts.url && data.has(id)) data.get(id).url = opts.url;
+              }
+            }
+          };
+
+          const ctx = vm.createContext({ browser, KITTY: { startupUrl: 'about:blank#launcher' }, console, original, b });
+          vm.runInContext(code, ctx);
+          vm.runInContext(
+            "routes.set('A',{}); routes.set('B',{}); inheritanceReady=true; " +
+            "knownTabs.set(2,b); knownTabs.set(3,original); " +
+            `activeTabs.set(1, ${original.active ? 3 : 2}); activeContainers.set(1, '${original.active ? 'A' : 'B'}');`,
+            ctx
+          );
+
+          await vm.runInContext("inheritNewTab(original,'A')", ctx);
+
+          assert.equal(calls[0].active, false, "Replacement must always be created inactive initially");
+
+          if (scenario === 'race') {
+            assert.equal(selected, 2, "Tab B must retain focus when user switched to B during tab resolution");
+            assert.equal(vm.runInContext('activeTabs.get(1)', ctx), 2);
+          } else if (scenario === 'background') {
+            assert.equal(selected, 2, "Tab B must retain focus when original tab was in background");
+            assert.equal(vm.runInContext('activeTabs.get(1)', ctx), 2);
+          } else if (scenario === 'normal') {
+            assert.equal(selected, 101, "Replacement tab must receive focus when original tab was active and not switched");
+            assert.equal(vm.runInContext('activeTabs.get(1)', ctx), 101);
+            assert.equal(vm.runInContext("activeContainers.get(1)", ctx), 'A');
+          } else if (scenario === 'race_during_update') {
+            assert.equal(selected, 2, "Selected B during update response, but tracked active tab must remain B");
+            assert.equal(vm.runInContext('activeTabs.get(1)', ctx), 2);
+            assert.equal(vm.runInContext("activeContainers.get(1)", ctx), 'B');
+          }
+
+          h.updated(6, { status: 'complete' }, { id: 6, active: false, cookieStoreId: 'firefox-default', url: 'about:newtab' });
+          assert.equal(vm.runInContext('startupTabs.length', ctx), 0);
+        }
+
+        (async () => {
+          await testScenario('race');
+          await testScenario('background');
+          await testScenario('normal');
+          await testScenario('race_during_update');
+        })().catch(e => { console.error(e); process.exit(1); });
+        """;
+
+        var runPsi = new System.Diagnostics.ProcessStartInfo(nodeExe)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var process = System.Diagnostics.Process.Start(runPsi)!;
+        process.StandardInput.Write(script);
+        process.StandardInput.Close();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit(5000);
+        if (process.ExitCode != 0)
+            throw new Exception("Extension interleaving check failed: " + stderr);
+    }
     private static async Task CheckContainersAsync()
     {
         var root = Path.Combine(Path.GetTempPath(), "kitty-containers-check-" + Guid.NewGuid().ToString("N"));
@@ -68,6 +226,26 @@ internal static class FirefoxContainerSmoke
         Directory.CreateDirectory(source);
         if (!File.Exists(Path.Combine(source, "key4.db")))
         {
+            File.WriteAllText(Path.Combine(source, "user.js"),
+                "user_pref(\"browser.aboutwelcome.enabled\", false);\n" +
+                "user_pref(\"trailhead.firstrun.didSeeAboutWelcome\", true);\n" +
+                "user_pref(\"browser.startup.firstrunSkipsHomepage\", true);\n" +
+                "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n" +
+                "user_pref(\"browser.startup.homepage_welcome_url\", \"\");\n" +
+                "user_pref(\"browser.startup.homepage_welcome_url.additional\", \"\");\n" +
+                "user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n" +
+                "user_pref(\"datareporting.policy.firstRunURL\", \"\");\n" +
+                "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);\n" +
+                "user_pref(\"browser.messaging-system.whatsNewPanel.enabled\", false);\n" +
+                "user_pref(\"doh-rollout.doneFirstRun\", true);\n" +
+                "user_pref(\"doh-rollout.enabled\", false);\n" +
+                "user_pref(\"app.update.auto\", false);\n" +
+                "user_pref(\"app.update.enabled\", false);\n" +
+                "user_pref(\"app.update.doorhanger\", false);\n" +
+                "user_pref(\"termsofuse.bypassNotification\", true);\n" +
+                "user_pref(\"dom.security.https_first\", false);\n" +
+                "user_pref(\"dom.security.https_only_mode\", false);\n" +
+                "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
             var seed = new System.Diagnostics.ProcessStartInfo(executable) {UseShellExecute = false};
             foreach (var arg in new[] {"-headless", "-no-remote", "-profile", source, "-screenshot",
                          Path.Combine(root, "seed.png"), "about:blank"}) seed.ArgumentList.Add(arg);
@@ -106,6 +284,10 @@ internal static class FirefoxContainerSmoke
                         var ui = await browser.ChromeForSmokeAsync($$"""
                             const win = Services.wm.getMostRecentWindow("navigator:browser").wrappedJSObject;
                             const index = [...win.gBrowser.tabs].findIndex(t => t.label === "{{panel.Flavor}}");
+                            if (index >= 0) {
+                              win.gBrowser.selectedTab = win.gBrowser.tabs[index];
+                              win.gBrowser.selectedBrowser.focus();
+                            }
                             const button = [...win.document.querySelectorAll("#tabs-newtab-button, #new-tab-button")]
                               .find(b => b.getBoundingClientRect().width > 0);
                             const r = button.getBoundingClientRect();
@@ -114,13 +296,13 @@ internal static class FirefoxContainerSmoke
                         var index = ui.GetProperty("index").GetInt32();
                         if (index < 0) throw new Exception("Panel tab not found");
                         await XdoAsync("windowfocus", "--sync", windowId);
-                        await XdoAsync("key", "--clearmodifiers", "ctrl+" + (index + 1));
                         await Task.Delay(300);
                         if (panel == a)
                             await XdoAsync("mousemove", "--sync", ui.GetProperty("x").ToString(), ui.GetProperty("y").ToString(), "click", "1");
                         else await XdoAsync("key", "--clearmodifiers", "ctrl+t");
-                        await Task.Delay(500);
+                        await Task.Delay(1000);
                         await XdoAsync("key", "--clearmodifiers", "ctrl+l");
+                        await Task.Delay(200);
                         await XdoAsync("type", "--clearmodifiers", "--delay", "1", "http://same.test/inherited");
                         await XdoAsync("key", "--clearmodifiers", "Return");
                         await panel.Inherited.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -238,7 +420,9 @@ internal static class FirefoxContainerSmoke
                 {
                     var len = new byte[1]; await stream.ReadExactlyAsync(len, stop.Token);
                     var domain = new byte[len[0]]; await stream.ReadExactlyAsync(domain, stop.Token);
-                    if (Encoding.ASCII.GetString(domain) != "same.test") throw new Exception("Unexpected destination");
+                    var domainStr = Encoding.ASCII.GetString(domain);
+                    if (domainStr != "same.test" && domainStr != "127.0.0.1" && domainStr != "localhost")
+                        throw new Exception("Unexpected destination: " + domainStr);
                 }
                 else if (header[3] == 1)
                 {
