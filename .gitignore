@@ -7,13 +7,19 @@ build/
 dist/
 
 # .NET SDK and NuGet packages (local install)
+.dotnet
 .dotnet/
+.dotnet_home
 .dotnet_home/
+.dotnet-home
 .dotnet-home/
+.nuget
 .nuget/
+.tools
 .tools/
 
 # Downloads
+downloads
 downloads/
 
 # Backups
@@ -30,6 +36,7 @@ __pycache__/
 vendor/KiTTY-source/
 
 # Ansible runtime (external large binary package, prepared/downloaded separately)
+vendor/ansible-runtime
 vendor/ansible-runtime/
 
 # Runtime data
