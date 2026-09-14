@@ -23,5 +23,18 @@ internal sealed partial class SelfTestRunner
         Equal(true, HelpContent.Entries.All(entry => !string.IsNullOrWhiteSpace(entry.Title) &&
             !string.IsNullOrWhiteSpace(entry.Description) && !string.IsNullOrWhiteSpace(entry.Section)));
         Equal(HelpContent.Entries.Count, HelpContent.Entries.Select(entry => (entry.Section, entry.Title)).Distinct().Count());
+
+        // Settings sections are properly structured into 4 groups
+        var extPrograms = HelpContent.Search("", "Настройки — Внешние программы");
+        Equal(true, extPrograms.Any(e => e.Title.Contains("KiTTY")));
+        var firefoxGroup = HelpContent.Search("", "Настройки — Firefox и веб-панели");
+        Equal(true, firefoxGroup.Any(e => e.Title.Contains("Firefox")));
+        Equal(true, firefoxGroup.Any(e => e.Title.Contains("веб-туннеля")));
+        var connGroup = HelpContent.Search("", "Настройки — Подключение и сеть");
+        Equal(true, connGroup.Any(e => e.Title.Contains("Таймаут")));
+        Equal(true, connGroup.Any(e => e.Title.Contains("точки входа")));
+        var appGroup = HelpContent.Search("", "Настройки — Поведение приложения и KiTTY");
+        Equal(true, appGroup.Any(e => e.Title.Contains("трей")));
+        Equal(true, appGroup.Any(e => e.Title.Contains("журнал")));
     }
 }

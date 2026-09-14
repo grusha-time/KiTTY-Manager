@@ -48,3 +48,6 @@ Thumbs.db
 
 # Agent state
 .agent-state/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
