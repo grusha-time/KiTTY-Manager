@@ -8,7 +8,7 @@ namespace KiTTYManager.App;
 public partial class MainWindow
 {
     // Separate from the old disposable runtime tree. Never cleaned up automatically.
-    private string FirefoxContainerRoot => Path.Combine(dataDirectory, "FirefoxContainersTest");
+    private string FirefoxContainerRoot => Path.Combine(dataDirectory, "FirefoxContainers");
     private FirefoxContainerBrowser? containerBrowser;
     private readonly Dictionary<string, ContainerWebSession> containerSessions = [];
     private readonly DispatcherTimer containerWatch = new() { Interval = TimeSpan.FromSeconds(2) };
@@ -19,7 +19,7 @@ public partial class MainWindow
         if (containerBrowser?.IsRunning == true)
         {
             if (!containerBrowser.Bridge.Connected)
-                throw new IOException("Расширение Firefox TEST не отвечает. Закройте его окна и повторите.");
+                throw new IOException("Расширение Firefox не отвечает. Закройте его окна и повторите.");
             return;
         }
         StopFirefoxContainers();

@@ -21,7 +21,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
     {
         if (IsRunning)
         {
-            if (!Bridge.Connected) throw new IOException("Расширение Firefox не отвечает. Закройте Firefox TEST и повторите.");
+            if (!Bridge.Connected) throw new IOException("Расширение Firefox не отвечает. Закройте Firefox и повторите.");
             return;
         }
         Directory.CreateDirectory(root);
@@ -36,7 +36,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
         if (OperatingSystem.IsWindows() && File.Exists(lockPath))
             using (new FileStream(lockPath, FileMode.Open, FileAccess.Read, FileShare.None)) { }
         if (OperatingSystem.IsWindows() && !FirefoxProfileWorkspace.CanMergeAndDelete(profile))
-            throw new IOException("Постоянный профиль занят. Закройте Firefox TEST от предыдущего запуска менеджера.");
+            throw new IOException("Постоянный профиль занят. Закройте Firefox от предыдущего запуска менеджера.");
         if (OperatingSystem.IsLinux())
         {
             // Linux smoke runs can leave the legacy 'lock' symlink after a crash.
@@ -55,7 +55,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
             "user_pref(\"focusmanager.testmode\", true);\n" +
             "user_pref(\"termsofuse.bypassNotification\", true);\n" +
             "user_pref(\"browser.aboutwelcome.enabled\", false);\n");
-        var addonPath = Path.Combine(root, "containers-test.xpi");
+        var addonPath = Path.Combine(root, "containers.xpi");
         WriteAddon(addonPath);
         var start = new ProcessStartInfo(executable) { UseShellExecute = false };
         foreach (var arg in new[] { "-wait-for-browser", "-no-remote", "-new-instance", "-profile", profile, "-marionette" }) start.ArgumentList.Add(arg);

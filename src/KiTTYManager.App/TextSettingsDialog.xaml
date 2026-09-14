@@ -15,13 +15,13 @@
         <TextBlock Text="Путь к WinSCP (необязательно)" Margin="0,18,0,7"/><TextBox x:Name="WinScpBox" ToolTip="Пустое поле — автоматический поиск WinSCP.exe"/>
         <CheckBox x:Name="AutoDiscoverFirefoxProfileBox" Margin="0,18,0,7"
                   Content="Автоматический поиск профиля Firefox" Checked="AutoDiscoverFirefoxProfile_Changed" Unchecked="AutoDiscoverFirefoxProfile_Changed"/>
-        <TextBlock Text="Исходный профиль Firefox (для первого запуска TEST)" Margin="0,8,0,7"/>
+        <TextBlock Text="Исходный профиль Firefox (для первого запуска)" Margin="0,8,0,7"/>
         <DockPanel>
           <Button x:Name="BrowseTemplateButton" DockPanel.Dock="Right" Content="Выбрать…" Margin="8,0,0,0" Click="BrowseTemplate_Click" Padding="12,4"/>
           <TextBox x:Name="TemplateProfileBox" ToolTip="В ручном режиме укажите исходный профиль Firefox. Менеджер копирует его один раз. Далее используется постоянный профиль и контейнеры."/>
         </DockPanel>
         <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="Автопоиск читает %APPDATA%\Mozilla\Firefox\profiles.ini. Исходный профиль копируется только при первом открытии. Далее используется Data/FirefoxContainersTest/profile. Новые пароли и контейнеры сохраняются там. Смена источника не пересоздаёт существующую копию."/>
+                   Text="Автопоиск читает %APPDATA%\Mozilla\Firefox\profiles.ini. Исходный профиль копируется только при первом открытии. Далее используется Data/FirefoxContainers/profile. Новые пароли и контейнеры сохраняются там. Смена источника не пересоздаёт существующую копию."/>
         <TextBlock Text="Таймаут одной попытки подключения, сек" Margin="0,18,0,7"/>
         <TextBox x:Name="ConnectionTimeoutBox" MaxLength="3" ToolTip="Допустимое значение: от 3 до 600 секунд"/>
         <TextBlock Text="Лимит зонда одного адреса, сек" Margin="0,18,0,7"/>
