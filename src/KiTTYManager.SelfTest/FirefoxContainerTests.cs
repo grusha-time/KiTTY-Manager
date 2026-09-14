@@ -215,6 +215,287 @@ internal sealed partial class SelfTestRunner
         }
         finally { Directory.Delete(root, true); }
     }
+
+    internal static void FirefoxDiskOptimizationPreferencesTest()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "kitty-pref-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            var profile = Path.Combine(root, "profile");
+            Directory.CreateDirectory(profile);
+
+            // 1. Default flags (all true)
+            FirefoxProfileWorkspace.ConfigureContainers(profile, 12340, 12341, 12342);
+            foreach (var name in new[] { "prefs.js", "user.js" })
+            {
+                var content = File.ReadAllText(Path.Combine(profile, name));
+                Equal(true, content.Contains("user_pref(\"browser.cache.disk.enable\", false);"));
+                Equal(true, content.Contains("user_pref(\"browser.cache.memory.enable\", true);"));
+                Equal(true, content.Contains("user_pref(\"browser.cache.memory.capacity\", 51200);"));
+                Equal(true, content.Contains("user_pref(\"browser.safebrowsing.malware.enabled\", false);"));
+                Equal(true, content.Contains("user_pref(\"browser.safebrowsing.phishing.enabled\", false);"));
+                Equal(true, content.Contains("user_pref(\"browser.safebrowsing.downloads.enabled\", false);"));
+                Equal(true, content.Contains("user_pref(\"places.history.enabled\", false);"));
+                Equal(true, content.Contains("user_pref(\"browser.chrome.site_icons\", false);"));
+                Equal(true, content.Contains("user_pref(\"privacy.sanitize.sanitizeOnShutdown\", true);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown.cache\", true);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown.cookies\", false);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown.sessions\", false);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown_v2.cache\", true);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown_v2.cookiesAndStorage\", false);"));
+            }
+
+            // 2. Disabled flags (all false)
+            FirefoxProfileWorkspace.ConfigureContainers(profile, 12340, 12341, 12342,
+                optimizeRamCache: false,
+                disableSafeBrowsing: false,
+                disableHistoryAndIcons: false,
+                clearCacheOnShutdown: false);
+            foreach (var name in new[] { "prefs.js", "user.js" })
+            {
+                var content = File.ReadAllText(Path.Combine(profile, name));
+                Equal(true, content.Contains("user_pref(\"browser.cache.disk.enable\", true);"));
+                Equal(true, content.Contains("user_pref(\"browser.cache.memory.capacity\", -1);"));
+                Equal(true, content.Contains("user_pref(\"browser.safebrowsing.malware.enabled\", true);"));
+                Equal(true, content.Contains("user_pref(\"browser.safebrowsing.phishing.enabled\", true);"));
+                Equal(true, content.Contains("user_pref(\"browser.safebrowsing.downloads.enabled\", true);"));
+                Equal(true, content.Contains("user_pref(\"places.history.enabled\", true);"));
+                Equal(true, content.Contains("user_pref(\"browser.chrome.site_icons\", true);"));
+                Equal(true, content.Contains("user_pref(\"privacy.sanitize.sanitizeOnShutdown\", false);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown.cache\", false);"));
+                Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown_v2.cache\", false);"));
+            }
+
+            // 3. Cycle back to enabled: verify no duplicate lines
+            FirefoxProfileWorkspace.ConfigureContainers(profile, 12340, 12341, 12342,
+                optimizeRamCache: true,
+                disableSafeBrowsing: true,
+                disableHistoryAndIcons: true,
+                clearCacheOnShutdown: true);
+            foreach (var name in new[] { "prefs.js", "user.js" })
+            {
+                var lines = File.ReadAllLines(Path.Combine(profile, name));
+                Equal(1, lines.Count(l => l.Contains("\"browser.cache.disk.enable\"")));
+                Equal(1, lines.Count(l => l.Contains("\"browser.safebrowsing.malware.enabled\"")));
+                Equal(1, lines.Count(l => l.Contains("\"places.history.enabled\"")));
+                Equal(1, lines.Count(l => l.Contains("\"privacy.sanitize.sanitizeOnShutdown\"")));
+            }
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    internal static void FirefoxContainerBridgePurgeTest()
+    {
+        CheckBridgePurgeAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task CheckBridgePurgeAsync()
+    {
+        using var bridge = new FirefoxContainerBridge();
+        using var http = new HttpClient(new HttpClientHandler { UseProxy = false });
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bridge.Token);
+
+        bridge.EnqueuePurge("purge-task-1", "0123456789abcdef0123456789abcdef-");
+
+        // Poll without acks to inspect purges list
+        var response = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[]}"));
+        response.EnsureSuccessStatusCode();
+        using var state = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var purges = state.RootElement.GetProperty("purges").EnumerateArray().ToList();
+        Equal(1, purges.Count);
+        Equal("purge-task-1", purges[0].GetProperty("id").GetString());
+        Equal("0123456789abcdef0123456789abcdef-", purges[0].GetProperty("pattern").GetString());
+
+        // 1. Acknowledge purge with an error: task must NOT be acknowledged and must be retained in bridge for retry
+        var ackTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        bridge.PurgeAcknowledged += id => ackTcs.TrySetResult(id);
+
+        var failPayload = JsonSerializer.Serialize(new
+        {
+            acks = Array.Empty<object>(),
+            activeKeys = Array.Empty<string>(),
+            purgeAcks = new[] { new { id = "purge-task-1", error = "simulated removal failure" } }
+        });
+        response = await http.PostAsync(bridge.Url, new StringContent(failPayload));
+        response.EnsureSuccessStatusCode();
+
+        // Event should not fire
+        Equal(false, ackTcs.Task.IsCompleted);
+
+        // Next poll should still contain the purge task for retry
+        response = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[]}"));
+        response.EnsureSuccessStatusCode();
+        using (var retryState = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
+        {
+            var retainedPurges = retryState.RootElement.GetProperty("purges").EnumerateArray().ToList();
+            Equal(1, retainedPurges.Count);
+            Equal("purge-task-1", retainedPurges[0].GetProperty("id").GetString());
+        }
+
+        // 2. Retry succeeds (error = null): event fires and task is removed
+        var successPayload = JsonSerializer.Serialize(new
+        {
+            acks = Array.Empty<object>(),
+            activeKeys = Array.Empty<string>(),
+            purgeAcks = new[] { new { id = "purge-task-1", error = (string?)null } }
+        });
+        response = await http.PostAsync(bridge.Url, new StringContent(successPayload));
+        response.EnsureSuccessStatusCode();
+
+        Equal("purge-task-1", await ackTcs.Task.WaitAsync(TimeSpan.FromSeconds(3)));
+
+        // Next poll should have empty purges
+        response = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[]}"));
+        response.EnsureSuccessStatusCode();
+        using var nextState = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Equal(0, nextState.RootElement.GetProperty("purges").GetArrayLength());
+    }
+
+    internal static void FirefoxDiskOptimizationConfigTest()
+    {
+        // 1. Defaults
+        var config = new ManagerConfig();
+        Equal(true, config.FirefoxOptimizeRamCache);
+        Equal(true, config.FirefoxDisableSafeBrowsing);
+        Equal(true, config.FirefoxDisableHistoryAndIcons);
+        Equal(true, config.FirefoxClearCacheOnShutdown);
+        Equal(true, config.FirefoxCleanRemovedServerContainers);
+        Equal(0, config.PendingFirefoxContainerCleanups.Count);
+
+        // 2. Deserialization from JSON without new fields defaults to true
+        var legacyJson = "{\"SchemaVersion\":9,\"Groups\":[],\"UngroupedServers\":[]}";
+        var deserialized = JsonSerializer.Deserialize<ManagerConfig>(legacyJson)!;
+        Equal(true, deserialized.FirefoxOptimizeRamCache);
+        Equal(true, deserialized.FirefoxDisableSafeBrowsing);
+        Equal(true, deserialized.FirefoxDisableHistoryAndIcons);
+        Equal(true, deserialized.FirefoxClearCacheOnShutdown);
+        Equal(true, deserialized.FirefoxCleanRemovedServerContainers);
+
+        // 3. Saved false values are preserved
+        var customJson = JsonSerializer.Serialize(new ManagerConfig
+        {
+            FirefoxOptimizeRamCache = false,
+            FirefoxDisableSafeBrowsing = false,
+            FirefoxDisableHistoryAndIcons = false,
+            FirefoxClearCacheOnShutdown = false,
+            FirefoxCleanRemovedServerContainers = false
+        });
+        var loadedCustom = JsonSerializer.Deserialize<ManagerConfig>(customJson)!;
+        Equal(false, loadedCustom.FirefoxOptimizeRamCache);
+        Equal(false, loadedCustom.FirefoxDisableSafeBrowsing);
+        Equal(false, loadedCustom.FirefoxDisableHistoryAndIcons);
+        Equal(false, loadedCustom.FirefoxClearCacheOnShutdown);
+        Equal(false, loadedCustom.FirefoxCleanRemovedServerContainers);
+
+        // 4. ConfigTransfer.CreateExport resets options and empties pending queue
+        var srvId = Guid.NewGuid();
+        var testServer = new ManagedServer { Id = srvId, Name = "Test" };
+        config.UngroupedServers.Add(testServer);
+        config.PendingFirefoxContainerCleanups.Add(new FirefoxContainerCleanupTask { ServerId = srvId });
+        config.FirefoxOptimizeRamCache = false;
+        var exported = ConfigTransfer.CreateExport(config, [srvId], true);
+        Equal(true, exported.FirefoxOptimizeRamCache);
+        Equal(true, exported.FirefoxDisableSafeBrowsing);
+        Equal(0, exported.PendingFirefoxContainerCleanups.Count);
+    }
+
+    internal static void FirefoxExtensionBackgroundPurgeNodeTest()
+    {
+        using var stream = typeof(FirefoxContainerBrowser).Assembly
+            .GetManifestResourceStream("KiTTYManager.Core.FirefoxExtension.background.js");
+        if (stream == null) return;
+        using var reader = new StreamReader(stream);
+        var jsCode = reader.ReadToEnd();
+
+        var nodeCandidates = new[] { "/usr/bin/node", "/usr/local/bin/node", "node" };
+        string? nodeExe = null;
+        foreach (var candidate in nodeCandidates)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(candidate, "--version")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p != null)
+                {
+                    p.WaitForExit(2000);
+                    if (p.ExitCode == 0) { nodeExe = candidate; break; }
+                }
+            }
+            catch { }
+        }
+        if (nodeExe == null) return;
+
+        var script = $$"""
+        const fs = require('fs'), assert = require('assert');
+        const s = {{JsonSerializer.Serialize(jsCode)}};
+        const a = s.indexOf('      if (Array.isArray(state.purges))');
+        const b = s.indexOf('      const next = new Map();', a);
+        const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+        const run = new AsyncFunction('state','browser','containerIds','routes','activeContainers','pendingContainers','purgeAcknowledgements', s.slice(a, b));
+
+        (async () => {
+          // 1. Missing identity ("Invalid contextual identity: ...") should not block remaining containers
+          {
+            const ids = {'server-web1': 'c1', 'server-web2': 'c2'};
+            let removedSecond = false;
+            let persisted = null;
+            const browser = {
+              tabs: { query: async () => [] },
+              contextualIdentities: {
+                remove: async id => {
+                  if (id === 'c1') throw Error('Invalid contextual identity: ' + id);
+                  removedSecond = true;
+                }
+              },
+              storage: { local: { set: async val => { persisted = structuredClone(val); } } }
+            };
+            const acks = [];
+            await run({purges: [{id: 'task-1', pattern: 'server-'}]}, browser, ids, new Map(), new Map(), new Map(), acks);
+            assert.equal(acks[0].error, null, 'Error must be null when missing container was already deleted');
+            assert.equal(removedSecond, true, 'Second container must be deleted');
+            assert.equal(Object.keys(ids).length, 0, 'Mappings must be cleaned up');
+            assert.deepEqual(persisted.containerIds, {}, 'Storage must be cleaned up');
+          }
+
+          // 2. Genuine failure should preserve mapping and report error
+          {
+            const ids = {'server-web1': 'c1'};
+            const browser = {
+              tabs: { query: async () => [] },
+              contextualIdentities: {
+                remove: async id => { throw Error('simulated removal failure'); }
+              },
+              storage: { local: { set: async () => {} } }
+            };
+            const acks = [];
+            await run({purges: [{id: 'task-2', pattern: 'server-'}]}, browser, ids, new Map(), new Map(), new Map(), acks);
+            assert.equal(acks[0].error, 'Error: simulated removal failure');
+            assert.equal(ids['server-web1'], 'c1');
+          }
+        })().catch(e => { console.error(e); process.exit(1); });
+        """;
+
+        var runPsi = new System.Diagnostics.ProcessStartInfo(nodeExe)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var process = System.Diagnostics.Process.Start(runPsi)!;
+        process.StandardInput.Write(script);
+        process.StandardInput.Close();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit(5000);
+        if (process.ExitCode != 0)
+            throw new Exception("Extension purge Node check failed: " + stderr);
+    }
 }
 
 internal static class FirefoxContainerSmoke

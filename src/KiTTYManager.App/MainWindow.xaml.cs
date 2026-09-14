@@ -789,7 +789,15 @@ public partial class MainWindow : Window
         SaveToKittyMenuItem.Visibility = row is not null && string.IsNullOrWhiteSpace(row.Server.SourceSessionPath)
             ? Visibility.Visible : Visibility.Collapsed;
     }
-    private void DeleteSession_Click(object sender, RoutedEventArgs e) { if (SelectedRow() is not SessionRow row || ThemedMessageDialog.Show(this, $"Удалить «{row.Name}» только из менеджера? Исходная сессия KiTTY останется.", "Удаление", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return; config.RemoveServer(row.Server.Id); if (selectedServer?.Id == row.Server.Id) selectedServer = null; SaveAndRefresh(); }
+
+    private void DeleteSession_Click(object sender, RoutedEventArgs e)
+    {
+        if (SelectedRow() is not SessionRow row || ThemedMessageDialog.Show(this, $"Удалить «{row.Name}» только из менеджера? Исходная сессия KiTTY останется.", "Удаление", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+        RequestContainerCleanup(row.Server.Id);
+        config.RemoveServer(row.Server.Id);
+        if (selectedServer?.Id == row.Server.Id) selectedServer = null;
+        SaveAndRefresh();
+    }
 
     private void ApplyServer_Click(object sender, RoutedEventArgs e)
     {
@@ -939,7 +947,16 @@ public partial class MainWindow : Window
         }
         catch (Exception ex) { Error(ex); }
     }
-    private void RemoveWeb_Click(object sender, RoutedEventArgs e) { if (selectedServer is not null && WebGrid.SelectedItem is WebInterface web) { selectedServer.WebInterfaces.Remove(web); SaveAndRefresh(); } }
+
+    private void RemoveWeb_Click(object sender, RoutedEventArgs e)
+    {
+        if (selectedServer is not null && WebGrid.SelectedItem is WebInterface web)
+        {
+            RequestContainerCleanup(selectedServer.Id, web.Id);
+            selectedServer.WebInterfaces.Remove(web);
+            SaveAndRefresh();
+        }
+    }
 
     private async void WebGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
@@ -1256,6 +1273,7 @@ public partial class MainWindow : Window
             {
                 if (!ValidateFirefoxProfile(showWarning: true)) return;
                 await EnsureFirefoxContainersAsync(cancellationToken);
+                if (config.FindServer(server.Id) is null || !server.WebInterfaces.Any(w => w.Id == web.Id)) return;
                 var containerKey = $"{server.Id:N}-{web.Id:N}";
                 if (containerSessions.TryGetValue(containerKey, out var existing))
                 {
@@ -1351,6 +1369,9 @@ public partial class MainWindow : Window
                 RouteLog($"Web destination probe: session={server.Name}; engine=kitty; exit=target; proxy=127.0.0.1:{browserProxyPort}; resolver={(useInternalResolver ? "internal" : "system")}; destination={destination.Host}:{destination.Port}; result={(probe.Success ? "PASS" : "FAIL")}; detail={probe.Detail}");
                 if (!probe.Success)
                     throw new IOException("KiTTY-туннель конечной сессии не смог открыть указанный веб-адрес. Подробности записаны в журнал.");
+
+                if (config.FindServer(server.Id) is null || !server.WebInterfaces.Any(w => w.Id == web.Id))
+                    throw new OperationCanceledException("Сессия или веб-интерфейс были удалены во время подключения.");
 
                 containerSessions.Add(containerKey, new ContainerWebSession(tunnel, route, resolver));
                 try
@@ -3401,7 +3422,12 @@ public partial class MainWindow : Window
             config.SuppressKittyChangeNotifications, config.RaceBestEntryPoints,
             config.SkipExistingLinksInMapCheck,
             config.WinScpPath, config.OfferStartMissingJumphosts,
-            config.TaskConnectionRecoveryMinutes) { Owner = this };
+            config.TaskConnectionRecoveryMinutes,
+            config.FirefoxOptimizeRamCache,
+            config.FirefoxDisableSafeBrowsing,
+            config.FirefoxDisableHistoryAndIcons,
+            config.FirefoxClearCacheOnShutdown,
+            config.FirefoxCleanRemovedServerContainers) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
         config.WinScpPath = dialog.WinScpPath;
@@ -3420,6 +3446,11 @@ public partial class MainWindow : Window
         config.RaceBestEntryPoints = dialog.RaceBestEntryPoints;
         config.SkipExistingLinksInMapCheck = dialog.SkipExistingLinksInMapCheck;
         config.OfferStartMissingJumphosts = dialog.OfferStartMissingJumphosts;
+        config.FirefoxOptimizeRamCache = dialog.FirefoxOptimizeRamCache;
+        config.FirefoxDisableSafeBrowsing = dialog.FirefoxDisableSafeBrowsing;
+        config.FirefoxDisableHistoryAndIcons = dialog.FirefoxDisableHistoryAndIcons;
+        config.FirefoxClearCacheOnShutdown = dialog.FirefoxClearCacheOnShutdown;
+        config.FirefoxCleanRemovedServerContainers = dialog.FirefoxCleanRemovedServerContainers;
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
         ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
         config.ClosePreferenceConfigured = true; SaveConfig();

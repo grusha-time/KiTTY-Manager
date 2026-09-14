@@ -23,11 +23,22 @@ public sealed class FirefoxContainerBridge : IDisposable
     public int BlockedPort { get; }
     public bool Connected => DateTime.UtcNow - new DateTime(Interlocked.Read(ref lastPollTicks)) < TimeSpan.FromSeconds(10);
     public event Action<string>? Closed;
+    public event Action<string>? PurgeAcknowledged;
     public Action<string>? Trace { get; set; }
     private sealed record Route(string Key, string Name, int Port) { public bool Opened { get; set; } }
     private sealed record Pending(string Key, string Url)
     {
         public TaskCompletionSource<bool> Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+    private sealed record Purge(string Id, string Pattern);
+    private readonly ConcurrentDictionary<string, Purge> purges = new();
+
+    public void EnqueuePurge(string id, string pattern)
+    {
+        lock (stateGate)
+        {
+            purges[id] = new Purge(id, pattern);
+        }
     }
 
     public FirefoxContainerBridge()
@@ -143,11 +154,30 @@ public sealed class FirefoxContainerBridge : IDisposable
                             pending.Done.TrySetResult(true);
                         }
                     }
+                    if (json.RootElement.TryGetProperty("purgeAcks", out var purgeAcks))
+                    {
+                        foreach (var ack in purgeAcks.EnumerateArray())
+                        {
+                            var id = ack.GetProperty("id").GetString();
+                            if (id is null) continue;
+                            var error = ack.TryGetProperty("error", out var err) && err.ValueKind != JsonValueKind.Null ? err.GetString() : null;
+                            if (error is null)
+                            {
+                                if (purges.TryRemove(id, out _))
+                                    PurgeAcknowledged?.Invoke(id);
+                            }
+                            else
+                            {
+                                Trace?.Invoke($"Firefox bridge: purge {id} failed: {error}");
+                            }
+                        }
+                    }
                     Interlocked.Exchange(ref lastPollTicks, DateTime.UtcNow.Ticks);
                     response = JsonSerializer.Serialize(new
                     {
                         routes = routes.Values.Select(r => new {key = r.Key, name = r.Name, port = r.Port}),
-                        commands = commands.Select(p => new {id = p.Key, key = p.Value.Key, url = p.Value.Url})
+                        commands = commands.Select(p => new {id = p.Key, key = p.Value.Key, url = p.Value.Url}),
+                        purges = purges.Values.Select(p => new {id = p.Id, pattern = p.Pattern})
                     });
                 }
                 await RespondAsync(stream, "200 OK", response, deadline.Token);

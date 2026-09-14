@@ -22,6 +22,23 @@
         </DockPanel>
         <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="Автопоиск читает %APPDATA%\Mozilla\Firefox\profiles.ini. Исходный профиль копируется только при первом открытии. Далее используется Data/FirefoxContainers/profile. Новые пароли и контейнеры сохраняются там. Смена источника не пересоздаёт существующую копию."/>
+        <Border Margin="0,22,0,18" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"/>
+        <TextBlock Text="Оптимизация дискового пространства Firefox" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
+        <CheckBox x:Name="FirefoxOptimizeRamCacheBox" Content="Перенос кэша в оперативную память (отключение дискового кэша)"/>
+        <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Отключает запись кэша на диск и держит его в RAM (browser.cache.disk.enable = false, browser.cache.memory.enable = true, browser.cache.memory.capacity = 51200). Экономит 80–90% размера профиля, ускоряет работу веб-консолей за счёт быстрого RAM-кэша. Авторизации, куки и сохранённые пароли не затрагиваются."/>
+        <CheckBox x:Name="FirefoxDisableSafeBrowsingBox" Margin="0,16,0,0" Content="Отключение баз SafeBrowsing"/>
+        <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Предотвращает скачивание и хранение бинарных баз фишинга и вредоносных сайтов (browser.safebrowsing.malware.enabled = false, browser.safebrowsing.phishing.enabled = false, browser.safebrowsing.downloads.enabled = false). Экономит 50–80 МБ на диске. Для внутреннего администрирования через туннели эти базы не нужны."/>
+        <CheckBox x:Name="FirefoxDisableHistoryAndIconsBox" Margin="0,16,0,0" Content="Отключение сбора истории и иконок для локальных адресов"/>
+        <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Отключает сохранение истории посещений и сбор фавиконов (places.history.enabled = false, browser.chrome.site_icons = false). Базы places.sqlite и favicons.sqlite не раздуваются и не фрагментируют диск при обращении к десяткам временных локальных портов и туннелей (экономия до 50 МБ)."/>
+        <CheckBox x:Name="FirefoxClearCacheOnShutdownBox" Margin="0,16,0,0" Content="Очистка кэша при закрытии браузера"/>
+        <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="Настраивает автоматическую санитаризацию при выходе (privacy.sanitize.sanitizeOnShutdown = true, privacy.clearOnShutdown.cache = true), сохраняя куки и сессии (privacy.clearOnShutdown.cookies = false, privacy.clearOnShutdown.sessions = false). Не даёт временным файлам оседать на диске между запусками менеджера, при этом авторизация в интерфейсах сохраняется."/>
+        <CheckBox x:Name="FirefoxCleanRemovedServerContainersBox" Margin="0,16,0,0" Content="Очистка данных удалённых серверов"/>
+        <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                   Text="При удалении сессии или сервера из менеджера удаляет ассоциированный контейнер через browser.contextualIdentities.remove(cookieStoreId). Очищает изолированные куки, IndexedDB и localStorage удалённых серверов, убирает «мертвые» контейнеры из меню Firefox."/>
         <TextBlock Text="Таймаут одной попытки подключения, сек" Margin="0,18,0,7"/>
         <TextBox x:Name="ConnectionTimeoutBox" MaxLength="3" ToolTip="Допустимое значение: от 3 до 600 секунд"/>
         <TextBlock Text="Лимит зонда одного адреса, сек" Margin="0,18,0,7"/>

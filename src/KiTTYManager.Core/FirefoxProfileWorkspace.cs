@@ -35,7 +35,11 @@ public static class FirefoxProfileWorkspace
         return profile;
     }
 
-    public static void ConfigureContainers(string profile, int blockedPort, int marionettePort, int bridgePort)
+    public static void ConfigureContainers(string profile, int blockedPort, int marionettePort, int bridgePort,
+        bool optimizeRamCache = true,
+        bool disableSafeBrowsing = true,
+        bool disableHistoryAndIcons = true,
+        bool clearCacheOnShutdown = true)
     {
         // The browser must be stopped. Keep normal profile migrations enabled.
         // No installation-wide policies, shared Firefox files or certificate bypass.
@@ -61,7 +65,22 @@ public static class FirefoxProfileWorkspace
             ["media.peerconnection.enabled"] = "true",
             ["privacy.userContext.enabled"] = "true",
             ["privacy.userContext.ui.enabled"] = "true",
-            ["privacy.sanitize.sanitizeOnShutdown"] = "false",
+            ["privacy.sanitize.sanitizeOnShutdown"] = clearCacheOnShutdown ? "true" : "false",
+            ["privacy.clearOnShutdown.cache"] = clearCacheOnShutdown ? "true" : "false",
+            ["privacy.clearOnShutdown.cookies"] = "false",
+            ["privacy.clearOnShutdown.sessions"] = "false",
+            ["privacy.clearOnShutdown_v2.cache"] = clearCacheOnShutdown ? "true" : "false",
+            ["privacy.clearOnShutdown_v2.cookiesAndStorage"] = "false",
+            ["privacy.clearOnShutdown_v2.historyFormDataAndDownloads"] = "false",
+            ["privacy.clearOnShutdown_v2.browsingHistoryAndDownloads"] = "false",
+            ["browser.cache.disk.enable"] = optimizeRamCache ? "false" : "true",
+            ["browser.cache.memory.enable"] = "true",
+            ["browser.cache.memory.capacity"] = optimizeRamCache ? "51200" : "-1",
+            ["browser.safebrowsing.malware.enabled"] = disableSafeBrowsing ? "false" : "true",
+            ["browser.safebrowsing.phishing.enabled"] = disableSafeBrowsing ? "false" : "true",
+            ["browser.safebrowsing.downloads.enabled"] = disableSafeBrowsing ? "false" : "true",
+            ["places.history.enabled"] = disableHistoryAndIcons ? "false" : "true",
+            ["browser.chrome.site_icons"] = disableHistoryAndIcons ? "false" : "true",
             ["browser.privatebrowsing.autostart"] = "false",
             ["browser.startup.page"] = "0",
             ["browser.sessionstore.resume_from_crash"] = "false",
