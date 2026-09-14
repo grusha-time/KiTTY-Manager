@@ -17,7 +17,11 @@ public sealed class FirefoxContainerBrowser : IDisposable
     public bool IsRunning => browser is { HasExited: false };
 
     public async Task StartAsync(string executable, string root, Func<string> source, CancellationToken token,
-        bool headless = false)
+        bool headless = false,
+        bool optimizeRamCache = true,
+        bool disableSafeBrowsing = true,
+        bool disableHistoryAndIcons = true,
+        bool clearCacheOnShutdown = true)
     {
         if (IsRunning)
         {
@@ -49,7 +53,8 @@ public sealed class FirefoxContainerBrowser : IDisposable
         portReservation.Start();
         var port = ((IPEndPoint)portReservation.LocalEndpoint).Port;
         portReservation.Stop();
-        FirefoxProfileWorkspace.ConfigureContainers(profile, Bridge.BlockedPort, port, new Uri(Bridge.Url).Port);
+        FirefoxProfileWorkspace.ConfigureContainers(profile, Bridge.BlockedPort, port, new Uri(Bridge.Url).Port,
+            optimizeRamCache, disableSafeBrowsing, disableHistoryAndIcons, clearCacheOnShutdown);
         if (headless) File.AppendAllText(Path.Combine(profile, "user.js"),
             "\nuser_pref(\"toolkit.cosmeticAnimations.enabled\", false);\n" +
             "user_pref(\"focusmanager.testmode\", true);\n" +

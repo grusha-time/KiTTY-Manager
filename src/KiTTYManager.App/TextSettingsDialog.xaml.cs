@@ -18,6 +18,11 @@ public partial class TextSettingsDialog : Window
     public bool RaceBestEntryPoints => RaceBestEntryPointsBox.IsChecked == true;
     public bool SkipExistingLinksInMapCheck => SkipExistingLinksInMapCheckBox.IsChecked == true;
     public bool OfferStartMissingJumphosts => OfferStartMissingJumphostsBox.IsChecked == true;
+    public bool FirefoxOptimizeRamCache => FirefoxOptimizeRamCacheBox.IsChecked == true;
+    public bool FirefoxDisableSafeBrowsing => FirefoxDisableSafeBrowsingBox.IsChecked == true;
+    public bool FirefoxDisableHistoryAndIcons => FirefoxDisableHistoryAndIconsBox.IsChecked == true;
+    public bool FirefoxClearCacheOnShutdown => FirefoxClearCacheOnShutdownBox.IsChecked == true;
+    public bool FirefoxCleanRemovedServerContainers => FirefoxCleanRemovedServerContainersBox.IsChecked == true;
     public int ConnectionTimeoutSeconds { get; private set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; private set; } = 4;
     public int TaskConnectionRecoveryMinutes { get; private set; } = 1;
@@ -29,7 +34,12 @@ public partial class TextSettingsDialog : Window
         bool suppressKittyChangeNotifications = true, bool raceBestEntryPoints = false,
         bool skipExistingLinksInMapCheck = true,
         string winScpPath = "", bool offerStartMissingJumphosts = true,
-        int taskConnectionRecoveryMinutes = 1)
+        int taskConnectionRecoveryMinutes = 1,
+        bool firefoxOptimizeRamCache = true,
+        bool firefoxDisableSafeBrowsing = true,
+        bool firefoxDisableHistoryAndIcons = true,
+        bool firefoxClearCacheOnShutdown = true,
+        bool firefoxCleanRemovedServerContainers = true)
     {
         InitializeComponent();
         Width = Math.Min(760, Math.Max(MinWidth, SystemParameters.WorkArea.Width - 48));
@@ -50,6 +60,11 @@ public partial class TextSettingsDialog : Window
         RaceBestEntryPointsBox.IsChecked = raceBestEntryPoints;
         SkipExistingLinksInMapCheckBox.IsChecked = skipExistingLinksInMapCheck;
         OfferStartMissingJumphostsBox.IsChecked = offerStartMissingJumphosts;
+        FirefoxOptimizeRamCacheBox.IsChecked = firefoxOptimizeRamCache;
+        FirefoxDisableSafeBrowsingBox.IsChecked = firefoxDisableSafeBrowsing;
+        FirefoxDisableHistoryAndIconsBox.IsChecked = firefoxDisableHistoryAndIcons;
+        FirefoxClearCacheOnShutdownBox.IsChecked = firefoxClearCacheOnShutdown;
+        FirefoxCleanRemovedServerContainersBox.IsChecked = firefoxCleanRemovedServerContainers;
     }
     private void AutoDiscoverFirefoxProfile_Changed(object sender, RoutedEventArgs e) => UpdateTemplateControls();
     private void UpdateTemplateControls()

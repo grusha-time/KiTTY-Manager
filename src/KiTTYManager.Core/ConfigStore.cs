@@ -202,6 +202,13 @@ public static class ConfigStore
         config.UngroupedServers ??= [];
         config.Links ??= [];
         config.BaseProxies ??= [];
+        config.PendingFirefoxContainerCleanups = (config.PendingFirefoxContainerCleanups ?? [])
+            .Where(t => t is not null && t.ServerId != Guid.Empty)
+            .GroupBy(t => string.IsNullOrWhiteSpace(t.Id) ? $"{t.ServerId:N}_{t.WebId}" : t.Id)
+            .Select(g => g.First())
+            .ToList();
+        foreach (var task in config.PendingFirefoxContainerCleanups)
+            if (string.IsNullOrWhiteSpace(task.Id)) task.Id = Guid.NewGuid().ToString("N");
         ManagerConfigMigration.UpgradeToVersion9(config);
         foreach (var proxy in config.BaseProxies)
         {

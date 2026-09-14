@@ -30,11 +30,35 @@ public partial class MainWindow
         {
             if (ReferenceEquals(containerBrowser, current)) CloseContainerSession(key, false);
         });
+        current.Bridge.PurgeAcknowledged += id => Dispatcher.BeginInvoke(() =>
+        {
+            if (ReferenceEquals(containerBrowser, current)) OnFirefoxContainerPurgeAcknowledged(id);
+        });
+        if (config.FirefoxCleanRemovedServerContainers)
+        {
+            foreach (var task in config.PendingFirefoxContainerCleanups.ToArray())
+            {
+                if (config.FindServer(task.ServerId) is not null && !task.WebId.HasValue)
+                {
+                    config.PendingFirefoxContainerCleanups.Remove(task);
+                    continue;
+                }
+                var pattern = task.WebId.HasValue
+                    ? $"{task.ServerId:N}-{task.WebId.Value:N}"
+                    : $"{task.ServerId:N}-";
+                current.Bridge.EnqueuePurge(task.Id, pattern);
+            }
+        }
         containerWatch.Tick -= WatchFirefoxContainers;
         containerWatch.Tick += WatchFirefoxContainers;
         try
         {
-            await current.StartAsync(ResolveProgram(config.FirefoxPath), FirefoxContainerRoot, FirefoxSourceProfile, token);
+            await current.StartAsync(ResolveProgram(config.FirefoxPath), FirefoxContainerRoot, FirefoxSourceProfile, token,
+                headless: false,
+                optimizeRamCache: config.FirefoxOptimizeRamCache,
+                disableSafeBrowsing: config.FirefoxDisableSafeBrowsing,
+                disableHistoryAndIcons: config.FirefoxDisableHistoryAndIcons,
+                clearCacheOnShutdown: config.FirefoxClearCacheOnShutdown);
             containerWatch.Start();
         }
         catch
@@ -77,5 +101,38 @@ public partial class MainWindow
         foreach (var key in containerSessions.Keys.ToArray()) CloseContainerSession(key, true);
         containerBrowser?.Dispose();
         containerBrowser = null;
+    }
+
+    private void OnFirefoxContainerPurgeAcknowledged(string id)
+    {
+        var removed = config.PendingFirefoxContainerCleanups.RemoveAll(t => t.Id == id);
+        if (removed > 0)
+        {
+            SaveConfig();
+            RouteLog($"Firefox container purge acknowledged: taskId={id}");
+        }
+    }
+
+    private void RequestContainerCleanup(Guid serverId, Guid? webId = null)
+    {
+        if (!config.FirefoxCleanRemovedServerContainers) return;
+        var prefix = webId.HasValue ? $"{serverId:N}-{webId.Value:N}" : $"{serverId:N}-";
+        foreach (var key in containerSessions.Keys.ToArray())
+        {
+            if (webId.HasValue ? key == prefix : key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                CloseContainerSession(key, true);
+            }
+        }
+        var task = new FirefoxContainerCleanupTask
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            ServerId = serverId,
+            WebId = webId
+        };
+        config.PendingFirefoxContainerCleanups.Add(task);
+        SaveConfig();
+        containerBrowser?.Bridge.EnqueuePurge(task.Id, prefix);
+        RouteLog($"Firefox container cleanup queued: server={serverId:N}; web={webId}; taskId={task.Id}");
     }
 }
