@@ -14,7 +14,7 @@
       <Grid>
         <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <StackPanel VerticalAlignment="Center">
-          <TextBlock Text="KiTTY Manager — TEST" Foreground="White" FontSize="22" FontWeight="SemiBold"/>
+          <TextBlock Text="KiTTY Manager" Foreground="White" FontSize="22" FontWeight="SemiBold"/>
           <TextBlock Text="Сессии, маршруты и веб-интерфейсы" Foreground="#858585" FontSize="12"/>
         </StackPanel>
         <WrapPanel Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center">
