@@ -79,7 +79,6 @@ public partial class MainWindow : Window
                 ex.Message + "\n\nМенеджер будет закрыт, исходный config.json не изменён.",
                 "Ошибка конфигурации", MessageBoxButton.OK, MessageBoxImage.Error);
         }
-        CleanupOrphanedFirefoxProfiles();
         if (configAvailable) MigrateLegacyPrototypeConfig();
         RestoreRememberedConsoles();
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
@@ -290,8 +289,8 @@ public partial class MainWindow : Window
     {
         try
         {
-            var sourceProfile = FirefoxSourceProfile();
-            FirefoxProfileWorkspace.ValidateSourceProfile(sourceProfile);
+            var profile = Path.Combine(FirefoxContainerRoot, "profile");
+            FirefoxProfileWorkspace.ValidateSourceProfile(Directory.Exists(profile) ? profile : FirefoxSourceProfile());
             return true;
         }
         catch (Exception ex)
@@ -1252,12 +1251,22 @@ public partial class MainWindow : Window
             KittyRoutedSession? routedSession = null;
             KittyLoginScript? loginScript = null;
             ResolvingSocks5Relay? resolver = null;
-            string? profile = null;
-            Task<string>? profilePreparation = null;
             var handedOff = false;
             try
             {
                 if (!ValidateFirefoxProfile(showWarning: true)) return;
+                await EnsureFirefoxContainersAsync(cancellationToken);
+                var containerKey = $"{server.Id:N}-{web.Id:N}";
+                if (containerSessions.TryGetValue(containerKey, out var existing))
+                {
+                    try
+                    {
+                        await containerBrowser!.Bridge.OpenAsync(containerKey, $"{server.Name} — {web.Name}",
+                            existing.Relay.Port, web.Url, cancellationToken);
+                    }
+                    catch { CloseContainerSession(containerKey, true); throw; }
+                    return;
+                }
                 var webPort = SelectFreeLoopbackPort();
                 var originalDestination = new Uri(web.Url);
                 var useInternalResolver = !string.IsNullOrWhiteSpace(web.ResolverAddress) &&
@@ -1278,23 +1287,8 @@ public partial class MainWindow : Window
                     if (!resolverMappings.Any(m => string.Equals(m.Key, pair.Key, StringComparison.OrdinalIgnoreCase)))
                         resolverMappings.Add(pair);
                 }
-                resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings);
+                resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings, resolveUnmappedLocally: true);
                 var browserProxyPort = resolver.Port;
-                profilePreparation = Task.Run(() =>
-                {
-                    var sourceProfile = FirefoxSourceProfile();
-                    RouteLog($"Firefox source profile: {sourceProfile}");
-                    var prepared = FirefoxProfileWorkspace.Create(FirefoxRuntimeRoot, server.Id, web.Id, sourceProfile);
-                    try
-                    {
-                        FirefoxProfileWorkspace.ApplyPreferences(prepared, browserProxyPort,
-                            useInternalResolver,
-                            useInternalResolver ? [originalDestination.DnsSafeHost] : null);
-                        RouteLog($"Firefox runtime profile: {FirefoxProfileWorkspace.StateSummary(prepared)}");
-                        return prepared;
-                    }
-                    catch { TryDeleteDirectory(prepared); throw; }
-                }, cancellationToken);
                 route = await Connect(server, cancellationToken, true);
                 var loadSavedSession = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
                                        File.Exists(server.SourceSessionPath);
@@ -1358,38 +1352,17 @@ public partial class MainWindow : Window
                 if (!probe.Success)
                     throw new IOException("KiTTY-туннель конечной сессии не смог открыть указанный веб-адрес. Подробности записаны в журнал.");
 
-                var firefox = ResolveProgram(config.FirefoxPath);
-                FirefoxProfileWorkspace.RemoveLegacyAutoConfig(firefox);
-                profile = await profilePreparation;
-                // Small delay ensures the profile files are fully committed to
-                // disk before Firefox reads them (Windows file system caching).
-                await Task.Delay(150, cancellationToken);
-                RouteLog($"Web destination ready: session={server.Name}; engine=kitty; proxy=127.0.0.1:{browserProxyPort}; resolver={(useInternalResolver ? "internal" : "system")}; profile={profile}; url={web.Url}");
-                var browserStart = new ProcessStartInfo(firefox)
-                    { WorkingDirectory = Path.GetDirectoryName(firefox)! };
-                // The runtime profile is disposable; a crash dump from it would
-                // only produce a "report Firefox crash" dialog for the user.
-                browserStart.Environment["MOZ_CRASHREPORTER_DISABLE"] = "1";
-                foreach (var argument in FirefoxProfileWorkspace.LaunchArguments(profile, web.Url))
-                    browserStart.ArgumentList.Add(argument);
-                var browser = Process.Start(browserStart)
-                    ?? throw new IOException("Firefox не вернул запущенный процесс.");
-                // The browser owns the profile from the moment it starts: any
-                // later failure in this block must not delete the directory
-                // out from under the running process.
-                handedOff = true;
+                containerSessions.Add(containerKey, new ContainerWebSession(tunnel, route, resolver));
                 try
                 {
-                    browser.EnableRaisingEvents = true;
-                    RouteLog($"Web cleanup: registered for Firefox pid={browser.Id}, tunnel pid={tunnel.Id}");
-                    _ = CleanupWebSessionAfterExitAsync(browser, tunnel, route, resolver, profile)
-                        .ContinueWith(t => RouteLog($"Web cleanup failed: {t.Exception?.GetBaseException().Message}"),
-                            TaskContinuationOptions.OnlyOnFaulted);
+                    await containerBrowser!.Bridge.OpenAsync(containerKey, $"{server.Name} — {web.Name}",
+                        browserProxyPort, web.Url, cancellationToken);
+                    handedOff = true;
+                    RouteLog($"Firefox container opened: key={containerKey}; proxy=127.0.0.1:{browserProxyPort}");
                 }
                 catch
                 {
-                    handedOff = false;
-                    StopProcess(browser);
+                    containerSessions.Remove(containerKey);
                     throw;
                 }
             }
@@ -1397,30 +1370,11 @@ public partial class MainWindow : Window
             {
                 routedSession?.Dispose();
                 loginScript?.Dispose();
-                if (profile is null && profilePreparation is { IsFaulted: true })
-                    RouteLog($"Firefox profile preparation failed: {profilePreparation.Exception?.GetBaseException().Message}");
                 if (!handedOff)
                 {
                     if (resolver is not null) await resolver.DisposeAsync();
                     if (tunnel is not null) StopProcess(tunnel);
                     if (route is not null) ReleaseRoute(route);
-                    if (WebSessionCleanupPolicy.ShouldDeletePreparedProfile(
-                            handedOff, profile is not null,
-                            profilePreparation is { IsCompletedSuccessfully: true }))
-                    {
-                        if (profile is not null) TryDeleteDirectory(profile);
-                        else if (profilePreparation is { IsCompletedSuccessfully: true })
-                            TryDeleteDirectory(profilePreparation.Result);
-                    }
-                    else if (profilePreparation is { IsCompleted: false } pendingPreparation)
-                    {
-                        // The copy is still in flight; delete its result as
-                        // soon as it lands so a failed startup leaks nothing.
-                        _ = pendingPreparation.ContinueWith(t =>
-                        {
-                            if (t.Status == TaskStatus.RanToCompletion) TryDeleteDirectory(t.Result);
-                        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-                    }
                 }
             }
         });
@@ -3838,6 +3792,7 @@ public partial class MainWindow : Window
         jumphostStartupGates.Clear();
         accessScriptGates.Clear();
         try { SaveConfig(); } catch { }
+        StopFirefoxContainers();
         foreach (var route in activeRoutes) route.Dispose();
         if (trayIcon is not null) { trayIcon.Visible = false; trayIcon.Dispose(); }
     }
@@ -3918,100 +3873,6 @@ public partial class MainWindow : Window
     }
     private static string Quote(string value) => '"' + value.Replace("\"", "\\\"") + '"';
     private static string SafeFileName(string value) => string.Concat(value.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
-    private string FirefoxRuntimeRoot => Path.Combine(dataDirectory, "FirefoxProfiles", "runtime");
-
-    private void CleanupOrphanedFirefoxProfiles()
-    {
-        if (Directory.Exists(FirefoxRuntimeRoot))
-            foreach (var path in Directory.EnumerateDirectories(FirefoxRuntimeRoot))
-            {
-                if (!WaitForFirefoxProfileProcesses(path, TimeSpan.Zero) ||
-                    !FirefoxProfileWorkspace.CanMergeAndDelete(path)) continue;
-                TryDeleteDirectory(path);
-            }
-    }
-
-    private async Task CleanupWebSessionAfterExitAsync(
-        Process browser, Process tunnel, ActiveRoute route, ResolvingSocks5Relay? resolver,
-        string profile)
-    {
-        var browserPid = browser.Id;
-        RouteLog($"Web cleanup: polling Firefox pid={browserPid}; closeTunnel={config.CloseWebTunnelWithFirefox}");
-        try { browser.Dispose(); } catch { }
-        // WaitForExitAsync hangs on Windows with Firefox multi-process model.
-        // Poll GetProcessById instead — throws ArgumentException when process is gone.
-        while (true)
-        {
-            await Task.Delay(1000).ConfigureAwait(false);
-            try
-            {
-                using var probe = Process.GetProcessById(browserPid);
-                if (probe.HasExited) break;
-            }
-            catch (ArgumentException) { break; }
-            catch (InvalidOperationException) { break; }
-        }
-
-        RouteLog($"Web cleanup: Firefox pid={browserPid} exited; closeTunnel={config.CloseWebTunnelWithFirefox}");
-        var processesExited = await Task.Run(() => WaitForFirefoxProfileProcesses(profile, TimeSpan.FromSeconds(10))).ConfigureAwait(false);
-        for (var attempt = 0; attempt < 4 && processesExited && !FirefoxProfileWorkspace.CanMergeAndDelete(profile); attempt++)
-            await Task.Delay(250).ConfigureAwait(false);
-        var profileReleased = processesExited && FirefoxProfileWorkspace.CanMergeAndDelete(profile);
-        if (!profileReleased) RouteLog("Web cleanup: Firefox всё ещё держит файлы профиля; профиль оставлен для безопасной очистки при следующем запуске");
-        if (resolver is not null) await resolver.DisposeAsync().ConfigureAwait(false);
-        if (config.CloseWebTunnelWithFirefox)
-        {
-            RouteLog($"Web cleanup: stopping tunnel pid={tunnel.Id}");
-            StopProcess(tunnel);
-            try { await Dispatcher.InvokeAsync(() => ReleaseRoute(route)); } catch { }
-            RouteLog("Web cleanup: tunnel stopped and route released");
-        }
-        else
-        {
-            tunnel.Dispose();
-            RouteLog("Web KiTTY tunnel left open after Firefox exit; close-after-firefox setting is disabled");
-        }
-        if (!profileReleased) return;
-        for (var attempt = 0; attempt < 40 && Directory.Exists(profile); attempt++)
-        {
-            if (TryDeleteDirectory(profile)) return;
-            await Task.Delay(250);
-        }
-    }
-
-    private static bool WaitForFirefoxProfileProcesses(string profile, TimeSpan timeout)
-    {
-        if (!OperatingSystem.IsWindows()) return true;
-        try
-        {
-            var script = "$deadline=(Get-Date).AddMilliseconds([int]$env:KITTY_FIREFOX_WAIT_MS); " +
-                "do { $count=@(Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" -ErrorAction SilentlyContinue | " +
-                "Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($env:KITTY_FIREFOX_PROFILE,[StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count; " +
-                "if ($count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline); exit 1";
-            var start = new ProcessStartInfo("powershell.exe")
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-            start.ArgumentList.Add("-NoProfile");
-            start.ArgumentList.Add("-NonInteractive");
-            start.ArgumentList.Add("-Command");
-            start.ArgumentList.Add(script);
-            start.Environment["KITTY_FIREFOX_PROFILE"] = profile;
-            start.Environment["KITTY_FIREFOX_WAIT_MS"] = Math.Max(0, (int)timeout.TotalMilliseconds).ToString();
-            using var process = Process.Start(start);
-            if (process is null || !process.WaitForExit((int)timeout.TotalMilliseconds + 5000))
-            {
-                try { process?.Kill(true); } catch { }
-                return false;
-            }
-            return process.ExitCode == 0;
-        }
-        catch { return FirefoxProfileWorkspace.CanMergeAndDelete(profile); }
-    }
-
     private void ReleaseRoute(ActiveRoute route)
     {
         activeRoutes.Remove(route);

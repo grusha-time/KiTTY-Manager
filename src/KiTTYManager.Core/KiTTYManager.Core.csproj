@@ -10,5 +10,6 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="KiTTYManager.SelfTest" />
+    <EmbeddedResource Include="FirefoxExtension/*" />
   </ItemGroup>
 </Project>

@@ -16,6 +16,90 @@ public sealed class FirefoxProfileLockedException : IOException
 
 public static class FirefoxProfileWorkspace
 {
+    // Publish the first copy only when complete. Never recreate an existing profile:
+    // it contains passwords/cookies saved after the initial import.
+    public static string EnsureContainerProfile(string root, Func<string> source)
+    {
+        Directory.CreateDirectory(root);
+        using var gate = new FileStream(Path.Combine(root, "prepare.lock"), FileMode.OpenOrCreate,
+            FileAccess.ReadWrite, FileShare.None);
+        var profile = Path.Combine(root, "profile");
+        if (Directory.Exists(profile))
+        {
+            ValidateSourceProfile(profile);
+            return profile;
+        }
+        var staging = Create(root, Guid.Empty, Guid.Empty, source());
+        try { Directory.Move(staging, profile); }
+        catch { try { Directory.Delete(staging, true); } catch { } throw; }
+        return profile;
+    }
+
+    public static void ConfigureContainers(string profile, int blockedPort, int marionettePort, int bridgePort)
+    {
+        // The browser must be stopped. Keep normal profile migrations enabled.
+        // No installation-wide policies, shared Firefox files or certificate bypass.
+        var settings = new Dictionary<string, string>
+        {
+            ["network.proxy.type"] = "1",
+            ["network.proxy.http"] = "\"127.0.0.1\"",
+            ["network.proxy.http_port"] = blockedPort.ToString(),
+            ["network.proxy.ssl"] = "\"127.0.0.1\"",
+            ["network.proxy.ssl_port"] = blockedPort.ToString(),
+            ["network.proxy.socks"] = "\"\"",
+            ["network.proxy.socks_port"] = "0",
+            // Firefox does not send an extension's own fetch through that
+            // extension's proxy listener. Only its authenticated bridge bypasses.
+            ["network.proxy.no_proxies_on"] = JsonSerializer.Serialize($"127.0.0.1:{bridgePort}"),
+            ["network.proxy.allow_hijacking_localhost"] = "true",
+            ["network.proxy.failover_direct"] = "false",
+            ["network.trr.mode"] = "5",
+            ["network.dns.disablePrefetch"] = "true",
+            ["network.prefetch-next"] = "false",
+            ["network.http.speculative-parallel-limit"] = "0",
+            // WebRTC media follows the OS network route; the container SOCKS relay is TCP-only.
+            ["media.peerconnection.enabled"] = "true",
+            ["privacy.userContext.enabled"] = "true",
+            ["privacy.userContext.ui.enabled"] = "true",
+            ["privacy.sanitize.sanitizeOnShutdown"] = "false",
+            ["browser.privatebrowsing.autostart"] = "false",
+            ["browser.startup.page"] = "0",
+            ["browser.sessionstore.resume_from_crash"] = "false",
+            ["browser.sessionstore.resume_session_once"] = "false",
+            ["browser.shell.checkDefaultBrowser"] = "false",
+            ["browser.aboutwelcome.enabled"] = "false",
+            ["trailhead.firstrun.didSeeAboutWelcome"] = "true",
+            ["browser.startup.firstrunSkipsHomepage"] = "true",
+            ["browser.startup.homepage_override.mstone"] = "\"ignore\"",
+            ["browser.startup.homepage_welcome_url"] = "\"\"",
+            ["browser.startup.homepage_welcome_url.additional"] = "\"\"",
+            ["datareporting.policy.dataSubmissionPolicyBypassNotification"] = "true",
+            ["datareporting.policy.firstRunURL"] = "\"\"",
+            ["toolkit.telemetry.reportingpolicy.firstRun"] = "false",
+            ["browser.messaging-system.whatsNewPanel.enabled"] = "false",
+            ["doh-rollout.doneFirstRun"] = "true",
+            ["doh-rollout.enabled"] = "false",
+            ["app.update.auto"] = "false",
+            ["app.update.enabled"] = "false",
+            ["app.update.doorhanger"] = "false",
+            ["termsofuse.bypassNotification"] = "true",
+            ["dom.security.https_first"] = "false",
+            ["dom.security.https_only_mode"] = "false",
+            ["remote.prefs.recommended"] = "false",
+            ["marionette.port"] = marionettePort.ToString(),
+            ["signon.rememberSignons"] = "true",
+            ["services.sync.engine.passwords"] = "false",
+            ["identity.fxaccounts.enabled"] = "false"
+        };
+        foreach (var name in new[] { "prefs.js", "user.js" })
+        {
+            var path = Path.Combine(profile, name);
+            var lines = File.Exists(path) ? File.ReadAllLines(path).ToList() : [];
+            foreach (var pair in settings) SetPreference(lines, pair.Key, pair.Value);
+            File.WriteAllLines(path, lines);
+        }
+    }
+
     private static readonly HashSet<string> ProfileLockFiles =
         new(["parent.lock", ".parentlock", "lock"], StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> RuntimeSkipFiles =

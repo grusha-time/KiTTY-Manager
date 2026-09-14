@@ -6,6 +6,8 @@ using KiTTYManager.App;
 using KiTTYManager.Core;
 
 Console.OutputEncoding = Encoding.UTF8;
+if (args.Length >= 3 && args[0] == "--firefox-container-smoke")
+    return await FirefoxContainerSmoke.RunAsync(Path.GetFullPath(args[1]), Path.GetFullPath(args[2]));
 ConfigStore.SecretProtector = new TestConfigSecretProtector();
 var filter = GetOption(args, "--filter");
 if (args.Contains("--filter") && (string.IsNullOrWhiteSpace(filter) ||
@@ -68,6 +70,7 @@ internal sealed partial class SelfTestRunner
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);
+        Test("Firefox containers сохраняют профиль и проверяют команды и закрытие", FirefoxContainerPersistenceAndBridge);
         Test("Ansible отвергает опасные имена и удаляет архив после ошибки", AnsibleArchiveRejectsUnsafeNamesAndCleansFailure);
         Test("Сравнение файлов учитывает короткие чтения, хвост и отмену", BatchFileComparisonWithFragmentedReads);
         Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);
