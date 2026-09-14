@@ -127,6 +127,12 @@ public static class ConfigTransfer
         config.RaceBestEntryPoints = false;
         config.SkipExistingLinksInMapCheck = true;
         config.OfferStartMissingJumphosts = true;
+        config.FirefoxOptimizeRamCache = true;
+        config.FirefoxDisableSafeBrowsing = true;
+        config.FirefoxDisableHistoryAndIcons = true;
+        config.FirefoxClearCacheOnShutdown = true;
+        config.FirefoxCleanRemovedServerContainers = true;
+        config.PendingFirefoxContainerCleanups = [];
     }
 
     private static void SanitizeProxiesForExport(ManagerConfig config)

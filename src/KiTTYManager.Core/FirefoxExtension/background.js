@@ -151,6 +151,7 @@ async function container(key, name) {
 }
 async function poll() {
   let acknowledgements = [];
+  let purgeAcknowledgements = [];
   for (;;) {
     try {
       const openingContainers = new Set(pendingContainers.values());
@@ -160,13 +161,76 @@ async function poll() {
         .map(([, route]) => route.key);
       const response = await fetch(KITTY.url, {
         method: "POST", headers: {"Content-Type": "application/json", "Authorization": "Bearer " + KITTY.token},
-        body: JSON.stringify({acks: acknowledgements, activeKeys}),
+        body: JSON.stringify({acks: acknowledgements, activeKeys, purgeAcks: purgeAcknowledgements}),
         signal: AbortSignal.timeout(3000), cache: "no-store", credentials: "omit"
       });
       if (!response.ok) throw new Error("Bridge HTTP " + response.status);
       const state = await response.json();
       lastError = "";
       acknowledgements = [];
+      purgeAcknowledgements = [];
+      if (Array.isArray(state.purges)) {
+        let storageUpdated = false;
+        for (const purge of state.purges) {
+          let error = null;
+          try {
+            const pattern = purge.pattern;
+            const toRemove = [];
+            for (const [key, id] of Object.entries(containerIds)) {
+              if (key === pattern || key.startsWith(pattern + "-") || key.startsWith(pattern)) {
+                toRemove.push([key, id]);
+              }
+            }
+            for (const [key, id] of toRemove) {
+              routes.delete(id);
+              for (const [winId, cid] of activeContainers) {
+                if (cid === id) activeContainers.delete(winId);
+              }
+              for (const [tid, cid] of pendingContainers) {
+                if (cid === id) pendingContainers.delete(tid);
+              }
+              try {
+                const ctabs = await browser.tabs.query({cookieStoreId: id});
+                for (const t of ctabs) {
+                  try { await browser.tabs.remove(t.id); } catch (_) { }
+                }
+              } catch (_) { }
+              try {
+                await browser.contextualIdentities.remove(id);
+              } catch (e) {
+                const msg = String(e && e.message ? e.message : e).toLowerCase();
+                let missing = msg.includes("invalid contextual identity") || msg.includes("not found") || msg.includes("no identity");
+                if (!missing && typeof browser.contextualIdentities.get === "function") {
+                  try {
+                    const existing = await browser.contextualIdentities.get(id);
+                    if (!existing) missing = true;
+                  } catch (getErr) {
+                    const getMsg = String(getErr && getErr.message ? getErr.message : getErr).toLowerCase();
+                    if (getMsg.includes("invalid contextual identity") || getMsg.includes("not found") || getMsg.includes("no identity")) {
+                      missing = true;
+                    }
+                  }
+                }
+                if (missing) {
+                  // Container already deleted externally or does not exist
+                } else {
+                  console.warn("KiTTY container remove failed", id, e);
+                  throw e;
+                }
+              }
+              delete containerIds[key];
+              storageUpdated = true;
+            }
+          } catch (e) {
+            console.error("KiTTY purge error", purge.id, e);
+            error = String(e);
+          }
+          purgeAcknowledgements.push({id: purge.id, error});
+        }
+        if (storageUpdated) {
+          await browser.storage.local.set({containerIds});
+        }
+      }
       const next = new Map();
       for (const route of state.routes) {
         const id = await container(route.key, route.name);

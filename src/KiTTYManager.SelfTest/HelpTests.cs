@@ -30,6 +30,7 @@ internal sealed partial class SelfTestRunner
         var firefoxGroup = HelpContent.Search("", "Настройки — Firefox и веб-панели");
         Equal(true, firefoxGroup.Any(e => e.Title.Contains("Firefox")));
         Equal(true, firefoxGroup.Any(e => e.Title.Contains("веб-туннеля")));
+        Equal(true, firefoxGroup.Any(e => e.Title.Contains("Оптимизация")));
         var connGroup = HelpContent.Search("", "Настройки — Подключение и сеть");
         Equal(true, connGroup.Any(e => e.Title.Contains("Таймаут")));
         Equal(true, connGroup.Any(e => e.Title.Contains("точки входа")));

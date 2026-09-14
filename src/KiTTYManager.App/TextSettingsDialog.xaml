@@ -10,7 +10,6 @@
     <TextBlock Text="Настройки приложения" FontSize="22" FontWeight="SemiBold" Margin="0,0,0,18"/>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <StackPanel Margin="0,0,10,0">
-
         <!-- 1. Внешние программы -->
         <GroupBox Header="Внешние программы" Margin="0,0,0,16" Padding="14,12">
           <StackPanel>
@@ -38,6 +37,21 @@
             <CheckBox x:Name="CloseWebTunnelBox" Margin="0,16,0,0" Content="Закрывать консоль веб-туннеля после закрытия Firefox"/>
             <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                        Text="По умолчанию выключено: консоль KiTTY остаётся открытой. При включении закрытие последней вкладки контейнера в Firefox автоматически закрывает консоль и освобождает туннель."/>
+            <CheckBox x:Name="FirefoxOptimizeRamCacheBox" Margin="0,16,0,0" Content="Перенос кэша в оперативную память (отключение дискового кэша)"/>
+            <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="Отключает запись кэша на диск и держит его в RAM (browser.cache.disk.enable = false, browser.cache.memory.enable = true, browser.cache.memory.capacity = 51200). Экономит 80–90% размера профиля, ускоряет работу веб-консолей за счёт быстрого RAM-кэша. Авторизации, куки и сохранённые пароли не затрагиваются."/>
+            <CheckBox x:Name="FirefoxDisableSafeBrowsingBox" Margin="0,16,0,0" Content="Отключение баз SafeBrowsing"/>
+            <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="Предотвращает скачивание и хранение бинарных баз фишинга и вредоносных сайтов (browser.safebrowsing.malware.enabled = false, browser.safebrowsing.phishing.enabled = false, browser.safebrowsing.downloads.enabled = false). Экономит 50–80 МБ на диске. Для внутреннего администрирования через туннели эти базы не нужны."/>
+            <CheckBox x:Name="FirefoxDisableHistoryAndIconsBox" Margin="0,16,0,0" Content="Отключение сбора истории и иконок для локальных адресов"/>
+            <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="Отключает сохранение истории посещений и сбор фавиконов (places.history.enabled = false, browser.chrome.site_icons = false). Базы places.sqlite и favicons.sqlite не раздуваются и не фрагментируют диск при обращении к десяткам временных локальных портов и туннелей (экономия до 50 МБ)."/>
+            <CheckBox x:Name="FirefoxClearCacheOnShutdownBox" Margin="0,16,0,0" Content="Очистка кэша при закрытии браузера"/>
+            <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="Настраивает автоматическую санитаризацию при выходе (privacy.sanitize.sanitizeOnShutdown = true, privacy.clearOnShutdown.cache = true), сохраняя куки и сессии (privacy.clearOnShutdown.cookies = false, privacy.clearOnShutdown.sessions = false). Не даёт временным файлам оседать на диске между запусками менеджера, при этом авторизация в интерфейсах сохраняется."/>
+            <CheckBox x:Name="FirefoxCleanRemovedServerContainersBox" Margin="0,16,0,0" Content="Очистка данных удалённых серверов"/>
+            <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="При удалении сессии или сервера из менеджера удаляет ассоциированный контейнер через browser.contextualIdentities.remove(cookieStoreId). Очищает изолированные куки, IndexedDB и localStorage удалённых серверов, убирает «мертвые» контейнеры из меню Firefox."/>
           </StackPanel>
         </GroupBox>
 
@@ -85,7 +99,6 @@
                        Text="По умолчанию включено. При проверке выбранных узлов карты уже сохранённые пары пропускаются. Обычные проверки связей эта настройка не ограничивает."/>
           </StackPanel>
         </GroupBox>
-
       </StackPanel>
     </ScrollViewer>
     <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">

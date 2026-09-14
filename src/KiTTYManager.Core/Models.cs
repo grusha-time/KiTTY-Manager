@@ -28,6 +28,19 @@ public sealed class ManagerConfig
     public bool RaceBestEntryPoints { get; set; }
     public bool SkipExistingLinksInMapCheck { get; set; } = true;
     public bool OfferStartMissingJumphosts { get; set; } = true;
+    public bool FirefoxOptimizeRamCache { get; set; } = true;
+    public bool FirefoxDisableSafeBrowsing { get; set; } = true;
+    public bool FirefoxDisableHistoryAndIcons { get; set; } = true;
+    public bool FirefoxClearCacheOnShutdown { get; set; } = true;
+    public bool FirefoxCleanRemovedServerContainers { get; set; } = true;
+    public List<FirefoxContainerCleanupTask> PendingFirefoxContainerCleanups { get; set; } = [];
+}
+
+public sealed class FirefoxContainerCleanupTask
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public Guid ServerId { get; set; }
+    public Guid? WebId { get; set; }
 }
 
 public sealed class ServerGroup
