@@ -43,7 +43,7 @@
                    Text="Запись выполняется после кнопки «Сохранить изменения» и только в папку KiTTY рядом с менеджером."/>
         <CheckBox x:Name="CloseWebTunnelBox" Margin="0,20,0,0" Content="Закрывать консоль веб-туннеля после закрытия Firefox"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                   Text="По умолчанию выключено: консоль KiTTY остаётся открытой, пока вы не закроете её вручную."/>
+                   Text="По умолчанию выключено: консоль KiTTY остаётся открытой. При включении закрытие последней вкладки контейнера в Firefox автоматически закрывает консоль и освобождает туннель."/>
         <CheckBox x:Name="AutoConfirmHostKeysBox" Margin="0,20,0,0" Content="Автоматически доверять новым и изменённым SSH host key"/>
         <TextBlock Margin="24,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                    Text="Новые и изменённые ключи принимаются без диалога и сохраняются после успешного подключения. Отключите настройку, если хотите сверять каждый новый или изменившийся отпечаток вручную."/>

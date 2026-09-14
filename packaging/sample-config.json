@@ -7,7 +7,9 @@
   "KittyPath": "KiTTY\\kitty.exe",
   "FirefoxPath": "firefox.exe",
   "WinScpPath": "",
-  "FirefoxProfile": "kitty-manager",
+  "AutoDiscoverFirefoxProfile": true,
+  "FirefoxTemplateProfile": "",
+  "CloseWebTunnelWithFirefox": false,
   "ConnectionTimeoutSeconds": 10,
   "TaskConnectionRecoveryMinutes": 1,
   "OfferStartMissingJumphosts": true
