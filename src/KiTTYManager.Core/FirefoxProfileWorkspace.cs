@@ -39,7 +39,8 @@ public static class FirefoxProfileWorkspace
         bool optimizeRamCache = true,
         bool disableSafeBrowsing = true,
         bool disableHistoryAndIcons = true,
-        bool clearCacheOnShutdown = true)
+        bool clearCacheOnShutdown = true,
+        bool acceptInsecureCerts = true)
     {
         // The browser must be stopped. Keep normal profile migrations enabled.
         // No installation-wide policies, shared Firefox files or certificate bypass.
@@ -106,6 +107,7 @@ public static class FirefoxProfileWorkspace
             ["dom.security.https_only_mode"] = "false",
             ["remote.prefs.recommended"] = "false",
             ["marionette.port"] = marionettePort.ToString(),
+            ["security.enterprise_roots.enabled"] = acceptInsecureCerts ? "true" : "false",
             ["signon.rememberSignons"] = "true",
             ["services.sync.engine.passwords"] = "false",
             ["identity.fxaccounts.enabled"] = "false"

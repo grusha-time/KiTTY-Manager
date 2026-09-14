@@ -12,5 +12,6 @@
   "CloseWebTunnelWithFirefox": false,
   "ConnectionTimeoutSeconds": 10,
   "TaskConnectionRecoveryMinutes": 1,
-  "OfferStartMissingJumphosts": true
+  "OfferStartMissingJumphosts": true,
+  "FirefoxAcceptInsecureCerts": true
 }

@@ -33,6 +33,7 @@ public sealed class ManagerConfig
     public bool FirefoxDisableHistoryAndIcons { get; set; } = true;
     public bool FirefoxClearCacheOnShutdown { get; set; } = true;
     public bool FirefoxCleanRemovedServerContainers { get; set; } = true;
+    public bool FirefoxAcceptInsecureCerts { get; set; } = true;
     public List<FirefoxContainerCleanupTask> PendingFirefoxContainerCleanups { get; set; } = [];
 }
 

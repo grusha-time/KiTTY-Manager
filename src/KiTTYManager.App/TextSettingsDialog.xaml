@@ -52,6 +52,9 @@
             <CheckBox x:Name="FirefoxCleanRemovedServerContainersBox" Margin="0,16,0,0" Content="Очистка данных удалённых серверов"/>
             <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                        Text="При удалении сессии или сервера из менеджера удаляет ассоциированный контейнер через browser.contextualIdentities.remove(cookieStoreId). Очищает изолированные куки, IndexedDB и localStorage удалённых серверов, убирает «мертвые» контейнеры из меню Firefox."/>
+            <CheckBox x:Name="FirefoxAcceptInsecureCertsBox" Margin="0,16,0,0" Content="Автоматически принимать самоподписанные SSL-сертификаты"/>
+            <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="Автоматический пропуск предупреждений безопасности («Принять риск и продолжить») при переходе на веб-панели и сервисы с самоподписанными или недоверенными SSL/TLS-сертификатами. Включает доверие системным корням ОС и передаёт параметр acceptInsecureCerts в сессию управления браузером. Применяется при следующем запуске Firefox Containers."/>
           </StackPanel>
         </GroupBox>
 

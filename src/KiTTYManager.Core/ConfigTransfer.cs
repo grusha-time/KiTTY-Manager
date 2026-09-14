@@ -132,6 +132,7 @@ public static class ConfigTransfer
         config.FirefoxDisableHistoryAndIcons = true;
         config.FirefoxClearCacheOnShutdown = true;
         config.FirefoxCleanRemovedServerContainers = true;
+        config.FirefoxAcceptInsecureCerts = true;
         config.PendingFirefoxContainerCleanups = [];
     }
 
