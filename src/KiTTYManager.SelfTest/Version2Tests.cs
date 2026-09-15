@@ -2182,6 +2182,219 @@ internal sealed partial class SelfTestRunner
         Equal(false, BatchStepInteractionPolicy.DetermineSelectAllState(new List<BatchTaskStep>()));
     }
 
+    private static void ConnectivityGroupSelectionStateTests()
+    {
+        var rootGroup = new ServerGroup { Name = "G1" };
+        var sDirect = new ManagedServer { Name = "DirectEntry", Host = "10.0.0.1" };
+        sDirect.PreferredRoute = new CachedRoute { ServerIds = [sDirect.Id] };
+        var sDependent = new ManagedServer { Name = "Dep1", Host = "10.0.0.2" };
+        var sDependent2 = new ManagedServer { Name = "Dep2", Host = "10.0.0.3" };
+        rootGroup.Servers.AddRange([sDirect, sDependent, sDependent2]);
+
+        var externalSource = new ManagedServer { Name = "SourceA", Host = "192.168.1.1" };
+        var config = new ManagerConfig
+        {
+            Groups = [rootGroup],
+            UngroupedServers = [externalSource]
+        };
+
+        // 1. При включенном фильтре независимых серверов выбирается только sDirect
+        var state = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        state.ToggleGroup(rootGroup.Id, [sDirect.Id, sDependent.Id, sDependent2.Id]);
+        Equal(true, state.SelectedIds.Contains(sDirect.Id));
+        Equal(false, state.SelectedIds.Contains(sDependent.Id));
+        Equal(false, state.SelectedIds.Contains(sDependent2.Id));
+
+        // 2. При отключении фильтра независимых серверов выбираются все серверы группы
+        state.FilterIndependentGroupServers = false;
+        Equal(true, state.SelectedIds.Contains(sDirect.Id));
+        Equal(true, state.SelectedIds.Contains(sDependent.Id));
+        Equal(true, state.SelectedIds.Contains(sDependent2.Id));
+
+        // 3. Обратное включение фильтра оставляет только независимый сервер
+        state.FilterIndependentGroupServers = true;
+        Equal(true, state.SelectedIds.Contains(sDirect.Id));
+        Equal(false, state.SelectedIds.Contains(sDependent.Id));
+        Equal(false, state.SelectedIds.Contains(sDependent2.Id));
+
+        // 4. Ручное добавление зависимого сервера
+        state.ToggleServer(sDependent.Id);
+        Equal(true, state.SelectedIds.Contains(sDirect.Id));
+        Equal(true, state.SelectedIds.Contains(sDependent.Id));
+        Equal(false, state.SelectedIds.Contains(sDependent2.Id));
+
+        // 5. Fallback: группа без независимых серверов выбирает всех
+        var fallbackGroup = new ServerGroup { Name = "G2" };
+        var sNoDirect1 = new ManagedServer { Name = "ND1", Host = "10.1.0.1" };
+        var sNoDirect2 = new ManagedServer { Name = "ND2", Host = "10.1.0.2" };
+        fallbackGroup.Servers.AddRange([sNoDirect1, sNoDirect2]);
+        config.Groups.Add(fallbackGroup);
+
+        var state2 = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        state2.ToggleGroup(fallbackGroup.Id, [sNoDirect1.Id, sNoDirect2.Id]);
+        Equal(true, state2.SelectedIds.Contains(sNoDirect1.Id));
+        Equal(true, state2.SelectedIds.Contains(sNoDirect2.Id));
+
+        // 6. Повторный клик по отфильтрованной группе снимает выбор
+        var stateRepeat = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        stateRepeat.ToggleGroup(rootGroup.Id, [sDirect.Id, sDependent.Id, sDependent2.Id]);
+        Equal(true, stateRepeat.SelectedIds.Contains(sDirect.Id));
+        stateRepeat.ToggleGroup(rootGroup.Id, [sDirect.Id, sDependent.Id, sDependent2.Id]);
+        Equal(false, stateRepeat.SelectedIds.Contains(sDirect.Id));
+        Equal(false, stateRepeat.SelectedIds.Contains(sDependent.Id));
+
+        // 7. Аддитивное добавление серверов (SelectVisible)
+        var stateAdditive = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        stateAdditive.ToggleServer(sDirect.Id);
+        Equal(true, stateAdditive.SelectedIds.Contains(sDirect.Id));
+        Equal(false, stateAdditive.SelectedIds.Contains(sDependent.Id));
+        stateAdditive.AddServers([sDirect.Id, sDependent.Id]);
+        Equal(true, stateAdditive.SelectedIds.Contains(sDirect.Id));
+        Equal(true, stateAdditive.SelectedIds.Contains(sDependent.Id));
+
+        // 8. Вложенные группы: снятие дочерней группы при выбранном родителе
+        var parentGroup = new ServerGroup { Name = "Parent" };
+        var childGroup = new ServerGroup { Name = "Child" };
+        var sP1 = new ManagedServer { Name = "P1", Host = "10.2.0.1" };
+        var sC1 = new ManagedServer { Name = "C1", Host = "10.2.0.2" };
+        parentGroup.Servers.Add(sP1);
+        childGroup.Servers.Add(sC1);
+        parentGroup.Groups.Add(childGroup);
+        config.Groups.Add(parentGroup);
+
+        var stateNested = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: false);
+        stateNested.ToggleGroup(parentGroup.Id, [sP1.Id, sC1.Id]);
+        Equal(true, stateNested.SelectedIds.Contains(sP1.Id));
+        Equal(true, stateNested.SelectedIds.Contains(sC1.Id));
+        // Снимаем дочернюю группу
+        stateNested.ToggleGroup(childGroup.Id, [sC1.Id]);
+        Equal(true, stateNested.SelectedIds.Contains(sP1.Id));
+        Equal(false, stateNested.SelectedIds.Contains(sC1.Id));
+
+        // 9. Источник внутри группы не превращает внутренний линк во внешний и исключается из целей
+        var stateInside = new ConnectivityGroupSelectionState(config, [], sDirect.Id, filterIndependentGroupServers: true);
+        stateInside.ToggleGroup(rootGroup.Id, [sDirect.Id, sDependent.Id, sDependent2.Id]);
+        Equal(false, stateInside.SelectedIds.Contains(sDirect.Id));
+        // Для sDependent и sDependent2 независимых нет (sDirect - источник), fallback на оставшиеся в группе
+        Equal(true, stateInside.SelectedIds.Contains(sDependent.Id));
+        Equal(true, stateInside.SelectedIds.Contains(sDependent2.Id));
+
+        // 10. Поиск в «Без группы»: при передаче отфильтрованного состава строки выбираются только они
+        var u1 = new ManagedServer { Name = "U1", Host = "10.3.0.1" };
+        var u2 = new ManagedServer { Name = "U2", Host = "10.3.0.2" };
+        config.UngroupedServers.AddRange([u1, u2]);
+        var stateUngrouped = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: false);
+        // При поиске строка передаёт только найденный u1
+        stateUngrouped.ToggleGroup(Guid.Empty, [u1.Id]);
+        Equal(true, stateUngrouped.SelectedIds.Contains(u1.Id));
+        Equal(false, stateUngrouped.SelectedIds.Contains(u2.Id));
+
+        // 11. Очистка состояния Clear при 0 выбранных серверах
+        var stateClear = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        stateClear.ToggleGroup(rootGroup.Id, [sDirect.Id, sDependent.Id, sDependent2.Id]);
+        stateClear.ToggleServer(sDirect.Id); // Сняли вручную единственный выбранный независимый сервер
+        Equal(0, stateClear.SelectedIds.Count);
+        stateClear.Clear(); // Очистили состояние
+        stateClear.FilterIndependentGroupServers = false; // Отключение фильтра не должно возвращать зависимые серверы
+        Equal(0, stateClear.SelectedIds.Count);
+
+        // 12. Смена поиска не сбрасывает ранее выбранные серверы при добавлении новых через «Без группы»
+        var stateSearchMulti = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: false);
+        stateSearchMulti.ToggleGroup(Guid.Empty, [u1.Id]); // нашли U1, кликнули «Без группы»
+        Equal(true, stateSearchMulti.SelectedIds.Contains(u1.Id));
+        stateSearchMulti.ToggleGroup(Guid.Empty, [u2.Id]); // нашли U2, кликнули «Без группы»
+        Equal(true, stateSearchMulti.SelectedIds.Contains(u1.Id));
+        Equal(true, stateSearchMulti.SelectedIds.Contains(u2.Id));
+
+        // 13. Поиск не превращает внутреннюю связь UngroupedServers во внешнюю
+        var u3 = new ManagedServer { Name = "U3", Host = "10.3.0.3" };
+        // Связь U3 -> U2 (внутренняя связь между серверами Без группы)
+        config.UngroupedServers.Add(u3);
+        config.Links.Add(new ServerLink
+        {
+            FromServerId = u3.Id,
+            ToServerId = u2.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        });
+        var stateSearchInternalLink = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        // При поиске видны только U1 и U2 (U3 скрыт фильтром поиска)
+        stateSearchInternalLink.ToggleGroup(Guid.Empty, [u1.Id, u2.Id]);
+        // U2 не должен ошибочно считаться независимым из-за скрытого U3 (U3 входит в полный состав UngroupedServers)
+        // Так как ни U1 ни U2 независимыми не являются (нет прямого маршрута и внешних связей), срабатывает fallback на видимые цели
+        Equal(true, stateSearchInternalLink.SelectedIds.Contains(u1.Id));
+        Equal(true, stateSearchInternalLink.SelectedIds.Contains(u2.Id));
+
+        // 14. Скрытый независимый сервер при поиске: зависимый не выбирается по ложному fallback
+        var testGroup = new ServerGroup { Name = "TG" };
+        var tgIndep = new ManagedServer { Name = "TGIndep", Host = "10.4.0.1" };
+        tgIndep.PreferredRoute = new CachedRoute { ServerIds = [tgIndep.Id] };
+        var tgDep = new ManagedServer { Name = "TGDep", Host = "10.4.0.2" };
+        testGroup.Servers.AddRange([tgIndep, tgDep]);
+        config.Groups.Add(testGroup);
+
+        var stateHiddenIndep = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        // Поиск по "TGDep": получаем строку через ServerSelectionPolicy.Build
+        var rowsSearchDep = ServerSelectionPolicy.Build(config, stateHiddenIndep.SelectedIds, searchText: "TGDep", excludedServerId: externalSource.Id);
+        var groupRowDep = rowsSearchDep.First(r => r.IsGroup && r.GroupId == testGroup.Id);
+        stateHiddenIndep.ToggleGroup(groupRowDep.GroupId!.Value, groupRowDep.ServerIds);
+        // В группе TG есть независимый tgIndep, поэтому tgDep НЕ должен выбираться по fallback
+        Equal(false, stateHiddenIndep.SelectedIds.Contains(tgDep.Id));
+        Equal(false, stateHiddenIndep.SelectedIds.Contains(tgIndep.Id));
+
+        // Теперь при поиске найден "TGIndep": получаем строку через ServerSelectionPolicy.Build
+        var rowsSearchIndep = ServerSelectionPolicy.Build(config, stateHiddenIndep.SelectedIds, searchText: "TGIndep", excludedServerId: externalSource.Id);
+        var groupRowIndep = rowsSearchIndep.First(r => r.IsGroup && r.GroupId == testGroup.Id);
+        stateHiddenIndep.ToggleGroup(groupRowIndep.GroupId!.Value, groupRowIndep.ServerIds);
+        Equal(true, stateHiddenIndep.SelectedIds.Contains(tgIndep.Id));
+        Equal(false, stateHiddenIndep.SelectedIds.Contains(tgDep.Id));
+
+        // 15. Снятие найденной группы сбрасывает только найденные цели, сохраняя скрытые цели дочерней группы
+        var nestParent = new ServerGroup { Name = "NestParent" };
+        var nestChild = new ServerGroup { Name = "NestChild" };
+        var sA = new ManagedServer { Name = "ServerA", Host = "10.5.0.1" };
+        var sB = new ManagedServer { Name = "ServerB", Host = "10.5.0.2" };
+        nestChild.Servers.AddRange([sA, sB]);
+        nestParent.Groups.Add(nestChild);
+        config.Groups.Add(nestParent);
+
+        var stateNestSearch = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: false);
+        // Выбираем дочернюю группу без поиска (выбраны sA и sB)
+        var rowsAll = ServerSelectionPolicy.Build(config, stateNestSearch.SelectedIds, searchText: "", excludedServerId: externalSource.Id);
+        var childRow = rowsAll.First(r => r.IsGroup && r.GroupId == nestChild.Id);
+        stateNestSearch.ToggleGroup(childRow.GroupId!.Value, childRow.ServerIds);
+        Equal(true, stateNestSearch.SelectedIds.Contains(sA.Id));
+        Equal(true, stateNestSearch.SelectedIds.Contains(sB.Id));
+
+        // Ищем ServerA: строка родительской группы содержит только ServerA
+        var rowsSearchA = ServerSelectionPolicy.Build(config, stateNestSearch.SelectedIds, searchText: "ServerA", excludedServerId: externalSource.Id);
+        var parentRowSearchA = rowsSearchA.First(r => r.IsGroup && r.GroupId == nestParent.Id);
+        // Снимаем родительскую группу при активном поиске по ServerA
+        stateNestSearch.ToggleGroup(parentRowSearchA.GroupId!.Value, parentRowSearchA.ServerIds);
+        // ServerA должен быть снят, а скрытый ServerB должен остаться выбранным
+        Equal(false, stateNestSearch.SelectedIds.Contains(sA.Id));
+        Equal(true, stateNestSearch.SelectedIds.Contains(sB.Id));
+
+        // 16. Снятие отмеченной группы, когда поиск скрыл независимые серверы, а зависимый выбран вручную
+        var groupWithIndepAndDep = new ServerGroup { Name = "IndepAndDep" };
+        var sIndepX = new ManagedServer { Name = "IndepX", Host = "10.6.0.1" };
+        sIndepX.PreferredRoute = new CachedRoute { ServerIds = [sIndepX.Id] };
+        var sDepY = new ManagedServer { Name = "DepY", Host = "10.6.0.2" };
+        groupWithIndepAndDep.Servers.AddRange([sIndepX, sDepY]);
+        config.Groups.Add(groupWithIndepAndDep);
+
+        var stateManualDep = new ConnectivityGroupSelectionState(config, [], externalSource.Id, filterIndependentGroupServers: true);
+        // Вручную выбираем sDepY
+        stateManualDep.ToggleServer(sDepY.Id);
+        Equal(true, stateManualDep.SelectedIds.Contains(sDepY.Id));
+
+        // Ищем DepY: строка группы содержит только DepY (sIndepX скрыт поиском)
+        var rowsSearchDepY = ServerSelectionPolicy.Build(config, stateManualDep.SelectedIds, searchText: "DepY", excludedServerId: externalSource.Id);
+        var groupRowDepY = rowsSearchDepY.First(r => r.IsGroup && r.GroupId == groupWithIndepAndDep.Id);
+        // Нажимаем по отмеченной строке группы: sDepY должен сняться
+        stateManualDep.ToggleGroup(groupRowDepY.GroupId!.Value, groupRowDepY.ServerIds);
+        Equal(false, stateManualDep.SelectedIds.Contains(sDepY.Id));
+    }
+
     private sealed class ChunkedMemoryStream(byte[] buffer, int chunkSize) : MemoryStream(buffer)
     {
         public override bool CanSeek => false;

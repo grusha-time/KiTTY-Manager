@@ -7,7 +7,8 @@ public sealed record ServerSelectionRow(
     string Details,
     int Depth,
     bool IsGroup,
-    bool? IsChecked);
+    bool? IsChecked,
+    Guid? GroupId = null);
 
 public static class ServerSelectionPolicy
 {
@@ -28,7 +29,7 @@ public static class ServerSelectionPolicy
             .ToArray();
         if (ungrouped.Length > 0)
         {
-            AddGroupRow(rows, "Без группы", 0, ungrouped.Select(server => server.Id).ToArray(), selectedIds);
+            AddGroupRow(rows, "Без группы", 0, ungrouped.Select(server => server.Id).ToArray(), selectedIds, Guid.Empty);
             foreach (var server in ungrouped)
                 AddServerRow(rows, server, "Без группы", 1, selectedIds);
         }
@@ -51,18 +52,21 @@ public static class ServerSelectionPolicy
 
         var allIds = AllServerIds(group).Where(id => id != excludedServerId).ToArray();
         if (allIds.Length == 0) return false;
-        AddGroupRow(rows, group.Name, depth, allIds, selectedIds);
+        var rowIds = string.IsNullOrEmpty(search) || groupMatches
+            ? allIds
+            : visibleServers.Select(s => s.Id).Concat(childRows.Where(r => !r.IsGroup).SelectMany(r => r.ServerIds)).Distinct().ToArray();
+        AddGroupRow(rows, group.Name, depth, rowIds, selectedIds, group.Id);
         foreach (var server in visibleServers) AddServerRow(rows, server, path, depth + 1, selectedIds);
         rows.AddRange(childRows);
         return true;
     }
 
     private static void AddGroupRow(List<ServerSelectionRow> rows, string name, int depth,
-        Guid[] serverIds, IReadOnlySet<Guid> selectedIds)
+        Guid[] serverIds, IReadOnlySet<Guid> selectedIds, Guid? groupId = null)
     {
         var selected = serverIds.Count(selectedIds.Contains);
         rows.Add(new(null, serverIds, name, $"Сессий: {serverIds.Length}", depth, true,
-            selected == 0 ? false : selected == serverIds.Length ? true : null));
+            selected == 0 ? false : selected == serverIds.Length ? true : null, groupId));
     }
 
     private static void AddServerRow(List<ServerSelectionRow> rows, ManagedServer server,

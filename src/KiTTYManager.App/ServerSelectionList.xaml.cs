@@ -14,6 +14,7 @@ public partial class ServerSelectionList : UserControl
 {
     private ManagerConfig? config;
     private Guid? excludedServerId;
+    private ConnectivityGroupSelectionState? groupSelectionState;
     private readonly HashSet<Guid> selectedIds = [];
     private bool refreshing;
 
@@ -22,19 +23,48 @@ public partial class ServerSelectionList : UserControl
 
     public ServerSelectionList() => InitializeComponent();
 
-    public void Configure(ManagerConfig value, IEnumerable<Guid> selected, Guid? excluded = null)
+    public void Configure(ManagerConfig value, IEnumerable<Guid> selected, Guid? excluded = null, bool supportGroupState = false, bool filterIndependentGroupServers = true)
     {
         config = value;
         excludedServerId = excluded;
-        selectedIds.Clear();
-        selectedIds.UnionWith(selected.Where(id => id != excluded));
+        if (supportGroupState)
+        {
+            groupSelectionState = new ConnectivityGroupSelectionState(value, selected, excluded, filterIndependentGroupServers);
+            selectedIds.Clear();
+            selectedIds.UnionWith(groupSelectionState.SelectedIds);
+        }
+        else
+        {
+            groupSelectionState = null;
+            selectedIds.Clear();
+            selectedIds.UnionWith(selected.Where(id => id != excluded));
+        }
         RefreshRows();
+    }
+
+    public void SetFilterIndependentGroupServers(bool filter)
+    {
+        if (groupSelectionState is null) return;
+        groupSelectionState.FilterIndependentGroupServers = filter;
+        selectedIds.Clear();
+        selectedIds.UnionWith(groupSelectionState.SelectedIds);
+        RefreshRows();
+        RaiseSelectionChanged();
     }
 
     public void SetSelected(IEnumerable<Guid> selected)
     {
-        selectedIds.Clear();
-        selectedIds.UnionWith(selected.Where(id => id != excludedServerId));
+        if (groupSelectionState is not null)
+        {
+            groupSelectionState.SetExplicitSelection(selected);
+            selectedIds.Clear();
+            selectedIds.UnionWith(groupSelectionState.SelectedIds);
+        }
+        else
+        {
+            selectedIds.Clear();
+            selectedIds.UnionWith(selected.Where(id => id != excludedServerId));
+        }
         RefreshRows();
         RaiseSelectionChanged();
     }
@@ -61,21 +91,50 @@ public partial class ServerSelectionList : UserControl
     {
         if (refreshing || ItemsControl.ContainerFromElement(ChoicesList, e.OriginalSource as DependencyObject)
             is not ListBoxItem { DataContext: DisplayRow row }) return;
-        Toggle(row.ServerIds);
+
+        if (groupSelectionState is not null)
+        {
+            if (row.IsGroup && row.GroupId.HasValue)
+                groupSelectionState.ToggleGroup(row.GroupId.Value, row.ServerIds);
+            else if (!row.IsGroup && row.ServerId.HasValue)
+                groupSelectionState.ToggleServer(row.ServerId.Value);
+            else
+                Toggle(row.ServerIds);
+
+            selectedIds.Clear();
+            selectedIds.UnionWith(groupSelectionState.SelectedIds);
+            RefreshRows();
+            RaiseSelectionChanged();
+        }
+        else
+        {
+            Toggle(row.ServerIds);
+        }
         e.Handled = true;
     }
 
     private void SelectVisible_Click(object sender, RoutedEventArgs e)
     {
-        foreach (var row in ChoicesList.Items.OfType<DisplayRow>().Where(row => !row.IsGroup))
-            selectedIds.UnionWith(row.ServerIds);
+        var visibleIds = ChoicesList.Items.OfType<DisplayRow>().Where(row => !row.IsGroup)
+            .SelectMany(row => row.ServerIds).ToArray();
+        if (groupSelectionState is not null)
+        {
+            groupSelectionState.AddServers(visibleIds);
+            selectedIds.Clear();
+            selectedIds.UnionWith(groupSelectionState.SelectedIds);
+        }
+        else
+        {
+            selectedIds.UnionWith(visibleIds);
+        }
         RefreshRows();
         RaiseSelectionChanged();
     }
 
     private void ClearAll_Click(object sender, RoutedEventArgs e)
     {
-        if (selectedIds.Count == 0) return;
+        if (groupSelectionState is null && selectedIds.Count == 0) return;
+        groupSelectionState?.Clear();
         selectedIds.Clear();
         RefreshRows();
         RaiseSelectionChanged();
@@ -95,6 +154,7 @@ public partial class ServerSelectionList : UserControl
     private sealed class DisplayRow
     {
         public Guid? ServerId { get; }
+        public Guid? GroupId { get; }
         public IReadOnlyList<Guid> ServerIds { get; }
         public string Name { get; }
         public string Details { get; }
@@ -107,6 +167,7 @@ public partial class ServerSelectionList : UserControl
         public DisplayRow(ServerSelectionRow row)
         {
             ServerId = row.ServerId;
+            GroupId = row.GroupId;
             ServerIds = row.ServerIds;
             Name = row.Name;
             Details = row.Details;

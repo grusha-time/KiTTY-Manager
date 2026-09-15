@@ -80,6 +80,7 @@ internal sealed partial class SelfTestRunner
         Test("Сравнение файлов учитывает короткие чтения, хвост и отмену", BatchFileComparisonWithFragmentedReads);
         Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);
         Test("Миграция schema 9 сохраняет данные и сбрасывает только старые InternalOnly", Schema9MigrationPreservesUserData);
+        Test("Выбор только независимых серверов группы при построении связей", ConnectivityGroupSelectionStateTests);
         Test("Версия продукта 2.0.0 и схема 9", Version2Metadata);
         Test("Миграция схемы 7 в 8 сохраняет старые данные", Version2SchemaMigration);
         Test("Таймаут подключения допускает минимум 3 секунды", Version2ConnectionTimeoutMinimum);
