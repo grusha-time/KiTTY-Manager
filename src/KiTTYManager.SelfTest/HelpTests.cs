@@ -37,5 +37,6 @@ internal sealed partial class SelfTestRunner
         var appGroup = HelpContent.Search("", "Настройки — Поведение приложения и KiTTY");
         Equal(true, appGroup.Any(e => e.Title.Contains("трей")));
         Equal(true, appGroup.Any(e => e.Title.Contains("журнал")));
+        Equal(true, appGroup.Any(e => e.Title.Contains("развёрнутыми")));
     }
 }

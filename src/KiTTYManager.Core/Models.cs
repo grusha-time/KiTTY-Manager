@@ -17,6 +17,7 @@ public sealed class ManagerConfig
     public bool CloseToTray { get; set; }
     public bool EnableLogging { get; set; }
     public bool WriteChangesImmediatelyToKitty { get; set; }
+    public bool MaximizeKittyWindows { get; set; }
     public bool CloseWebTunnelWithFirefox { get; set; }
     public bool AutoDiscoverFirefoxProfile { get; set; } = true;
     public string FirefoxTemplateProfile { get; set; } = "";
