@@ -1,6 +1,9 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using KiTTYManager.Core;
@@ -244,6 +247,7 @@ internal sealed partial class SelfTestRunner
                 Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown.sessions\", false);"));
                 Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown_v2.cache\", true);"));
                 Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown_v2.cookiesAndStorage\", false);"));
+                Equal(true, content.Contains("user_pref(\"security.enterprise_roots.enabled\", true);"));
             }
 
             // 2. Disabled flags (all false)
@@ -251,7 +255,8 @@ internal sealed partial class SelfTestRunner
                 optimizeRamCache: false,
                 disableSafeBrowsing: false,
                 disableHistoryAndIcons: false,
-                clearCacheOnShutdown: false);
+                clearCacheOnShutdown: false,
+                acceptInsecureCerts: false);
             foreach (var name in new[] { "prefs.js", "user.js" })
             {
                 var content = File.ReadAllText(Path.Combine(profile, name));
@@ -265,6 +270,7 @@ internal sealed partial class SelfTestRunner
                 Equal(true, content.Contains("user_pref(\"privacy.sanitize.sanitizeOnShutdown\", false);"));
                 Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown.cache\", false);"));
                 Equal(true, content.Contains("user_pref(\"privacy.clearOnShutdown_v2.cache\", false);"));
+                Equal(true, content.Contains("user_pref(\"security.enterprise_roots.enabled\", false);"));
             }
 
             // 3. Cycle back to enabled: verify no duplicate lines
@@ -272,7 +278,8 @@ internal sealed partial class SelfTestRunner
                 optimizeRamCache: true,
                 disableSafeBrowsing: true,
                 disableHistoryAndIcons: true,
-                clearCacheOnShutdown: true);
+                clearCacheOnShutdown: true,
+                acceptInsecureCerts: true);
             foreach (var name in new[] { "prefs.js", "user.js" })
             {
                 var lines = File.ReadAllLines(Path.Combine(profile, name));
@@ -280,6 +287,8 @@ internal sealed partial class SelfTestRunner
                 Equal(1, lines.Count(l => l.Contains("\"browser.safebrowsing.malware.enabled\"")));
                 Equal(1, lines.Count(l => l.Contains("\"places.history.enabled\"")));
                 Equal(1, lines.Count(l => l.Contains("\"privacy.sanitize.sanitizeOnShutdown\"")));
+                Equal(1, lines.Count(l => l.Contains("\"security.enterprise_roots.enabled\"")));
+                Equal(true, lines.Any(l => l.Contains("user_pref(\"security.enterprise_roots.enabled\", true);")));
             }
         }
         finally { Directory.Delete(root, true); }
@@ -361,6 +370,7 @@ internal sealed partial class SelfTestRunner
         Equal(true, config.FirefoxDisableHistoryAndIcons);
         Equal(true, config.FirefoxClearCacheOnShutdown);
         Equal(true, config.FirefoxCleanRemovedServerContainers);
+        Equal(true, config.FirefoxAcceptInsecureCerts);
         Equal(0, config.PendingFirefoxContainerCleanups.Count);
 
         // 2. Deserialization from JSON without new fields defaults to true
@@ -371,6 +381,7 @@ internal sealed partial class SelfTestRunner
         Equal(true, deserialized.FirefoxDisableHistoryAndIcons);
         Equal(true, deserialized.FirefoxClearCacheOnShutdown);
         Equal(true, deserialized.FirefoxCleanRemovedServerContainers);
+        Equal(true, deserialized.FirefoxAcceptInsecureCerts);
 
         // 3. Saved false values are preserved
         var customJson = JsonSerializer.Serialize(new ManagerConfig
@@ -379,7 +390,8 @@ internal sealed partial class SelfTestRunner
             FirefoxDisableSafeBrowsing = false,
             FirefoxDisableHistoryAndIcons = false,
             FirefoxClearCacheOnShutdown = false,
-            FirefoxCleanRemovedServerContainers = false
+            FirefoxCleanRemovedServerContainers = false,
+            FirefoxAcceptInsecureCerts = false
         });
         var loadedCustom = JsonSerializer.Deserialize<ManagerConfig>(customJson)!;
         Equal(false, loadedCustom.FirefoxOptimizeRamCache);
@@ -387,6 +399,7 @@ internal sealed partial class SelfTestRunner
         Equal(false, loadedCustom.FirefoxDisableHistoryAndIcons);
         Equal(false, loadedCustom.FirefoxClearCacheOnShutdown);
         Equal(false, loadedCustom.FirefoxCleanRemovedServerContainers);
+        Equal(false, loadedCustom.FirefoxAcceptInsecureCerts);
 
         // 4. ConfigTransfer.CreateExport resets options and empties pending queue
         var srvId = Guid.NewGuid();
@@ -394,9 +407,11 @@ internal sealed partial class SelfTestRunner
         config.UngroupedServers.Add(testServer);
         config.PendingFirefoxContainerCleanups.Add(new FirefoxContainerCleanupTask { ServerId = srvId });
         config.FirefoxOptimizeRamCache = false;
+        config.FirefoxAcceptInsecureCerts = false;
         var exported = ConfigTransfer.CreateExport(config, [srvId], true);
         Equal(true, exported.FirefoxOptimizeRamCache);
         Equal(true, exported.FirefoxDisableSafeBrowsing);
+        Equal(true, exported.FirefoxAcceptInsecureCerts);
         Equal(0, exported.PendingFirefoxContainerCleanups.Count);
     }
 
@@ -495,6 +510,308 @@ internal sealed partial class SelfTestRunner
         process.WaitForExit(5000);
         if (process.ExitCode != 0)
             throw new Exception("Extension purge Node check failed: " + stderr);
+    }
+
+    internal static void FirefoxAcceptInsecureCertsProtocolAndTlsTest()
+    {
+        CheckMarionetteAcceptInsecureCertsProtocolAsync().GetAwaiter().GetResult();
+        var firefoxCandidate = FindFirefoxCandidate();
+        if (firefoxCandidate != null)
+            CheckFirefoxContainerHttpsSelfSignedAsync(firefoxCandidate).GetAwaiter().GetResult();
+    }
+
+    private static async Task CheckMarionetteAcceptInsecureCertsProtocolAsync()
+    {
+        // 1. Test acceptInsecureCerts = true: verifies flat { acceptInsecureCerts: true }, ack, and session retention (no DeleteSession)
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            var serverTask = Task.Run(async () =>
+            {
+                using var client = await listener.AcceptTcpClientAsync(cts.Token);
+                var stream = client.GetStream();
+                await SendMarionettePacketAsync(stream, "{\"marionetteProtocol\":3}", cts.Token);
+
+                // Read command 1: WebDriver:NewSession
+                var cmd1 = await ReadMarionettePacketAsync(stream, cts.Token);
+                Equal(0, cmd1[0].GetInt32());
+                Equal(1, cmd1[1].GetInt32());
+                Equal("WebDriver:NewSession", cmd1[2].GetString());
+                var p1 = cmd1[3];
+                Equal(false, p1.TryGetProperty("capabilities", out _));
+                Equal(true, p1.GetProperty("acceptInsecureCerts").GetBoolean());
+
+                await SendMarionettePacketAsync(stream, "[1,1,null,{\"sessionId\":\"sess-1\",\"capabilities\":{\"acceptInsecureCerts\":true}}]", cts.Token);
+
+                // Read command 2: Addon:Install
+                var cmd2 = await ReadMarionettePacketAsync(stream, cts.Token);
+                Equal(0, cmd2[0].GetInt32());
+                Equal(2, cmd2[1].GetInt32());
+                Equal("Addon:Install", cmd2[2].GetString());
+                await SendMarionettePacketAsync(stream, "[1,2,null,{\"value\":\"ext-id\"}]", cts.Token);
+
+                // No DeleteSession should be received when acceptInsecureCerts = true.
+                await Task.Delay(100, cts.Token);
+            });
+
+            using var clientTcp = new TcpClient();
+            await clientTcp.ConnectAsync(IPAddress.Loopback, port, cts.Token);
+            var traces = new List<string>();
+            await FirefoxContainerBrowser.InitializeSessionAsync(
+                clientTcp.GetStream(),
+                "dummy.xpi",
+                headless: false,
+                acceptInsecureCerts: true,
+                trace: traces.Add,
+                cts.Token);
+
+            await serverTask;
+            Equal(false, traces.Any(t => t.Contains("warning: acceptInsecureCerts not acknowledged")));
+        }
+
+        // 2. Test acceptInsecureCerts = true with unacknowledged capability: verifies warning trace
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            var serverTask = Task.Run(async () =>
+            {
+                using var client = await listener.AcceptTcpClientAsync(cts.Token);
+                var stream = client.GetStream();
+                await SendMarionettePacketAsync(stream, "{\"marionetteProtocol\":3}", cts.Token);
+                var cmd1 = await ReadMarionettePacketAsync(stream, cts.Token);
+                // Return acceptInsecureCerts: false in capabilities
+                await SendMarionettePacketAsync(stream, "[1,1,null,{\"sessionId\":\"sess-warn\",\"capabilities\":{\"acceptInsecureCerts\":false}}]", cts.Token);
+                var cmd2 = await ReadMarionettePacketAsync(stream, cts.Token);
+                await SendMarionettePacketAsync(stream, "[1,2,null,{\"value\":\"ext-id\"}]", cts.Token);
+            });
+
+            using var clientTcp = new TcpClient();
+            await clientTcp.ConnectAsync(IPAddress.Loopback, port, cts.Token);
+            var traces = new List<string>();
+            await FirefoxContainerBrowser.InitializeSessionAsync(
+                clientTcp.GetStream(),
+                "dummy.xpi",
+                headless: false,
+                acceptInsecureCerts: true,
+                trace: traces.Add,
+                cts.Token);
+
+            await serverTask;
+            Equal(true, traces.Any(t => t.Contains("warning: acceptInsecureCerts not acknowledged")));
+        }
+
+        // 3. Test acceptInsecureCerts = false: verifies flat { acceptInsecureCerts: false } and presence of WebDriver:DeleteSession
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+            var serverTask = Task.Run(async () =>
+            {
+                using var client = await listener.AcceptTcpClientAsync(cts.Token);
+                var stream = client.GetStream();
+                await SendMarionettePacketAsync(stream, "{\"marionetteProtocol\":3}", cts.Token);
+
+                var cmd1 = await ReadMarionettePacketAsync(stream, cts.Token);
+                Equal(0, cmd1[0].GetInt32());
+                Equal(1, cmd1[1].GetInt32());
+                Equal("WebDriver:NewSession", cmd1[2].GetString());
+                var p1 = cmd1[3];
+                Equal(false, p1.TryGetProperty("capabilities", out _));
+                Equal(false, p1.GetProperty("acceptInsecureCerts").GetBoolean());
+
+                await SendMarionettePacketAsync(stream, "[1,1,null,{\"sessionId\":\"sess-false\",\"capabilities\":{\"acceptInsecureCerts\":false}}]", cts.Token);
+
+                var cmd2 = await ReadMarionettePacketAsync(stream, cts.Token);
+                Equal(0, cmd2[0].GetInt32());
+                Equal(2, cmd2[1].GetInt32());
+                await SendMarionettePacketAsync(stream, "[1,2,null,{\"value\":\"ext-id\"}]", cts.Token);
+
+                var cmd3 = await ReadMarionettePacketAsync(stream, cts.Token);
+                Equal(0, cmd3[0].GetInt32());
+                Equal(3, cmd3[1].GetInt32());
+                Equal("WebDriver:DeleteSession", cmd3[2].GetString());
+                await SendMarionettePacketAsync(stream, "[1,3,null,{}]", cts.Token);
+            });
+
+            using var clientTcp = new TcpClient();
+            await clientTcp.ConnectAsync(IPAddress.Loopback, port, cts.Token);
+            var traces = new List<string>();
+            await FirefoxContainerBrowser.InitializeSessionAsync(
+                clientTcp.GetStream(),
+                "dummy.xpi",
+                headless: false,
+                acceptInsecureCerts: false,
+                trace: traces.Add,
+                cts.Token);
+
+            await serverTask;
+        }
+    }
+
+    private static string? FindFirefoxCandidate()
+    {
+        var candidates = new[]
+        {
+            Environment.GetEnvironmentVariable("KITTY_SMOKE_FIREFOX"),
+            "/root/test4/build/firefox-research/firefox/firefox",
+            "/usr/bin/firefox",
+            "/usr/bin/firefox-esr",
+            "/usr/local/bin/firefox"
+        };
+        return candidates.FirstOrDefault(c => !string.IsNullOrEmpty(c) && File.Exists(c));
+    }
+
+    private static async Task EnsureSeedProfileAsync(string executable, string source, string root)
+    {
+        Directory.CreateDirectory(source);
+        if (File.Exists(Path.Combine(source, "key4.db")) && File.Exists(Path.Combine(source, "cert9.db")))
+            return;
+
+        File.WriteAllText(Path.Combine(source, "user.js"),
+            "user_pref(\"browser.aboutwelcome.enabled\", false);\n" +
+            "user_pref(\"trailhead.firstrun.didSeeAboutWelcome\", true);\n" +
+            "user_pref(\"browser.startup.firstrunSkipsHomepage\", true);\n" +
+            "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\n" +
+            "user_pref(\"browser.startup.homepage_welcome_url\", \"\");\n" +
+            "user_pref(\"browser.startup.homepage_welcome_url.additional\", \"\");\n" +
+            "user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\n" +
+            "user_pref(\"datareporting.policy.firstRunURL\", \"\");\n" +
+            "user_pref(\"toolkit.telemetry.reportingpolicy.firstRun\", false);\n" +
+            "user_pref(\"browser.messaging-system.whatsNewPanel.enabled\", false);\n" +
+            "user_pref(\"doh-rollout.doneFirstRun\", true);\n" +
+            "user_pref(\"doh-rollout.enabled\", false);\n" +
+            "user_pref(\"app.update.auto\", false);\n" +
+            "user_pref(\"app.update.enabled\", false);\n" +
+            "user_pref(\"app.update.doorhanger\", false);\n" +
+            "user_pref(\"termsofuse.bypassNotification\", true);\n" +
+            "user_pref(\"dom.security.https_first\", false);\n" +
+            "user_pref(\"dom.security.https_only_mode\", false);\n" +
+            "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n");
+        var seed = new System.Diagnostics.ProcessStartInfo(executable) { UseShellExecute = false };
+        foreach (var arg in new[] { "-headless", "-no-remote", "-profile", source, "-screenshot",
+                     Path.Combine(root, "seed.png"), "about:blank" }) seed.ArgumentList.Add(arg);
+        using var process = System.Diagnostics.Process.Start(seed)!;
+        await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(45));
+        if (process.ExitCode != 0) throw new Exception("Seed Firefox failed");
+    }
+
+    private static async Task CheckFirefoxContainerHttpsSelfSignedAsync(string executable)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "kitty-firefox-https-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var source = Path.Combine(root, "source");
+            await EnsureSeedProfileAsync(executable, source, root);
+
+            using var rsa = RSA.Create(2048);
+            var req = new CertificateRequest("CN=same.test", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            var san = new SubjectAlternativeNameBuilder();
+            san.AddDnsName("same.test");
+            req.CertificateExtensions.Add(san.Build());
+            using var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
+            var pfx = new X509Certificate2(cert.Export(X509ContentType.Pfx));
+
+            using var direct = new DirectTrap();
+
+            // 1. acceptInsecureCerts = true: self-signed certificate is accepted, container tab loads
+            {
+                using var panel = new FakePanel("HTTPS_ACCEPTED", direct.Port, pfx);
+                using var browser = new FirefoxContainerBrowser();
+                await browser.StartAsync(executable, Path.Combine(root, "managed-accepted"),
+                    () => source, CancellationToken.None, headless: true, acceptInsecureCerts: true);
+                try
+                {
+                    await browser.Bridge.OpenAsync("s1", "Test Accepted", panel.Port, "https://same.test/", CancellationToken.None);
+                    var seen = await panel.Seen.Task.WaitAsync(TimeSpan.FromSeconds(45));
+                    Equal(true, seen.Contains("after=flavor=HTTPS_ACCEPTED"));
+                }
+                finally
+                {
+                    if (browser.IsRunning) await browser.CloseForSmokeAsync();
+                }
+            }
+
+            // 2. acceptInsecureCerts = false: self-signed certificate is rejected, about:neterror is displayed
+            {
+                using var panel = new FakePanel("HTTPS_REJECTED", direct.Port, pfx);
+                using var browser = new FirefoxContainerBrowser();
+                await browser.StartAsync(executable, Path.Combine(root, "managed-rejected"),
+                    () => source, CancellationToken.None, headless: true, acceptInsecureCerts: false);
+                try
+                {
+                    await browser.Bridge.OpenAsync("s2", "Test Rejected", panel.Port, "https://same.test/", CancellationToken.None);
+                    var deadline = DateTime.UtcNow.AddSeconds(45);
+                    string? certErrorDoc = null;
+                    while (DateTime.UtcNow < deadline)
+                    {
+                        var tabInfo = await browser.ChromeForSmokeAsync("""
+                            const win = Services.wm.getMostRecentWindow("navigator:browser").wrappedJSObject;
+                            const tab = [...win.gBrowser.tabs].find(t => {
+                                const doc = t.linkedBrowser?.documentURI?.spec || "";
+                                return doc.includes("about:certerror") || doc.includes("about:neterror");
+                            });
+                            return tab?.linkedBrowser?.documentURI?.spec || "";
+                            """);
+                        var doc = tabInfo.GetString() ?? "";
+                        if ((doc.Contains("about:certerror") || doc.Contains("about:neterror")) && doc.Contains("nssBadCert"))
+                        {
+                            certErrorDoc = doc;
+                            break;
+                        }
+                        await Task.Delay(300);
+                    }
+
+                    if (certErrorDoc == null)
+                        throw new Exception("Expected certificate error page (about:certerror with nssBadCert) was not displayed in Firefox tab");
+
+                    Equal(true, certErrorDoc.Contains("about:certerror") || certErrorDoc.Contains("about:neterror"));
+                    Equal(true, certErrorDoc.Contains("nssBadCert"));
+                    Equal(false, panel.Seen.Task.IsCompleted);
+                }
+                finally
+                {
+                    if (browser.IsRunning) await browser.CloseForSmokeAsync();
+                }
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    private static async Task SendMarionettePacketAsync(Stream stream, string json, CancellationToken token)
+    {
+        var bytes = Encoding.UTF8.GetBytes(json);
+        var header = Encoding.ASCII.GetBytes(bytes.Length + ":");
+        await stream.WriteAsync(header, token);
+        await stream.WriteAsync(bytes, token);
+    }
+
+    private static async Task<JsonElement> ReadMarionettePacketAsync(Stream stream, CancellationToken token)
+    {
+        var one = new byte[1];
+        var length = 0;
+        for (var i = 0; ; i++)
+        {
+            await stream.ReadExactlyAsync(one, token);
+            if (one[0] == ':') break;
+            if (i >= 7 || one[0] is < (byte)'0' or > (byte)'9') throw new IOException("Bad length");
+            length = checked(length * 10 + (one[0] - '0'));
+        }
+        var buffer = new byte[length];
+        await stream.ReadExactlyAsync(buffer, token);
+        using var doc = JsonDocument.Parse(buffer);
+        return doc.RootElement.Clone();
     }
 }
 
@@ -636,39 +953,41 @@ internal static class FirefoxContainerSmoke
         if (process.ExitCode != 0) throw new Exception("xdotool: " + await error);
         return await output;
     }
+}
 
-    private sealed class DirectTrap : IDisposable
+internal sealed class DirectTrap : IDisposable
+{
+    private readonly TcpListener listener = new(IPAddress.Loopback, 0);
+    private readonly CancellationTokenSource stop = new();
+    private int connections;
+    public int Connections => Volatile.Read(ref connections);
+    public int Port { get; }
+    public DirectTrap()
     {
-        private readonly TcpListener listener = new(IPAddress.Loopback, 0);
-        private readonly CancellationTokenSource stop = new();
-        private int connections;
-        public int Connections => Volatile.Read(ref connections);
-        public int Port { get; }
-        public DirectTrap()
-        {
-            listener.Start(); Port = ((IPEndPoint)listener.LocalEndpoint).Port;
-            _ = RunAsync();
-        }
-        private async Task RunAsync()
-        {
-            try
-            {
-                while (!stop.IsCancellationRequested)
-                {
-                    using var client = await listener.AcceptTcpClientAsync(stop.Token);
-                    Interlocked.Increment(ref connections);
-                }
-            }
-            catch (OperationCanceledException) { }
-        }
-        public void Dispose() { stop.Cancel(); listener.Stop(); }
+        listener.Start(); Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        _ = RunAsync();
     }
-
-    private sealed class FakePanel : IDisposable
+    private async Task RunAsync()
     {
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                using var client = await listener.AcceptTcpClientAsync(stop.Token);
+                Interlocked.Increment(ref connections);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+    public void Dispose() { stop.Cancel(); listener.Stop(); }
+}
+
+internal sealed class FakePanel : IDisposable
+{
         private readonly TcpListener listener = new(IPAddress.Loopback, 0);
         private readonly CancellationTokenSource stop = new();
         private readonly string flavor;
+        private readonly X509Certificate2? cert;
         public string Flavor => flavor;
         private readonly int directPort;
         private int requestCount;
@@ -676,10 +995,13 @@ internal static class FirefoxContainerSmoke
         public int Port { get; }
         public TaskCompletionSource<string> Seen { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource<bool> Inherited { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public FakePanel(string flavor, int directPort)
+        public FakePanel(string flavor, int directPort, X509Certificate2? cert = null)
         {
             this.directPort = directPort;
-            this.flavor = flavor; listener.Start(); Port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            this.flavor = flavor;
+            this.cert = cert;
+            listener.Start();
+            Port = ((IPEndPoint)listener.LocalEndpoint).Port;
             _ = AcceptAsync();
         }
         private async Task AcceptAsync()
@@ -713,7 +1035,16 @@ internal static class FirefoxContainerSmoke
                 else throw new Exception("Unexpected address type");
                 var port = new byte[2]; await stream.ReadExactlyAsync(port, stop.Token);
                 await stream.WriteAsync(new byte[] {5, 0, 0, 1, 127, 0, 0, 1, 0, 80}, stop.Token);
-                using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
+
+                Stream dataStream = stream;
+                if (cert != null)
+                {
+                    var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
+                    await ssl.AuthenticateAsServerAsync(cert, false, System.Security.Authentication.SslProtocols.Tls12 | System.Security.Authentication.SslProtocols.Tls13, false);
+                    dataStream = ssl;
+                }
+
+                using var reader = new StreamReader(dataStream, Encoding.ASCII, leaveOpen: true);
                 var request = await reader.ReadLineAsync(stop.Token) ?? "";
                 if (request.StartsWith("GET /inherited ", StringComparison.Ordinal)) Inherited.TrySetResult(true);
                 Interlocked.Increment(ref requestCount);
@@ -721,12 +1052,11 @@ internal static class FirefoxContainerSmoke
                 if (request.StartsWith("GET /seen?", StringComparison.Ordinal)) Seen.TrySetResult(Uri.UnescapeDataString(request));
                 var html = $"<html><title>{flavor}</title><script>let old=document.cookie;if(!old)document.cookie='flavor={flavor}; Max-Age=86400; Path=/';fetch('/seen?before='+encodeURIComponent(old)+'&after='+encodeURIComponent(document.cookie));setInterval(()=>{{fetch('/heartbeat').catch(()=>{{}});fetch('http://127.0.0.1:{directPort}/direct').catch(()=>{{}});}},300);</script></html>";
                 var data = Encoding.UTF8.GetBytes(html);
-                await stream.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {data.Length}\r\nConnection: close\r\n\r\n"), stop.Token);
-                await stream.WriteAsync(data, stop.Token);
+                await dataStream.WriteAsync(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {data.Length}\r\nConnection: close\r\n\r\n"), stop.Token);
+                await dataStream.WriteAsync(data, stop.Token);
             }
-            catch (Exception e) when (e is IOException or OperationCanceledException) { }
+            catch (Exception e) when (e is IOException or OperationCanceledException or System.Security.Authentication.AuthenticationException) { }
             catch (Exception e) { Seen.TrySetException(e); }
         }
         public void Dispose() { stop.Cancel(); listener.Stop(); }
     }
-}

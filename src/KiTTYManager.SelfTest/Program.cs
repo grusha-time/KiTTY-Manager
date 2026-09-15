@@ -75,6 +75,7 @@ internal sealed partial class SelfTestRunner
         Test("Bridge передаёт задания очистки контейнеров и обрабатывает подтверждения", FirefoxContainerBridgePurgeTest);
         Test("Удаление контейнеров в фоне обрабатывает отсутствующие контейнеры и сбои", FirefoxExtensionBackgroundPurgeNodeTest);
         Test("Настройки оптимизации Firefox сохраняются, нормализуются и очищаются при экспорте", FirefoxDiskOptimizationConfigTest);
+        Test("Firefox Marionette протокол и HTTPS с самоподписанным сертификатом", FirefoxAcceptInsecureCertsProtocolAndTlsTest);
         Test("Ansible отвергает опасные имена и удаляет архив после ошибки", AnsibleArchiveRejectsUnsafeNamesAndCleansFailure);
         Test("Сравнение файлов учитывает короткие чтения, хвост и отмену", BatchFileComparisonWithFragmentedReads);
         Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);

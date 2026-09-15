@@ -12,6 +12,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
     private Process? browser;
     private FileStream? owner;
     private TcpClient? smokeClient;
+    private TcpClient? marionetteClient;
     private readonly string startupUrl = "about:blank#kitty-manager-" + Guid.NewGuid().ToString("N");
     public FirefoxContainerBridge Bridge { get; } = new();
     public bool IsRunning => browser is { HasExited: false };
@@ -21,7 +22,8 @@ public sealed class FirefoxContainerBrowser : IDisposable
         bool optimizeRamCache = true,
         bool disableSafeBrowsing = true,
         bool disableHistoryAndIcons = true,
-        bool clearCacheOnShutdown = true)
+        bool clearCacheOnShutdown = true,
+        bool acceptInsecureCerts = true)
     {
         if (IsRunning)
         {
@@ -54,7 +56,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
         var port = ((IPEndPoint)portReservation.LocalEndpoint).Port;
         portReservation.Stop();
         FirefoxProfileWorkspace.ConfigureContainers(profile, Bridge.BlockedPort, port, new Uri(Bridge.Url).Port,
-            optimizeRamCache, disableSafeBrowsing, disableHistoryAndIcons, clearCacheOnShutdown);
+            optimizeRamCache, disableSafeBrowsing, disableHistoryAndIcons, clearCacheOnShutdown, acceptInsecureCerts);
         if (headless) File.AppendAllText(Path.Combine(profile, "user.js"),
             "\nuser_pref(\"toolkit.cosmeticAnimations.enabled\", false);\n" +
             "user_pref(\"focusmanager.testmode\", true);\n" +
@@ -77,8 +79,8 @@ public sealed class FirefoxContainerBrowser : IDisposable
         Bridge.Trace?.Invoke($"Firefox containers: browser launched pid={browser.Id}");
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
         deadline.CancelAfter(TimeSpan.FromSeconds(60));
-        using var ownedClient = headless ? null : new TcpClient();
-        var client = ownedClient ?? (smokeClient = new TcpClient());
+        using var ownedClient = (headless || acceptInsecureCerts) ? null : new TcpClient();
+        var client = ownedClient ?? (headless ? (smokeClient = new TcpClient()) : (marionetteClient = new TcpClient()));
         while (!client.Connected)
         {
             if (browser.HasExited) throw new IOException("Firefox завершился до загрузки расширения. Возможно, профиль уже открыт.");
@@ -86,23 +88,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
             catch (SocketException) { await Task.Delay(200, deadline.Token); }
         }
         var stream = client.GetStream();
-        using var greeting = await ReadPacketAsync(stream, deadline.Token);
-        if (greeting.RootElement.GetProperty("marionetteProtocol").GetInt32() != 3)
-            throw new IOException("Неподдерживаемый протокол Marionette.");
-        await CommandAsync(stream, 1, "WebDriver:NewSession", new
-        {
-            capabilities = new { alwaysMatch = new { acceptInsecureCerts = false } }
-        }, deadline.Token);
-        try
-        {
-            await CommandAsync(stream, 2, "Addon:Install", new {path = addonPath, temporary = true}, deadline.Token);
-            Bridge.Trace?.Invoke("Firefox containers: temporary extension installed");
-        }
-        finally
-        {
-            // Delete only the automation session, not the browser or profile.
-            if (!headless) await CommandAsync(stream, 3, "WebDriver:DeleteSession", new { }, deadline.Token);
-        }
+        await InitializeSessionAsync(stream, addonPath, headless, acceptInsecureCerts, Bridge.Trace, deadline.Token);
         while (!Bridge.Connected)
         {
             if (browser.HasExited) throw new IOException("Firefox закрылся во время установки расширения.");
@@ -130,9 +116,31 @@ public sealed class FirefoxContainerBrowser : IDisposable
     internal async Task CloseForSmokeAsync()
     {
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-        var stream = smokeClient!.GetStream();
-        await CommandAsync(stream, 6, "Marionette:Quit", new {flags = new[] {"eAttemptQuit"}}, deadline.Token);
-        if (browser is not null) await browser.WaitForExitAsync(deadline.Token);
+        try
+        {
+            if (smokeClient is { Connected: true })
+            {
+                var stream = smokeClient.GetStream();
+                await CommandAsync(stream, 6, "Marionette:Quit", new {flags = new[] {"eAttemptQuit"}}, deadline.Token);
+            }
+        }
+        catch { }
+        if (browser is not null)
+        {
+            try
+            {
+                await browser.WaitForExitAsync(deadline.Token);
+            }
+            catch
+            {
+                if (!browser.HasExited)
+                {
+                    browser.Kill(entireProcessTree: true);
+                    using var killDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await browser.WaitForExitAsync(killDeadline.Token);
+                }
+            }
+        }
     }
 
     internal async Task<int> TabCountForSmokeAsync()
@@ -162,6 +170,39 @@ public sealed class FirefoxContainerBrowser : IDisposable
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var value = await CommandAsync(smokeClient!.GetStream(), 9, "WebDriver:TakeScreenshot", new {full = true}, timeout.Token);
         await File.WriteAllBytesAsync(path, Convert.FromBase64String(value.GetProperty("value").GetString()!));
+    }
+
+    internal static async Task InitializeSessionAsync(
+        Stream stream,
+        string addonPath,
+        bool headless,
+        bool acceptInsecureCerts,
+        Action<string>? trace,
+        CancellationToken token)
+    {
+        using var greeting = await ReadPacketAsync(stream, token);
+        if (greeting.RootElement.GetProperty("marionetteProtocol").GetInt32() != 3)
+            throw new IOException("Неподдерживаемый протокол Marionette.");
+        var sessionResponse = await CommandAsync(stream, 1, "WebDriver:NewSession", new
+        {
+            acceptInsecureCerts
+        }, token);
+        if (acceptInsecureCerts)
+        {
+            var capabilities = sessionResponse.TryGetProperty("capabilities", out var caps) ? caps : sessionResponse;
+            if (capabilities.TryGetProperty("acceptInsecureCerts", out var ack) && !ack.GetBoolean())
+                trace?.Invoke("Firefox containers: warning: acceptInsecureCerts not acknowledged by browser");
+        }
+        try
+        {
+            await CommandAsync(stream, 2, "Addon:Install", new {path = addonPath, temporary = true}, token);
+            trace?.Invoke("Firefox containers: temporary extension installed");
+        }
+        finally
+        {
+            // Delete only the automation session, not the browser or profile.
+            if (!headless && !acceptInsecureCerts) await CommandAsync(stream, 3, "WebDriver:DeleteSession", new { }, token);
+        }
     }
 
     private static async Task<JsonElement> CommandAsync(Stream stream, int id, string command, object parameters, CancellationToken token)
@@ -198,6 +239,7 @@ public sealed class FirefoxContainerBrowser : IDisposable
     public void Dispose()
     {
         Bridge.Dispose();
+        marionetteClient?.Dispose();
         smokeClient?.Dispose();
         browser?.Dispose(); // Leave Firefox alive to finish saving; never kill or delete its profile.
         owner?.Dispose();

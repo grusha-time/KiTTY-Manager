@@ -23,6 +23,7 @@ public partial class TextSettingsDialog : Window
     public bool FirefoxDisableHistoryAndIcons => FirefoxDisableHistoryAndIconsBox.IsChecked == true;
     public bool FirefoxClearCacheOnShutdown => FirefoxClearCacheOnShutdownBox.IsChecked == true;
     public bool FirefoxCleanRemovedServerContainers => FirefoxCleanRemovedServerContainersBox.IsChecked == true;
+    public bool FirefoxAcceptInsecureCerts => FirefoxAcceptInsecureCertsBox.IsChecked == true;
     public int ConnectionTimeoutSeconds { get; private set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; private set; } = 4;
     public int TaskConnectionRecoveryMinutes { get; private set; } = 1;
@@ -39,7 +40,8 @@ public partial class TextSettingsDialog : Window
         bool firefoxDisableSafeBrowsing = true,
         bool firefoxDisableHistoryAndIcons = true,
         bool firefoxClearCacheOnShutdown = true,
-        bool firefoxCleanRemovedServerContainers = true)
+        bool firefoxCleanRemovedServerContainers = true,
+        bool firefoxAcceptInsecureCerts = true)
     {
         InitializeComponent();
         Width = Math.Min(760, Math.Max(MinWidth, SystemParameters.WorkArea.Width - 48));
@@ -65,6 +67,7 @@ public partial class TextSettingsDialog : Window
         FirefoxDisableHistoryAndIconsBox.IsChecked = firefoxDisableHistoryAndIcons;
         FirefoxClearCacheOnShutdownBox.IsChecked = firefoxClearCacheOnShutdown;
         FirefoxCleanRemovedServerContainersBox.IsChecked = firefoxCleanRemovedServerContainers;
+        FirefoxAcceptInsecureCertsBox.IsChecked = firefoxAcceptInsecureCerts;
     }
     private void AutoDiscoverFirefoxProfile_Changed(object sender, RoutedEventArgs e) => UpdateTemplateControls();
     private void UpdateTemplateControls()

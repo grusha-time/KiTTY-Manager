@@ -58,7 +58,8 @@ public partial class MainWindow
                 optimizeRamCache: config.FirefoxOptimizeRamCache,
                 disableSafeBrowsing: config.FirefoxDisableSafeBrowsing,
                 disableHistoryAndIcons: config.FirefoxDisableHistoryAndIcons,
-                clearCacheOnShutdown: config.FirefoxClearCacheOnShutdown);
+                clearCacheOnShutdown: config.FirefoxClearCacheOnShutdown,
+                acceptInsecureCerts: config.FirefoxAcceptInsecureCerts);
             containerWatch.Start();
         }
         catch

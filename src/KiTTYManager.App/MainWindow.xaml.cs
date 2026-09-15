@@ -3427,7 +3427,8 @@ public partial class MainWindow : Window
             config.FirefoxDisableSafeBrowsing,
             config.FirefoxDisableHistoryAndIcons,
             config.FirefoxClearCacheOnShutdown,
-            config.FirefoxCleanRemovedServerContainers) { Owner = this };
+            config.FirefoxCleanRemovedServerContainers,
+            config.FirefoxAcceptInsecureCerts) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
         config.WinScpPath = dialog.WinScpPath;
@@ -3451,6 +3452,7 @@ public partial class MainWindow : Window
         config.FirefoxDisableHistoryAndIcons = dialog.FirefoxDisableHistoryAndIcons;
         config.FirefoxClearCacheOnShutdown = dialog.FirefoxClearCacheOnShutdown;
         config.FirefoxCleanRemovedServerContainers = dialog.FirefoxCleanRemovedServerContainers;
+        config.FirefoxAcceptInsecureCerts = dialog.FirefoxAcceptInsecureCerts;
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
         ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
         config.ClosePreferenceConfigured = true; SaveConfig();
