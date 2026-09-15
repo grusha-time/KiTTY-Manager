@@ -150,21 +150,24 @@ public sealed class SshConnectionService
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectCandidateAsync(
         ManagerConfig config, RouteCandidate candidate,
         CancellationToken cancellationToken = default, bool consoleOnly = false,
-        bool rememberTargetPreference = true) =>
+        bool rememberTargetPreference = true,
+        RouteAttemptBudget? budget = null) =>
         await ConnectCandidatesAsync(config, [candidate],
             "Указанный маршрут недоступен.", cancellationToken, consoleOnly,
-            rememberTargetPreference);
+            rememberTargetPreference, budget);
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectFirstSuccessfulAsync(
         ManagerConfig config, IReadOnlyList<RouteCandidate> candidates,
-        CancellationToken cancellationToken = default, bool consoleOnly = false)
+        CancellationToken cancellationToken = default, bool consoleOnly = false,
+        RouteAttemptBudget? budget = null)
     {
         if (candidates.Count == 0)
             throw new InvalidOperationException("Не указаны маршруты для параллельной проверки.");
 
+        budget ??= new RouteAttemptBudget(config.MaxRouteAttempts);
         using var raceCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var tasks = candidates.Select(candidate => ConnectCandidateAsync(
-            config, candidate, raceCancellation.Token, consoleOnly)).ToList();
+            config, candidate, raceCancellation.Token, consoleOnly, budget: budget)).ToList();
         var failures = new List<Exception>();
         while (tasks.Count > 0)
         {
@@ -182,6 +185,9 @@ public sealed class SshConnectionService
             catch (Exception ex) { failures.Add(ex); }
         }
 
+        if (budget is not null && !budget.HasCapacity)
+            throw new RouteAttemptLimitException(budget.Limit, budget.AttemptCount, failures.Count == 0 ? null : new AggregateException(failures));
+
         throw new InvalidOperationException(
             "Ни один из параллельно проверенных маршрутов не сработал.",
             new AggregateException(failures));
@@ -197,8 +203,10 @@ public sealed class SshConnectionService
     private async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectCandidatesAsync(
         ManagerConfig config, IEnumerable<RouteCandidate> candidates, string failureMessage,
         CancellationToken cancellationToken, bool consoleOnly,
-        bool rememberTargetPreference = true)
+        bool rememberTargetPreference = true,
+        RouteAttemptBudget? budget = null)
     {
+        budget ??= new RouteAttemptBudget(config.MaxRouteAttempts);
         var failures = new List<Exception>();
         var candidateList = candidates
             .Where(candidate => RoutePlanner.SatisfiesRouteConstraints(config, candidate))
@@ -206,6 +214,7 @@ public sealed class SshConnectionService
         if (candidateList.Length == 0)
             Emit(SshTraceStage.RouteCandidate, "route", "FAIL",
                 new InvalidOperationException("No enabled global SOCKS route candidates."));
+        var budgetExhausted = false;
         foreach (var candidate in candidateList)
         {
             // Кэш относится к входу proxy -> первый сервер, в том числе в длинной цепочке.
@@ -214,6 +223,11 @@ public sealed class SshConnectionService
             {
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "SKIP_CACHED_FAILURE");
                 continue;
+            }
+            if (!budget.TryAcquire())
+            {
+                budgetExhausted = true;
+                break;
             }
             cancellationToken.ThrowIfCancellationRequested();
             using var attempt = CreateAttemptCancellation(cancellationToken);
@@ -293,6 +307,8 @@ public sealed class SshConnectionService
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "FAIL", ex);
             }
         }
+        if (budgetExhausted || (candidateList.Length > 0 && !budget.HasCapacity))
+            throw new RouteAttemptLimitException(budget.Limit, budget.AttemptCount, CombineFailures(failures));
         throw new InvalidOperationException(AddTimeoutHint(failureMessage, failures), CombineFailures(failures));
     }
 

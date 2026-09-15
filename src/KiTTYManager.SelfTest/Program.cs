@@ -249,6 +249,10 @@ internal sealed partial class SelfTestRunner
         Test("Гонка точек входа по умолчанию выключена и сохраняется в JSON", EntryPointRaceSettingRoundTrip);
         Test("Пропуск существующих связей карты по умолчанию включён и сохраняется", MapCheckSettingRoundTrip);
         Test("Лимит endpoint-зонда по умолчанию 4 секунды и сохраняется в JSON", EndpointProbeTimeoutRoundTrip);
+        Test("Лимит вариантов маршрутов по умолчанию 10, нормализуется и сохраняется в JSON", RouteAttemptLimitDefaultsAndRoundTrip);
+        Test("Бюджет попыток маршрутов ограничивает попытки и генерирует исключение", RouteAttemptBudgetEnforcementAndException);
+        Test("Исключение лимита маршрутов не считается сбоем связи в задачах", RouteAttemptLimitNonRetryableInBatchTasks);
+        Test("Параллельная проверка маршрутов делит общий бюджет при вызове без явного бюджета", ConnectFirstSuccessfulSharesBudgetWhenOmitted);
         Test("Отрицательный endpoint-кэш изолирован по JH и предыдущему серверу", EndpointFailureCacheContexts);
         Test("Фоновая проверка одной сессии имеет единственного владельца", BackgroundProbeRegistrySerializesPerServer);
         Test("Фоновая проверка не пропускает короткий маршрут после текущего", BackgroundProbePrioritizesShorterRoute);

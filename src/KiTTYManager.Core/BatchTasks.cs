@@ -689,12 +689,15 @@ public static class TaskConnectionRecoveryPolicy
     public static bool IsConnectivityFailure(Exception exception)
     {
         for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is RouteAttemptLimitException) return false;
             if (current is SshConnectionException or SshOperationTimeoutException or SocketException or EndOfStreamException ||
                 current is ObjectDisposedException && current.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
                 current is IOException && (current.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
                                              current.Message.Contains("соединен", StringComparison.OrdinalIgnoreCase) ||
                                              current.Message.Contains("socket", StringComparison.OrdinalIgnoreCase)))
                 return true;
+        }
         return false;
     }
 }
@@ -898,12 +901,15 @@ public sealed class BatchTaskRunner
             {
                 var state = states[id];
                 var snap = snapshot[id];
-                var success = snap.Connected && !snap.Failed && !cancellationToken.IsCancellationRequested;
-                var message = cancellationToken.IsCancellationRequested && !snap.Failed ? "Остановлено"
-                    : !snap.Connected ? snap.ErrorMessage ?? "Не подключено"
-                    : snap.Failed ? snap.ErrorMessage ?? "Ошибка"
+                var failed = snap.Failed || state.Failed;
+                var errorMessage = snap.Failed ? snap.ErrorMessage : (state.ErrorMessage ?? snap.ErrorMessage);
+                var stoppedAtStep = snap.StoppedAtStep ?? state.StoppedAtStep;
+                var success = snap.Connected && !failed && !cancellationToken.IsCancellationRequested;
+                var message = cancellationToken.IsCancellationRequested && !failed ? "Остановлено"
+                    : !snap.Connected ? errorMessage ?? "Не подключено"
+                    : failed ? errorMessage ?? "Ошибка"
                     : "Готово";
-                return new BatchServerResult(id, state.Server.Name, success, cancellationToken.IsCancellationRequested, message, state.Backups, snap.StoppedAtStep, snap.Failed);
+                return new BatchServerResult(id, state.Server.Name, success, cancellationToken.IsCancellationRequested, message, state.Backups, stoppedAtStep, failed);
             }).ToList();
             return new(results.OrderBy(x => x.ServerName).ToArray(), cancellationToken.IsCancellationRequested);
         }
@@ -1073,6 +1079,15 @@ public sealed class BatchTaskRunner
                     : await routeFactory(state.Server.Id, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { return; }
+            catch (RouteAttemptLimitException ex)
+            {
+                state.Failed = true;
+                state.ErrorMessage = SecretRedactor.Redact(ex.Message, state.Server, activeSecrets);
+                state.StoppedAtStep = "Туннели";
+                Emit(state, "", "Переподключение не удалось (исчерпан лимит маршрутов): " +
+                    state.ErrorMessage, BatchLogLevel.Warning);
+                return;
+            }
             catch (Exception ex)
             {
                 Emit(state, "", "Переподключение не удалось: " +
