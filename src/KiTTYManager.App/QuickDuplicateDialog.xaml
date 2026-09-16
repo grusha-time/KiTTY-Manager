@@ -81,7 +81,56 @@
           <local:ServerSelectionList x:Name="LinkServerSelector" Grid.Row="1" Margin="0,10,0,0"/>
         </Grid>
       </TabItem>
+      <TabItem Header="Группа">
+        <Grid Margin="12">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+          </Grid.RowDefinitions>
+          <TextBox x:Name="GroupSearchBox" TextChanged="GroupSearchBox_TextChanged"
+                   ToolTip="Поиск по названию или пути группы"/>
+          <WrapPanel Grid.Row="1" Margin="0,8,0,8">
+            <Button x:Name="UngroupedButton" Content="Без группы" Click="UngroupedButton_Click" Margin="0,0,8,0"
+                    ToolTip="Поместить сессию на верхний уровень без привязки к группе"/>
+            <Button x:Name="CreateGroupButton" Content="Создать группу" Click="CreateGroup_Click" Margin="0,0,8,0"
+                    ToolTip="Создать новую корневую группу"/>
+            <Button x:Name="CreateSubgroupButton" Content="Создать подгруппу" Click="CreateSubgroup_Click" Margin="0,0,8,0"
+                    ToolTip="Создать подгруппу внутри выбранной группы"/>
+            <TextBlock x:Name="SelectedGroupText" VerticalAlignment="Center" Margin="8,0,0,0" FontWeight="SemiBold"
+                       TextTrimming="CharacterEllipsis"/>
+          </WrapPanel>
+          <Grid Grid.Row="2">
+            <ListBox x:Name="GroupList" MinHeight="140" SelectionMode="Single"
+                     SelectionChanged="GroupList_SelectionChanged"
+                     local:ScrollWheelForwarding.Enabled="True">
+              <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                  <Setter Property="Padding" Value="4,3"/>
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                </Style>
+              </ListBox.ItemContainerStyle>
+              <ListBox.ItemTemplate>
+                <DataTemplate>
+                  <Grid Margin="{Binding Indent}">
+                    <StackPanel Margin="6,3,0,3">
+                      <TextBlock Text="{Binding Name}" FontWeight="SemiBold"
+                                 Foreground="{Binding Foreground}" TextTrimming="CharacterEllipsis"/>
+                      <TextBlock Text="{Binding Details}" Margin="0,2,0,0" FontSize="12"
+                                 Foreground="{StaticResource MutedTextBrush}" TextTrimming="CharacterEllipsis"/>
+                    </StackPanel>
+                  </Grid>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+            <TextBlock x:Name="EmptyGroupText" Text="Ничего не найдено"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"
+                       Foreground="{StaticResource MutedTextBrush}" Visibility="Collapsed"/>
+          </Grid>
+        </Grid>
+      </TabItem>
     </TabControl>
+
     <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
       <Button Content="Отмена" IsCancel="True" Click="Cancel_Click"/>
       <Button Content="Сохранить" IsDefault="True" Margin="8,0,0,0" Click="Save_Click"/>

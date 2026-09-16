@@ -1,14 +1,24 @@
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
 using KiTTYManager.Core;
+using Brush = System.Windows.Media.Brush;
+using Color = System.Windows.Media.Color;
 
 namespace KiTTYManager.App;
+
 
 public partial class QuickDuplicateDialog : Window
 {
     private readonly ManagerConfig config;
     private readonly ManagedServer source;
+    private bool refreshingGroups;
+
     public ManagedServer Draft { get; }
     public string InitiallyGeneratedName { get; }
+    public QuickDuplicatePlacementDraft PlacementDraft { get; }
+    public Guid? TargetGroupId => PlacementDraft.SelectedGroupId;
+
     public event EventHandler? Saved;
     public IReadOnlyList<Guid> SelectedServerIds => BuildLinksBox.IsChecked == true
         ? LinkServerSelector.SelectedIds.ToArray() : [];
@@ -19,6 +29,7 @@ public partial class QuickDuplicateDialog : Window
         this.source = source;
         Draft = ManagedServerDuplicator.CreateQuickDuplicate(config, source);
         InitiallyGeneratedName = Draft.Name;
+        PlacementDraft = new QuickDuplicatePlacementDraft(config, source);
         SourceInitialized += (_, _) => DarkWindowChrome.Apply(this);
         InitializeComponent();
         LoadDraft();
@@ -26,6 +37,7 @@ public partial class QuickDuplicateDialog : Window
         var entryIds = QuickDuplicatePolicy.DefaultLinkSourceIds(config, source);
         LinkServerSelector.Configure(config, entryIds);
         UpdateTreeEnabled();
+        RefreshGroupList();
     }
 
     private void LoadDraft()
@@ -103,5 +115,117 @@ public partial class QuickDuplicateDialog : Window
     }
 
     private void ShowError(string message) => ThemedMessageDialog.Show(this, message, "Быстрый дубль", MessageBoxButton.OK, MessageBoxImage.Warning);
+
+    private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e) => RefreshGroupList();
+
+    private void UngroupedButton_Click(object sender, RoutedEventArgs e)
+    {
+        PlacementDraft.SelectedGroupId = null;
+        if (GroupList is not null) GroupList.SelectedItem = null;
+        UpdateGroupSelectionUi();
+    }
+
+    private void CreateGroup_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new PromptDialog("Новая группа", "Название группы") { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        var name = dialog.Value;
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        var draft = PlacementDraft.CreateGroup(name);
+        if (GroupSearchBox is not null) GroupSearchBox.Text = "";
+        RefreshGroupList(scrollToId: draft.Id);
+    }
+
+    private void CreateSubgroup_Click(object sender, RoutedEventArgs e)
+    {
+        if (!PlacementDraft.SelectedGroupId.HasValue) return;
+        var parentName = PlacementDraft.GetDisplayPath(config);
+
+        var dialog = new PromptDialog("Новая подгруппа", $"Название подгруппы для «{parentName}»") { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        var name = dialog.Value;
+        if (string.IsNullOrWhiteSpace(name)) return;
+
+        var draft = PlacementDraft.CreateGroup(name, PlacementDraft.SelectedGroupId.Value);
+        if (GroupSearchBox is not null) GroupSearchBox.Text = "";
+        RefreshGroupList(scrollToId: draft.Id);
+    }
+
+    private void GroupList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (refreshingGroups) return;
+        if (GroupList?.SelectedItem is DisplayGroupRow row)
+        {
+            PlacementDraft.SelectedGroupId = row.GroupId;
+        }
+        UpdateGroupSelectionUi();
+    }
+
+    private void RefreshGroupList(Guid? scrollToId = null)
+    {
+        if (GroupList is null) return;
+        refreshingGroups = true;
+        try
+        {
+            var rows = GroupSelectionPolicy.Build(config, PlacementDraft.NewGroups, GroupSearchBox?.Text)
+                .Select(row => new DisplayGroupRow(row)).ToArray();
+            GroupList.ItemsSource = rows;
+            if (EmptyGroupText is not null)
+                EmptyGroupText.Visibility = rows.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            DisplayGroupRow? toSelect = null;
+            if (PlacementDraft.SelectedGroupId.HasValue)
+                toSelect = rows.FirstOrDefault(r => r.GroupId == PlacementDraft.SelectedGroupId.Value);
+
+            GroupList.SelectedItem = toSelect;
+            UpdateGroupSelectionUi();
+
+            if (scrollToId.HasValue)
+            {
+                var target = rows.FirstOrDefault(r => r.GroupId == scrollToId.Value);
+                if (target is not null) GroupList.ScrollIntoView(target);
+            }
+            else if (toSelect is not null)
+            {
+                GroupList.ScrollIntoView(toSelect);
+            }
+        }
+        finally
+        {
+            refreshingGroups = false;
+        }
+    }
+
+    private void UpdateGroupSelectionUi()
+    {
+        if (SelectedGroupText is null) return;
+        var path = PlacementDraft.GetDisplayPath(config);
+        SelectedGroupText.Text = $"Выбрано: {path}";
+        if (CreateSubgroupButton is not null)
+            CreateSubgroupButton.IsEnabled = PlacementDraft.SelectedGroupId.HasValue;
+    }
+
+    private sealed class DisplayGroupRow
+    {
+        public Guid GroupId { get; }
+        public string Name { get; }
+        public string Details { get; }
+        public Thickness Indent { get; }
+        public Brush Foreground { get; }
+
+        public DisplayGroupRow(GroupSelectionRow row)
+        {
+            GroupId = row.GroupId;
+            Name = row.Name;
+            Details = row.IsNew
+                ? $"{row.Path}  ·  Новая группа (будет создана при сохранении)"
+                : $"{row.Path}  ·  Сессий: {row.ServerCount}";
+            Indent = new Thickness(row.Depth * 18, 0, 0, 0);
+            Foreground = new SolidColorBrush(Color.FromRgb(190, 210, 245));
+        }
+    }
+
     private sealed record ServerChoice(Guid? Id, string Name);
 }
+

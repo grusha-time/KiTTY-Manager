@@ -175,6 +175,9 @@ internal sealed partial class SelfTestRunner
         Test("Дублирование сессии сохраняет данные и группу без связей", DuplicateManagedServer);
         Test("Быстрый дубль до сохранения отделён и очищает runtime", QuickDuplicateIsDetachedAndClean);
         Test("Немодальные быстрые дубли повторно уточняют автоматическое имя", QuickDuplicateRefreshesGeneratedName);
+        Test("Быстрый дубль: черновик размещения и выбор целевой группы", QuickDuplicatePlacementAndGroupSelection);
+        Test("Политика выбора групп поддерживает иерархию, поиск и счётчики", GroupSelectionPolicyHierarchyAndFiltering);
+        Test("Размещение дубля в целевую группу или на верхний уровень", AddToServerGroupPlacement);
         Test("Направленный успех не создаёт обратную связь", DirectedLinkSuccess);
         Test("Встречные направления одной пары объединяются в одну связь", SavedLinksCollapseRelationship);
         Test("Повторная фиксация связи не создаёт дубликат", RememberDirectedSuccessDoesNotDuplicate);
@@ -1101,7 +1104,195 @@ internal sealed partial class SelfTestRunner
         Equal("Моё имя", second.Name);
     }
 
+    private static void QuickDuplicatePlacementAndGroupSelection()
+    {
+        var rootGroup = new ServerGroup { Name = "Основная группа" };
+        var subGroup = new ServerGroup { Name = "Подгруппа" };
+        rootGroup.Groups.Add(subGroup);
+
+        var serverInSub = new ManagedServer { Name = "Сервер в подгруппе" };
+        subGroup.Servers.Add(serverInSub);
+
+        var serverInRoot = new ManagedServer { Name = "Сервер в корне" };
+        rootGroup.Servers.Add(serverInRoot);
+
+        var ungroupedServer = new ManagedServer { Name = "Сервер без группы" };
+
+        var config = new ManagerConfig
+        {
+            Groups = [rootGroup],
+            UngroupedServers = [ungroupedServer]
+        };
+
+        // 1. Initial selection from source server
+        var draftSub = new QuickDuplicatePlacementDraft(config, serverInSub);
+        Equal<Guid?>(subGroup.Id, draftSub.SelectedGroupId);
+        Equal("Основная группа / Подгруппа", draftSub.GetDisplayPath(config));
+
+        var draftRoot = new QuickDuplicatePlacementDraft(config, serverInRoot);
+        Equal<Guid?>(rootGroup.Id, draftRoot.SelectedGroupId);
+        Equal("Основная группа", draftRoot.GetDisplayPath(config));
+
+        var draftUngrouped = new QuickDuplicatePlacementDraft(config, ungroupedServer);
+        Equal<Guid?>(null, draftUngrouped.SelectedGroupId);
+        Equal("Без группы (верхний уровень)", draftUngrouped.GetDisplayPath(config));
+
+        // 2. Setting SelectedGroupId explicitly to null
+        draftSub.SelectedGroupId = null;
+        Equal<Guid?>(null, draftSub.SelectedGroupId);
+        Equal("Без группы (верхний уровень)", draftSub.GetDisplayPath(config));
+
+        // 3. Creating new draft groups
+        var newRoot = draftSub.CreateGroup("Новый ЦОД");
+        Equal(newRoot.Id, draftSub.SelectedGroupId);
+        Equal("Новый ЦОД", draftSub.GetDisplayPath(config));
+
+        var newSub = draftSub.CreateGroup("Стойка 1", newRoot.Id);
+        Equal(newSub.Id, draftSub.SelectedGroupId);
+        Equal("Новый ЦОД / Стойка 1", draftSub.GetDisplayPath(config));
+
+        var draftSubUnderExisting = draftRoot.CreateGroup("Новая подгруппа корня", rootGroup.Id);
+        Equal(draftSubUnderExisting.Id, draftRoot.SelectedGroupId);
+        Equal("Основная группа / Новая подгруппа корня", draftRoot.GetDisplayPath(config));
+
+        // 4. Applying draft to config
+        var (appliedTargetId, fallback) = draftSub.ApplyTo(config);
+        Equal(false, fallback);
+        Equal<Guid?>(newSub.Id, appliedTargetId);
+
+        var createdRoot = config.FindGroup(newRoot.Id);
+        Equal(true, createdRoot is not null);
+        Equal("Новый ЦОД", createdRoot!.Name);
+
+        var createdSub = config.FindGroup(newSub.Id);
+        Equal(true, createdSub is not null);
+        Equal("Стойка 1", createdSub!.Name);
+        Equal(true, createdRoot.Groups.Any(g => g.Id == newSub.Id));
+
+        // 5. Fallback when selected target group was deleted before apply
+        var draftWithDeletedTarget = new QuickDuplicatePlacementDraft(Guid.NewGuid());
+        var (fallbackTargetId, fallbackOccurred) = draftWithDeletedTarget.ApplyTo(config);
+        Equal(true, fallbackOccurred);
+        Equal<Guid?>(null, fallbackTargetId);
+
+        // 6. Subgroup with deleted parent falls back to ungrouped with fallback flag
+        var orphanDraft = new QuickDuplicatePlacementDraft();
+        var orphan = orphanDraft.CreateGroup("Сирота", Guid.NewGuid());
+        var (orphanTargetId, orphanFallback) = orphanDraft.ApplyTo(config);
+        Equal(true, orphanFallback);
+        Equal<Guid?>(null, orphanTargetId);
+        var createdOrphan = config.FindGroup(orphan.Id);
+        Equal(false, createdOrphan is not null);
+    }
+
+    private static void GroupSelectionPolicyHierarchyAndFiltering()
+    {
+        var rootEmpty = new ServerGroup { Name = "Пустая группа" };
+        var rootActive = new ServerGroup { Name = "Активная группа" };
+        var sub1 = new ServerGroup { Name = "Подгруппа веб", Servers = [new ManagedServer { Name = "Web1" }, new ManagedServer { Name = "Web2" }] };
+        var subSub = new ServerGroup { Name = "Базы данных", Servers = [new ManagedServer { Name = "Db1" }] };
+        sub1.Groups.Add(subSub);
+        rootActive.Groups.Add(sub1);
+
+        var config = new ManagerConfig { Groups = [rootEmpty, rootActive] };
+
+        // 1. Unfiltered build
+        var allRows = GroupSelectionPolicy.Build(config);
+        Equal(4, allRows.Count);
+        Equal("Пустая группа", allRows[0].Name);
+        Equal(0, allRows[0].Depth);
+        Equal(0, allRows[0].ServerCount);
+
+        Equal("Активная группа", allRows[1].Name);
+        Equal(0, allRows[1].Depth);
+        Equal(3, allRows[1].ServerCount);
+
+        Equal("Подгруппа веб", allRows[2].Name);
+        Equal(1, allRows[2].Depth);
+        Equal(3, allRows[2].ServerCount);
+        Equal("Активная группа / Подгруппа веб", allRows[2].Path);
+
+        Equal("Базы данных", allRows[3].Name);
+        Equal(2, allRows[3].Depth);
+        Equal(1, allRows[3].ServerCount);
+        Equal("Активная группа / Подгруппа веб / Базы данных", allRows[3].Path);
+
+        // 2. Draft new groups are included
+        var draft = new QuickDuplicatePlacementDraft();
+        var draftGroup = draft.CreateGroup("Новый кластер", subSub.Id);
+        var rowsWithDraft = GroupSelectionPolicy.Build(config, draft.NewGroups);
+        Equal(5, rowsWithDraft.Count);
+        var lastRow = rowsWithDraft[^1];
+        Equal("Новый кластер", lastRow.Name);
+        Equal(3, lastRow.Depth);
+        Equal(true, lastRow.IsNew);
+        Equal(0, lastRow.ServerCount);
+        Equal("Активная группа / Подгруппа веб / Базы данных / Новый кластер", lastRow.Path);
+
+        // 3. Search filtering matches child and retains ancestors, as well as sub-branches
+        var dbSearch = GroupSelectionPolicy.Build(config, draft.NewGroups, "базы");
+        Equal(4, dbSearch.Count);
+        Equal("Активная группа", dbSearch[0].Name);
+        Equal(0, dbSearch[0].Depth);
+        Equal("Подгруппа веб", dbSearch[1].Name);
+        Equal(1, dbSearch[1].Depth);
+        Equal("Базы данных", dbSearch[2].Name);
+        Equal(2, dbSearch[2].Depth);
+        Equal("Новый кластер", dbSearch[3].Name);
+        Equal(3, dbSearch[3].Depth);
+
+        // 4. Search matching root empty group
+        var emptySearch = GroupSelectionPolicy.Build(config, draft.NewGroups, "пустая");
+        Equal(1, emptySearch.Count);
+        Equal("Пустая группа", emptySearch[0].Name);
+
+        // 5. Search with no matches
+        var noMatches = GroupSelectionPolicy.Build(config, draft.NewGroups, "несуществующий текст");
+        Equal(0, noMatches.Count);
+    }
+
+    private static void AddToServerGroupPlacement()
+    {
+        var rootGroup = new ServerGroup { Name = "Корень" };
+        var subGroup = new ServerGroup { Name = "Подгруппа" };
+        rootGroup.Groups.Add(subGroup);
+
+        var config = new ManagerConfig { Groups = [rootGroup] };
+
+        // 1. Place into root group
+        var server1 = new ManagedServer { Name = "Сервер 1" };
+        ManagedServerDuplicator.AddToServerGroup(config, server1, rootGroup.Id);
+        Equal(true, rootGroup.Servers.Contains(server1));
+        Equal(false, config.UngroupedServers.Contains(server1));
+
+        // 2. Place into nested subgroup
+        var server2 = new ManagedServer { Name = "Сервер 2" };
+        ManagedServerDuplicator.AddToServerGroup(config, server2, subGroup.Id);
+        Equal(true, subGroup.Servers.Contains(server2));
+        Equal(false, config.UngroupedServers.Contains(server2));
+
+        // 3. Place with targetGroupId = null (ungrouped)
+        var server3 = new ManagedServer { Name = "Сервер 3" };
+        ManagedServerDuplicator.AddToServerGroup(config, server3, null);
+        Equal(true, config.UngroupedServers.Contains(server3));
+
+        // 4. Place with non-existent targetGroupId (fallback to ungrouped)
+        var server4 = new ManagedServer { Name = "Сервер 4" };
+        ManagedServerDuplicator.AddToServerGroup(config, server4, Guid.NewGuid());
+        Equal(true, config.UngroupedServers.Contains(server4));
+
+        // 5. AddToSourceGroup backward compatibility
+        var server5 = new ManagedServer { Name = "Сервер 5" };
+        ManagedServerDuplicator.AddToSourceGroup(config, server2, server5);
+        Equal(true, subGroup.Servers.Contains(server5));
+
+        var server6 = new ManagedServer { Name = "Сервер 6" };
+        ManagedServerDuplicator.AddToSourceGroup(config, server3, server6);
+        Equal(true, config.UngroupedServers.Contains(server6));
+    }
+
     private static void DirectedLinkSuccess()
+
     {
         var source = new ManagedServer();
         var target = new ManagedServer();
