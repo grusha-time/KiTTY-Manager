@@ -23,7 +23,7 @@ public partial class BatchTaskWindow : Window
     private readonly ObservableCollection<BatchServerChoice> servers = [];
     private readonly BatchTaskRunner runner;
     private readonly SshConnectionService connections;
-    private readonly Func<Guid, CancellationToken, Task<ActiveRoute>>? routeFactory;
+    private readonly Func<Guid, Action<SshConnectionProgress>?, CancellationToken, Task<ActiveRoute>>? routeFactory;
     private readonly Action<ActiveRoute>? routeRelease;
     private readonly ObservableCollection<BatchTaskStep> steps = [];
     private readonly ObservableCollection<BatchTunnelDefinition> tunnels = [];
@@ -55,7 +55,7 @@ public partial class BatchTaskWindow : Window
     private readonly SemaphoreSlim connectionPromptGate = new(1, 1);
 
     public BatchTaskWindow(ManagerConfig config, IEnumerable<Guid> serverIds, SshConnectionService? connections = null,
-        Func<Guid, CancellationToken, Task<ActiveRoute>>? routeFactory = null,
+        Func<Guid, Action<SshConnectionProgress>?, CancellationToken, Task<ActiveRoute>>? routeFactory = null,
         Action<ActiveRoute>? routeRelease = null, Action? saveConfig = null, Action<string>? fileLog = null)
     {
         this.fileLog = fileLog;
@@ -1178,16 +1178,18 @@ public partial class BatchTaskWindow : Window
         (AnsibleVerbosityBox.SelectedItem as ComboBoxItem)?.Tag?.ToString(), out var value)
         ? AnsibleRunPolicy.NormalizeVerbosity(value) : 0;
 
-    private void AppendAnsibleLog(string text, IEnumerable<string>? secrets = null, bool isConsole = false)
+    private void AppendAnsibleLog(string text, IEnumerable<string>? secrets = null, bool isConsole = false, bool? isWarningOrError = null)
     {
         var safe = AnsibleSecretRedactor.Redact(text, secrets ?? []);
-        var isErrorOrWarning = safe.Contains("fatal:", StringComparison.OrdinalIgnoreCase) ||
+        var isErrorOrWarning = isWarningOrError ?? (
+                               safe.Contains("fatal:", StringComparison.OrdinalIgnoreCase) ||
                                safe.Contains("FAILED!", StringComparison.OrdinalIgnoreCase) ||
                                safe.Contains("ERROR!", StringComparison.OrdinalIgnoreCase) ||
                                safe.Contains("[WARNING]", StringComparison.OrdinalIgnoreCase) ||
                                safe.StartsWith("Ошибка (", StringComparison.Ordinal) ||
                                safe.Contains("Сбой: ", StringComparison.Ordinal) ||
-                               safe.Contains("недоступен", StringComparison.Ordinal);
+                               safe.Contains("недоступен", StringComparison.Ordinal) ||
+                               safe.Contains("не удалась", StringComparison.OrdinalIgnoreCase));
         var entry = new AnsibleLogEntry(DateTimeOffset.Now, safe, isConsole, isErrorOrWarning);
         void Append()
         {
@@ -1272,7 +1274,7 @@ public partial class BatchTaskWindow : Window
                     var server = config.FindServer(choice.Id) ?? throw new InvalidOperationException("Сессия удалена: " + choice.Name);
                     choice.Status = "Строю маршрут";
                     AppendAnsibleLog($"Маршрут: начинаю подключение к «{choice.Name}».", secrets);
-                    var route = await ConnectAnsibleRouteWithRecoveryAsync(server, choice, cancellation.Token);
+                    var route = await ConnectAnsibleRouteWithRecoveryAsync(server, choice, secrets, cancellation.Token);
                     lock (routes) routes.Add((choice, server, route));
                     AppendAnsibleLog($"Маршрут: «{choice.Name}» готов, локальный SSH-порт {route.LocalSshPort}.", secrets);
                     choice.Status = "Маршрут готов"; await Dispatcher.InvokeAsync(() => AnsibleProgress.Value++);
@@ -1375,9 +1377,23 @@ public partial class BatchTaskWindow : Window
     }
 
     private async Task<ActiveRoute> ConnectAnsibleRouteWithRecoveryAsync(
-        ManagedServer server, BatchServerChoice choice, CancellationToken token)
+        ManagedServer server, BatchServerChoice choice, string[] secrets, CancellationToken token)
     {
         var minutes = TaskConnectionRecoveryPolicy.NormalizeMinutes(config.TaskConnectionRecoveryMinutes);
+        Action<SshConnectionProgress> onProgress = p =>
+        {
+            var formatted = RouteAttemptFormatter.Format(p);
+            var isWarn = p.Kind == SshConnectionProgressKind.AttemptFailed;
+            AppendAnsibleLog($"[{choice.Name}] Маршрут: {formatted}", secrets, isWarningOrError: isWarn ? true : null);
+            choice.Status = p.Kind switch
+            {
+                SshConnectionProgressKind.AttemptStarting => "Подключение…",
+                SshConnectionProgressKind.EndpointProbing => "Проверка…",
+                SshConnectionProgressKind.AttemptFailed => "Сбой попытки",
+                SshConnectionProgressKind.AttemptSucceeded => "Подключено",
+                _ => choice.Status
+            };
+        };
         while (true)
         {
             var deadline = DateTimeOffset.UtcNow.AddMinutes(minutes);
@@ -1388,14 +1404,14 @@ public partial class BatchTaskWindow : Window
                 try
                 {
                     return routeFactory is null
-                        ? (await connections.ConnectBestAsync(config, server.Id, token)).Route
-                        : await routeFactory(server.Id, token);
+                        ? (await connections.ConnectBestAsync(config, server.Id, token, progress: onProgress)).Route
+                        : await routeFactory(server.Id, onProgress, token);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex) when (TaskConnectionRecoveryPolicy.IsConnectivityFailure(ex))
                 {
                     last = ex;
-                    AppendAnsibleLog($"Маршрут: «{choice.Name}» недоступен; повтор через 10 секунд.", []);
+                    AppendAnsibleLog($"Маршрут: «{choice.Name}» недоступен; повтор через 10 секунд.", secrets);
                 }
                 if (DateTimeOffset.UtcNow >= deadline) break;
                 var delay = deadline - DateTimeOffset.UtcNow;
