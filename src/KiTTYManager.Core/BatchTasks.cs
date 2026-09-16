@@ -708,7 +708,7 @@ public static class TaskConnectionRecoveryPolicy
                 queue.Enqueue(current.InnerException);
         }
 
-        if (allExceptions.Any(e => e is SshAuthenticationException or RouteAttemptLimitException))
+        if (allExceptions.Any(e => e is RouteAttemptLimitException))
             return false;
 
         return allExceptions.Any(e =>

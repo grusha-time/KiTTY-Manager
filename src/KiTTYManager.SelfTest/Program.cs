@@ -256,6 +256,7 @@ internal sealed partial class SelfTestRunner
         Test("Лимит вариантов маршрутов по умолчанию 10, нормализуется и сохраняется в JSON", RouteAttemptLimitDefaultsAndRoundTrip);
         Test("Бюджет попыток маршрутов ограничивает попытки и генерирует исключение", RouteAttemptBudgetEnforcementAndException);
         Test("Исключение лимита маршрутов не считается сбоем связи в задачах", RouteAttemptLimitNonRetryableInBatchTasks);
+        Test("Лимит маршрутов ограничивает запуск нескольких недоступных jumphost", RouteAttemptLimitWithMultipleUnavailableManagedJumphosts);
         Test("Параллельная проверка маршрутов делит общий бюджет при вызове без явного бюджета", ConnectFirstSuccessfulSharesBudgetWhenOmitted);
         Test("Отрицательный endpoint-кэш изолирован по JH и предыдущему серверу", EndpointFailureCacheContexts);
         Test("Фоновая проверка одной сессии имеет единственного владельца", BackgroundProbeRegistrySerializesPerServer);
@@ -7013,16 +7014,16 @@ internal sealed partial class SelfTestRunner
         Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(jumphostFailure));
         Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(jumphostAuthEx));
 
-        // Mixed aggregate: both orders must return false because authentication failure is terminal
+        // Mixed aggregate: authentication failure on an alternate route does not block recovery of a temporarily unavailable route
         var mixedAggEntryFirst = new AggregateException(unavailableEntryEx, jumphostAuthEx);
         var mixedAggAuthFirst = new AggregateException(jumphostAuthEx, unavailableEntryEx);
-        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggEntryFirst));
-        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggAuthFirst));
+        Equal(true, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggEntryFirst));
+        Equal(true, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggAuthFirst));
 
-        // Nested authentication failure must also be detected and return false
+        // Nested authentication failure on alternate route also does not block recovery
         var nestedAuthEx = new InvalidOperationException("Wrapper error", jumphostAuthEx);
         var mixedAggNestedAuth = new AggregateException(unavailableEntryEx, nestedAuthEx);
-        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggNestedAuth));
+        Equal(true, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggNestedAuth));
     }
 
     private static void RoutedSessionCreateMinimal()
