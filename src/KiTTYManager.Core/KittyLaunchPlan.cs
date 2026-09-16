@@ -100,6 +100,7 @@ public static class KittyLaunchPlan
             var privilegeCommand = BuildPrivilegeCommand(server);
             if (privilegeCommand is not null) arguments.AddRange(["-cmd", privilegeCommand]);
         }
+        arguments.Add("-send-to-tray");
         arguments.AddRange(["-title", $"{server.Name} — веб-туннель"]);
         return arguments;
     }

@@ -12,6 +12,7 @@ public partial class TextSettingsDialog : Window
     public bool CloseToTray => CloseToTrayBox.IsChecked == true;
     public bool EnableLogging => EnableLoggingBox.IsChecked == true;
     public bool WriteChangesImmediatelyToKitty => WriteToKittyBox.IsChecked == true;
+    public bool MaximizeKittyWindows => MaximizeKittyWindowsBox.IsChecked == true;
     public bool CloseWebTunnelWithFirefox => CloseWebTunnelBox.IsChecked == true;
     public bool AutoConfirmHostKeys => AutoConfirmHostKeysBox.IsChecked == true;
     public bool SuppressKittyChangeNotifications => SuppressKittyChangesBox.IsChecked == true;
@@ -41,7 +42,8 @@ public partial class TextSettingsDialog : Window
         bool firefoxDisableHistoryAndIcons = true,
         bool firefoxClearCacheOnShutdown = true,
         bool firefoxCleanRemovedServerContainers = true,
-        bool firefoxAcceptInsecureCerts = true)
+        bool firefoxAcceptInsecureCerts = true,
+        bool maximizeKittyWindows = false)
     {
         InitializeComponent();
         Width = Math.Min(760, Math.Max(MinWidth, SystemParameters.WorkArea.Width - 48));
@@ -56,6 +58,7 @@ public partial class TextSettingsDialog : Window
         TaskConnectionRecoveryBox.Text = taskConnectionRecoveryMinutes.ToString();
         EnableLoggingBox.IsChecked = enableLogging;
         WriteToKittyBox.IsChecked = writeChangesImmediatelyToKitty;
+        MaximizeKittyWindowsBox.IsChecked = maximizeKittyWindows;
         CloseWebTunnelBox.IsChecked = closeWebTunnelWithFirefox;
         AutoConfirmHostKeysBox.IsChecked = autoConfirmHostKeys;
         SuppressKittyChangesBox.IsChecked = suppressKittyChangeNotifications;

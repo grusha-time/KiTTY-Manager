@@ -1005,7 +1005,11 @@ public partial class MainWindow : Window
             try
             {
                 loginScript = KittyLoginScript.Create(server);
-                var startInfo = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
+                var startInfo = new ProcessStartInfo(kitty)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                    WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
+                };
                 foreach (var argument in KittyLaunchPlan.OriginalSessionArguments(server, loginScript?.Path))
                     startInfo.ArgumentList.Add(argument);
                 Process.Start(startInfo);
@@ -1187,14 +1191,15 @@ public partial class MainWindow : Window
                     routedSession = directEndpoint is null
                         ? KittyRoutedSession.Create(
                             server.SourceSessionPath!, route.LocalSshPort, server.ImportedCommand,
-                            server.IgnoreImportedCommand)
+                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows)
                         : KittyRoutedSession.CreateDirect(
                             server.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
-                            server.ImportedCommand, server.IgnoreImportedCommand);
+                            server.ImportedCommand, server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows);
                 loginScript = KittyLoginScript.Create(server);
                 var startInfo = new ProcessStartInfo(kitty)
                 {
-                    WorkingDirectory = Path.GetDirectoryName(kitty)!
+                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                    WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
                 };
                 var arguments = directEndpoint is null
                     ? KittyLaunchPlan.RoutedConsoleArguments(
@@ -1320,7 +1325,11 @@ public partial class MainWindow : Window
                 // No login script for the tunnel: it connects to an already-
                 // authenticated local SSH port. A login script waiting for a
                 // shell prompt blocks the tunnel console until timeout.
-                var tunnelStart = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
+                var tunnelStart = new ProcessStartInfo(kitty)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                    WindowStyle = ProcessWindowStyle.Minimized
+                };
                 foreach (var argument in KittyLaunchPlan.RoutedTunnelArguments(server, route.LocalSshPort,
                              true, routedSession.Path, null, skipPrivilegeCommand: true))
                     tunnelStart.ArgumentList.Add(argument);
@@ -3428,7 +3437,8 @@ public partial class MainWindow : Window
             config.FirefoxDisableHistoryAndIcons,
             config.FirefoxClearCacheOnShutdown,
             config.FirefoxCleanRemovedServerContainers,
-            config.FirefoxAcceptInsecureCerts) { Owner = this };
+            config.FirefoxAcceptInsecureCerts,
+            config.MaximizeKittyWindows) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
         config.WinScpPath = dialog.WinScpPath;
@@ -3439,6 +3449,7 @@ public partial class MainWindow : Window
         config.EndpointProbeTimeoutSeconds = dialog.EndpointProbeTimeoutSeconds;
         config.TaskConnectionRecoveryMinutes = dialog.TaskConnectionRecoveryMinutes;
         config.WriteChangesImmediatelyToKitty = dialog.WriteChangesImmediatelyToKitty;
+        config.MaximizeKittyWindows = dialog.MaximizeKittyWindows;
         config.CloseWebTunnelWithFirefox = dialog.CloseWebTunnelWithFirefox;
         config.AutoDiscoverFirefoxProfile = dialog.AutoDiscoverFirefoxProfile;
         config.FirefoxTemplateProfile = dialog.AutoDiscoverFirefoxProfile ? "" : dialog.TemplateProfile;

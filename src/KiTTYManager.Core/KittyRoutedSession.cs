@@ -11,7 +11,7 @@ public sealed class KittyRoutedSession : IDisposable
 
     public static KittyRoutedSession Create(
         string sourceSessionPath, int localSshPort, string importedCommand = "", bool ignoreImportedCommand = false,
-        int? dynamicPort = null)
+        int? dynamicPort = null, bool maximize = false)
     {
         if (!File.Exists(sourceSessionPath)) throw new FileNotFoundException("Сессия KiTTY не найдена.", sourceSessionPath);
         var name = "KiTTYManager-route-" + Guid.NewGuid().ToString("N");
@@ -35,13 +35,23 @@ public sealed class KittyRoutedSession : IDisposable
         Set(lines, "RemoteCommand", "");
         var isPrivilegeCommand = KittyCredentialDecoder.NormalizeRootCommand(importedCommand) is not null;
         Set(lines, "Autocommand", ignoreImportedCommand || isPrivilegeCommand ? "" : importedCommand);
+        if (dynamicPort is > 0)
+        {
+            Set(lines, "SendToTray", "1");
+            Set(lines, "Maximize", "0");
+            Set(lines, "Fullscreen", "0");
+        }
+        else if (maximize)
+        {
+            Set(lines, "Maximize", "1");
+        }
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
         return new KittyRoutedSession(name, path);
     }
 
     public static KittyRoutedSession CreateDirect(
         string sourceSessionPath, string host, int port, string importedCommand = "",
-        bool ignoreImportedCommand = false)
+        bool ignoreImportedCommand = false, bool maximize = false)
     {
         if (!File.Exists(sourceSessionPath))
             throw new FileNotFoundException("Сессия KiTTY не найдена.", sourceSessionPath);
@@ -64,6 +74,8 @@ public sealed class KittyRoutedSession : IDisposable
             KittyCredentialDecoder.NormalizeRootCommand(importedCommand) is not null;
         Set(lines, "Autocommand",
             ignoreImportedCommand || isPrivilegeCommand ? "" : importedCommand);
+        if (maximize)
+            Set(lines, "Maximize", "1");
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
         return new KittyRoutedSession(name, path);
     }
@@ -93,7 +105,10 @@ public sealed class KittyRoutedSession : IDisposable
             "Scriptfile\\\\",
             "ScriptfileContent\\\\",
             "Autocommand\\\\",
-            "RemoteCommand\\\\"
+            "RemoteCommand\\\\",
+            "SendToTray\\1\\",
+            "Maximize\\0\\",
+            "Fullscreen\\0\\"
         };
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
         return new KittyRoutedSession(name, path);

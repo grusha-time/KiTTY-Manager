@@ -118,6 +118,7 @@ public static class ConfigTransfer
         config.CloseToTray = false;
         config.EnableLogging = false;
         config.WriteChangesImmediatelyToKitty = false;
+        config.MaximizeKittyWindows = false;
         config.CloseWebTunnelWithFirefox = false;
         config.AutoDiscoverFirefoxProfile = true;
         config.FirefoxTemplateProfile = "";

@@ -419,6 +419,7 @@ internal sealed partial class SelfTestRunner
         Test("Таймаут прямой цели не блокирует обход через ту же JH", DirectTimeoutDoesNotBlockSameProxyMultiHop);
         Test("ClearFailureCache сбрасывает весь кэш", ClearFailureCacheResetsAll);
         Test("CreateMinimal создаёт валидную сессию без Autocommand", RoutedSessionCreateMinimal);
+        Test("Опции окон KiTTY: максимизация обычных консолей и скрытие туннелей в трей", KittyWindowDisplayOptionsAndSessionConfiguration);
         Test("Умный импорт отдаёт приоритет более коротким сохранённым маршрутам", SmartImportAppliesShorterPreferredRoutes);
         Test("Асимметричная проверка связей и инвалидация направления", AsymmetricLinkVerificationAndDirectedInvalidation);
         Test("Определение односторонних и двусторонних связей на карте", AsymmetricLinkMapVisuals);
@@ -1476,10 +1477,16 @@ internal sealed partial class SelfTestRunner
         Equal(true, ContainsPair(arguments, "-loadfile", "runtime-session"));
         Equal(true, ContainsPair(arguments, "-P", "43123"));
         Equal(false, arguments.Contains("-D"));
-        Equal(false, arguments.Contains("-send-to-tray"));
+        Equal(true, arguments.Contains("-send-to-tray"));
+        Equal(1, arguments.Count(a => a == "-send-to-tray"));
         Equal(false, arguments.Contains("-N"));
         Equal(true, ContainsPair(arguments, "-loginscript", "root-login.txt"));
         Equal(false, arguments.Contains("-cmd"));
+
+        var routedConsoleArgs = KittyLaunchPlan.RoutedConsoleArguments(server, 43123, true, "runtime-session");
+        Equal(false, routedConsoleArgs.Contains("-send-to-tray"));
+        var directConsoleArgs = KittyLaunchPlan.DirectConsoleArguments(server, "192.0.2.10", 22, true, "runtime-session");
+        Equal(false, directConsoleArgs.Contains("-send-to-tray"));
     }
 
     private static void InternalWebResolverDefaultsAndRoundTrip()
@@ -6757,8 +6764,105 @@ internal sealed partial class SelfTestRunner
             Equal(true, content.Contains("Autocommand\\\\"));
             Equal(true, content.Contains("Scriptfile\\\\"));
             Equal(true, content.Contains("ScriptfileContent\\\\"));
+            Equal(true, content.Contains("SendToTray\\1\\"));
+            Equal(true, content.Contains("Maximize\\0\\"));
+            Equal(true, content.Contains("Fullscreen\\0\\"));
         }
         finally { try { File.Delete(path); } catch { } }
+    }
+
+    private static void KittyWindowDisplayOptionsAndSessionConfiguration()
+    {
+        // 1. Config defaults and serialization
+        var freshConfig = new ManagerConfig();
+        Equal(false, freshConfig.MaximizeKittyWindows);
+
+        var tempConfigPath = TempFile();
+        var oldProtector = ConfigStore.SecretProtector;
+        try
+        {
+            ConfigStore.SecretProtector = new TestConfigSecretProtector();
+            freshConfig.MaximizeKittyWindows = true;
+            ConfigStore.Save(tempConfigPath, freshConfig);
+            var loaded = ConfigStore.Load(tempConfigPath);
+            Equal(true, loaded.MaximizeKittyWindows);
+
+            // Legacy JSON without MaximizeKittyWindows
+            var legacyJson = "{\"SchemaVersion\": 9, \"Groups\": []}";
+            File.WriteAllText(tempConfigPath, legacyJson);
+            var legacyLoaded = ConfigStore.Load(tempConfigPath);
+            Equal(false, legacyLoaded.MaximizeKittyWindows);
+
+            // Export resets MaximizeKittyWindows without altering source
+            var export = ConfigTransfer.CreateExport(freshConfig, [], false);
+            Equal(false, export.MaximizeKittyWindows);
+            Equal(true, freshConfig.MaximizeKittyWindows);
+        }
+        finally
+        {
+            ConfigStore.SecretProtector = oldProtector;
+            try { File.Delete(tempConfigPath); } catch { }
+        }
+
+        // 2. KittyRoutedSession creation options
+        var sourceSessionPath = TempFile();
+        try
+        {
+            File.WriteAllLines(sourceSessionPath,
+            [
+                "HostName\\10.0.0.1\\",
+                "PortNumber\\22\\",
+                "Maximize\\1\\",
+                "Fullscreen\\1\\"
+            ]);
+
+            // Web tunnel session (dynamicPort > 0) suppresses source Maximize and Fullscreen, forces SendToTray=1
+            using (var tunnelSession = KittyRoutedSession.Create(sourceSessionPath, 43100, dynamicPort: 49100))
+            {
+                var text = File.ReadAllText(tunnelSession.Path);
+                Equal(true, text.Contains("SendToTray\\1\\"));
+                Equal(true, text.Contains("Maximize\\0\\"));
+                Equal(true, text.Contains("Fullscreen\\0\\"));
+                Equal(true, text.Contains("PortForwardings\\D49100=\\"));
+            }
+
+            // Routed session with maximize=false preserves source session settings
+            using (var normalSession = KittyRoutedSession.Create(sourceSessionPath, 43100, maximize: false))
+            {
+                var text = File.ReadAllText(normalSession.Path);
+                Equal(true, text.Contains("Maximize\\1\\"));
+                Equal(false, text.Contains("SendToTray\\1\\"));
+            }
+
+            // Fresh source session without Maximize
+            File.WriteAllLines(sourceSessionPath,
+            [
+                "HostName\\10.0.0.1\\",
+                "PortNumber\\22\\"
+            ]);
+
+            // Routed session with maximize=true adds Maximize\1\
+            using (var maxSession = KittyRoutedSession.Create(sourceSessionPath, 43100, maximize: true))
+            {
+                var text = File.ReadAllText(maxSession.Path);
+                Equal(true, text.Contains("Maximize\\1\\"));
+            }
+
+            // Direct session with maximize=true
+            using (var directMax = KittyRoutedSession.CreateDirect(sourceSessionPath, "10.0.0.1", 22, maximize: true))
+            {
+                var text = File.ReadAllText(directMax.Path);
+                Equal(true, text.Contains("Maximize\\1\\"));
+            }
+
+            // Direct session with maximize=false
+            using (var directNormal = KittyRoutedSession.CreateDirect(sourceSessionPath, "10.0.0.1", 22, maximize: false))
+            {
+                var text = File.ReadAllText(directNormal.Path);
+                Equal(false, text.Contains("Maximize\\1\\"));
+            }
+        }
+        finally { try { File.Delete(sourceSessionPath); } catch { } }
     }
 }
 
