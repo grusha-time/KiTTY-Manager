@@ -3573,7 +3573,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        activeTunnelsWindow = new ActiveTunnelsWindow(tunnelService, RequestForwardTunnelFromWindowAsync);
+        activeTunnelsWindow = new ActiveTunnelsWindow(tunnelService);
         activeTunnelsWindow.Closed += (_, _) => activeTunnelsWindow = null;
         activeTunnelsWindow.Show();
     }
@@ -3601,53 +3601,6 @@ public partial class MainWindow : Window
                 startedItem = await tunnelService.StartTunnelAsync(definition, token);
             });
             if (startedItem is { IsRunning: true })
-            {
-                Status($"Туннель «{definition.Summary}» успешно поднят.");
-            }
-        }
-        catch (Exception ex)
-        {
-            Error(ex);
-        }
-    }
-
-    private async Task RequestForwardTunnelFromWindowAsync(Window parentWindow)
-    {
-        var allServers = config.AllServers().ToList();
-        if (allServers.Count == 0)
-        {
-            ThemedMessageDialog.Show(parentWindow, "В менеджере нет сохранённых сессий.", "Проброс туннеля", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        ManagedServer? server = SelectedRow()?.Server ?? selectedServer;
-        if (server is null)
-        {
-            if (allServers.Count == 1)
-            {
-                server = allServers[0];
-            }
-            else
-            {
-                var picker = new SearchChoiceDialog("Выбор сессии", "Выберите сессию для проброса туннеля:", allServers) { Owner = parentWindow };
-                if (picker.ShowDialog() != true || picker.Selections.Count == 0) return;
-                server = picker.Selections[0] as ManagedServer;
-            }
-        }
-        if (server is null) return;
-
-        var dialog = new TunnelForwardDialog(server) { Owner = parentWindow };
-        if (dialog.ShowDialog() != true || dialog.Result is null) return;
-
-        var definition = dialog.Result;
-        ActiveTunnelItem? windowStartedItem = null;
-        try
-        {
-            await BusyAsync($"Поднимаю туннель «{definition.Summary}»…", async token =>
-            {
-                windowStartedItem = await tunnelService.StartTunnelAsync(definition, token);
-            });
-            if (windowStartedItem is { IsRunning: true })
             {
                 Status($"Туннель «{definition.Summary}» успешно поднят.");
             }

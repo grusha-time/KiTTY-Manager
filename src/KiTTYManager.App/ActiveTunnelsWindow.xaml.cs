@@ -7,16 +7,12 @@ namespace KiTTYManager.App;
 public partial class ActiveTunnelsWindow : Window
 {
     private readonly TunnelService tunnelService;
-    private readonly Func<Window, Task>? requestAddTunnel;
     private bool forceClose;
 
-    public ActiveTunnelsWindow(TunnelService tunnelService, Func<Window, Task>? requestAddTunnel = null)
+    public ActiveTunnelsWindow(TunnelService tunnelService)
     {
         InitializeComponent();
         this.tunnelService = tunnelService ?? throw new ArgumentNullException(nameof(tunnelService));
-        this.requestAddTunnel = requestAddTunnel;
-
-        AddTunnelButton.Visibility = requestAddTunnel != null ? Visibility.Visible : Visibility.Collapsed;
 
         tunnelService.Changed += OnTunnelServiceChanged;
         Closing += Window_Closing;
@@ -99,14 +95,6 @@ public partial class ActiveTunnelsWindow : Window
     private async void StopAll_Click(object sender, RoutedEventArgs e)
     {
         await tunnelService.StopAllAsync();
-    }
-
-    private async void AddTunnel_Click(object sender, RoutedEventArgs e)
-    {
-        if (requestAddTunnel != null)
-        {
-            await requestAddTunnel(this);
-        }
     }
 
     private void CopyBind_Click(object sender, RoutedEventArgs e)

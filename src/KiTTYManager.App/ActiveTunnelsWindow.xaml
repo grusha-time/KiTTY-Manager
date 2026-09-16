@@ -23,8 +23,6 @@
         <TextBlock x:Name="TunnelCountText" Text="Туннелей: 0" Opacity="0.7" Margin="0,3,0,0"/>
       </StackPanel>
       <WrapPanel Grid.Column="1" VerticalAlignment="Center">
-        <Button x:Name="AddTunnelButton" Content="Прокинуть туннель…" Style="{StaticResource SuccessButton}"
-                Click="AddTunnel_Click" Margin="0,0,8,0"/>
         <Button x:Name="StopSelectedButton" Content="Остановить выбранные" Style="{StaticResource DangerButton}"
                 Click="StopSelected_Click" Margin="0,0,8,0"/>
         <Button x:Name="StopAllButton" Content="Остановить все" Click="StopAll_Click"/>

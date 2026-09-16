@@ -27,7 +27,7 @@ public partial class TunnelForwardDialog : Window
 
     private void UpdateKindHelp()
     {
-        if (KindBox is null || KindHelpText is null) return;
+        if (KindBox is null || KindHelp is null) return;
 
         var selected = KindBox.SelectedIndex;
         var isDynamic = selected == 2;
@@ -44,25 +44,77 @@ public partial class TunnelForwardDialog : Window
 
         if (isDynamic)
         {
-            BindHostLabel.Text = "Где открыть SOCKS5 (ПК)";
-            BindPortLabel.Text = "Порт SOCKS5";
-            if (string.IsNullOrWhiteSpace(BindPortBox.Text))
+            KindHelp.Text = "Dynamic: менеджер поднимает локальный SOCKS5-прокси на вашем Windows-ПК. Любые программы могут направлять трафик через этот прокси во всю внутреннюю сеть сервера.";
+            if (BindHostLabel != null && BindHostBox != null)
+            {
+                BindHostLabel.Text = "Где открыть SOCKS5 (ПК)";
+                BindHostLabel.ToolTip = BindHostBox.ToolTip = "Адрес на вашем ПК, на котором откроется SOCKS5-прокси. Обычно 127.0.0.1 — тогда прокси доступен только самому ПК.";
+            }
+            if (BindPortLabel != null && BindPortBox != null)
+            {
+                BindPortLabel.Text = "Порт SOCKS5";
+                BindPortLabel.ToolTip = BindPortBox.ToolTip = "Номер локального SOCKS5-порта, который откроется для подключений (например, 1080).";
+            }
+            if (BindPortBox != null && string.IsNullOrWhiteSpace(BindPortBox.Text))
             {
                 BindPortBox.Text = "1080";
             }
-            KindHelpText.Text = "Dynamic (-D / SOCKS): менеджер открывает локальный SOCKS5-прокси на вашем компьютере. Программы (браузер, утилиты), использующие этот прокси, получают доступ ко всей сети сервера.";
+            if (FieldsHelp != null)
+            {
+                FieldsHelp.Text = "Пример: открыть на ПК 127.0.0.1:1080 как SOCKS5-прокси — как ssh -D 1080.";
+            }
         }
         else if (isRemote)
         {
-            BindHostLabel.Text = "Где открыть порт (сервер)";
-            BindPortLabel.Text = "Какой порт открыть";
-            KindHelpText.Text = "Remote (-R): SSH-сервер открывает указанный порт на своей стороне. Подключения к нему перенаправляются через SSH к целевому адресу со стороны вашего ПК.";
+            KindHelp.Text = "Remote: SSH-сервер открывает указанный порт. Подключения к этому порту идут через SSH к целевому хосту со стороны вашего ПК.";
+            if (BindHostLabel != null && BindHostBox != null)
+            {
+                BindHostLabel.Text = "Где открыть порт";
+                BindHostLabel.ToolTip = BindHostBox.ToolTip = "Адрес на сервере, на котором откроется порт. 127.0.0.1 — порт виден только на самом сервере (безопасный вариант).";
+            }
+            if (BindPortLabel != null && BindPortBox != null)
+            {
+                BindPortLabel.Text = "Какой порт открыть";
+                BindPortLabel.ToolTip = BindPortBox.ToolTip = "Номер порта, который откроется для подключений (1–65535).";
+            }
+            if (DestinationHostLabel != null && DestinationHostBox != null)
+            {
+                DestinationHostLabel.ToolTip = DestinationHostBox.ToolTip = "Адрес, который доступен с вашего ПК: куда на самом деле попадёт трафик (например, внутренний веб-сервер).";
+            }
+            if (DestinationPortLabel != null && DestinationPortBox != null)
+            {
+                DestinationPortLabel.ToolTip = DestinationPortBox.ToolTip = "Порт назначения, на который попадёт трафик.";
+            }
+            if (FieldsHelp != null)
+            {
+                FieldsHelp.Text = "Пример: открыть на сервере 127.0.0.1:8443 и вести трафик со стороны ПК на example.com:443 — как ssh -R 8443:example.com:443.";
+            }
         }
         else
         {
-            BindHostLabel.Text = "Где открыть порт (ПК)";
-            BindPortLabel.Text = "Какой порт открыть";
-            KindHelpText.Text = "Local (-L): менеджер открывает порт на вашем ПК. Подключения к нему перенаправляются через SSH к целевому адресу со стороны сервера.";
+            KindHelp.Text = "Local: менеджер открывает порт на вашем Windows-ПК. Подключение к нему уходит через выбранный сервер к целевому хосту.";
+            if (BindHostLabel != null && BindHostBox != null)
+            {
+                BindHostLabel.Text = "Где открыть порт";
+                BindHostLabel.ToolTip = BindHostBox.ToolTip = "Адрес на вашем ПК, на котором откроется порт. Обычно 127.0.0.1 — тогда порт виден только самому ПК.";
+            }
+            if (BindPortLabel != null && BindPortBox != null)
+            {
+                BindPortLabel.Text = "Какой порт открыть";
+                BindPortLabel.ToolTip = BindPortBox.ToolTip = "Номер порта, который откроется для подключений (1–65535).";
+            }
+            if (DestinationHostLabel != null && DestinationHostBox != null)
+            {
+                DestinationHostLabel.ToolTip = DestinationHostBox.ToolTip = "Адрес, который виден со стороны сервера: куда сервер будет думать, что он подключается.";
+            }
+            if (DestinationPortLabel != null && DestinationPortBox != null)
+            {
+                DestinationPortLabel.ToolTip = DestinationPortBox.ToolTip = "Порт назначения, на который попадёт трафик.";
+            }
+            if (FieldsHelp != null)
+            {
+                FieldsHelp.Text = "Пример: открыть на ПК 127.0.0.1:9000 и вести трафик через сервер на db.internal:5432 — как ssh -L 9000:db.internal:5432.";
+            }
         }
     }
 
