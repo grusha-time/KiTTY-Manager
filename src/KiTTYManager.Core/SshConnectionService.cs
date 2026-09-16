@@ -205,28 +205,32 @@ public sealed class SshConnectionService
         CancellationToken cancellationToken = default, bool consoleOnly = false,
         bool rememberTargetPreference = true,
         Action<SshConnectionProgress>? progress = null,
-        int attemptIndex = 1, int attemptCount = 1) =>
+        int attemptIndex = 1, int attemptCount = 1,
+        RouteAttemptBudget? budget = null) =>
         await ConnectCandidatesAsync(config, [candidate],
             "Указанный маршрут недоступен.", cancellationToken, consoleOnly,
-            rememberTargetPreference, progress, attemptIndex, attemptCount);
+            rememberTargetPreference, progress, attemptIndex, attemptCount, budget);
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectFirstSuccessfulAsync(
         ManagerConfig config, IReadOnlyList<RouteCandidate> candidates,
         CancellationToken cancellationToken = default, bool consoleOnly = false,
         Action<SshConnectionProgress>? progress = null,
         IReadOnlyList<int>? candidateIndices = null,
-        int totalAttempts = 0)
+        int totalAttempts = 0,
+        RouteAttemptBudget? budget = null)
     {
         if (candidates.Count == 0)
             throw new InvalidOperationException("Не указаны маршруты для параллельной проверки.");
 
+        budget ??= new RouteAttemptBudget(config.MaxRouteAttempts);
         var attemptCount = totalAttempts > 0 ? totalAttempts : candidates.Count;
         using var raceCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var tasks = candidates.Select((candidate, index) => ConnectCandidateAsync(
             config, candidate, raceCancellation.Token, consoleOnly,
             progress: progress,
             attemptIndex: candidateIndices is not null && index < candidateIndices.Count ? candidateIndices[index] : (index + 1),
-            attemptCount: attemptCount)).ToList();
+            attemptCount: attemptCount,
+            budget: budget)).ToList();
         var failures = new List<Exception>();
         while (tasks.Count > 0)
         {
@@ -243,6 +247,9 @@ public sealed class SshConnectionService
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex) { failures.Add(ex); }
         }
+
+        if (budget is not null && !budget.HasCapacity)
+            throw new RouteAttemptLimitException(budget.Limit, budget.AttemptCount, failures.Count == 0 ? null : new AggregateException(failures));
 
         throw new InvalidOperationException(
             "Ни один из параллельно проверенных маршрутов не сработал.",
@@ -261,8 +268,10 @@ public sealed class SshConnectionService
         CancellationToken cancellationToken, bool consoleOnly,
         bool rememberTargetPreference = true,
         Action<SshConnectionProgress>? progress = null,
-        int overrideAttemptIndex = 0, int overrideAttemptCount = 0)
+        int overrideAttemptIndex = 0, int overrideAttemptCount = 0,
+        RouteAttemptBudget? budget = null)
     {
+        budget ??= new RouteAttemptBudget(config.MaxRouteAttempts);
         var failures = new List<Exception>();
         var candidateList = candidates
             .Where(candidate => RoutePlanner.SatisfiesRouteConstraints(config, candidate))
@@ -272,6 +281,7 @@ public sealed class SshConnectionService
                 new InvalidOperationException("No enabled global SOCKS route candidates."));
 
         var totalAttempts = overrideAttemptCount > 0 ? overrideAttemptCount : candidateList.Length;
+        var budgetExhausted = false;
         for (var i = 0; i < candidateList.Length; i++)
         {
             var candidate = candidateList[i];
@@ -287,6 +297,11 @@ public sealed class SshConnectionService
                     SshConnectionProgressKind.CachedSkip,
                     attemptNumber, totalAttempts, routeDesc));
                 continue;
+            }
+            if (!budget.TryAcquire())
+            {
+                budgetExhausted = true;
+                break;
             }
             cancellationToken.ThrowIfCancellationRequested();
             using var attempt = CreateAttemptCancellation(cancellationToken);
@@ -394,6 +409,8 @@ public sealed class SshConnectionService
                     Duration: sw.Elapsed, ErrorMessage: SafeMessage(ex)));
             }
         }
+        if (budgetExhausted || (candidateList.Length > 0 && !budget.HasCapacity))
+            throw new RouteAttemptLimitException(budget.Limit, budget.AttemptCount, CombineFailures(failures));
         throw new InvalidOperationException(AddTimeoutHint(failureMessage, failures), CombineFailures(failures));
     }
 

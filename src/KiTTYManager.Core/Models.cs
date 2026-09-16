@@ -17,12 +17,13 @@ public sealed class ManagerConfig
     public bool CloseToTray { get; set; }
     public bool EnableLogging { get; set; }
     public bool WriteChangesImmediatelyToKitty { get; set; }
-    public bool MaximizeKittyWindows { get; set; }
+    public bool MaximizeKittyWindows { get; set; } = true;
     public bool CloseWebTunnelWithFirefox { get; set; }
     public bool AutoDiscoverFirefoxProfile { get; set; } = true;
     public string FirefoxTemplateProfile { get; set; } = "";
     public int ConnectionTimeoutSeconds { get; set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; set; } = 4;
+    public int MaxRouteAttempts { get; set; } = 10;
     public int TaskConnectionRecoveryMinutes { get; set; } = 1;
     public bool AutoConfirmHostKeys { get; set; } = true;
     public bool SuppressKittyChangeNotifications { get; set; } = true;

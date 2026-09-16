@@ -67,6 +67,10 @@
             <TextBox x:Name="EndpointProbeTimeoutBox" MaxLength="2" ToolTip="Допустимое значение: от 1 до 30 секунд"/>
             <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                        Text="Короткая проверка доступности конкретного основного или резервного ip:port. Входит в общий таймаут попытки маршрута."/>
+            <TextBlock Text="Лимит вариантов маршрутов" Margin="0,16,0,7"/>
+            <TextBox x:Name="MaxRouteAttemptsBox" MaxLength="3" ToolTip="Допустимое значение: от 1 до 100 вариантов (по умолчанию 10)"/>
+            <TextBlock Margin="0,8,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
+                       Text="Максимальное число перебираемых маршрутов подключения к целевому серверу."/>
             <TextBlock Text="Ожидание восстановления связи в задачах, мин" Margin="0,16,0,7"/>
             <TextBox x:Name="TaskConnectionRecoveryBox" MaxLength="5"
                      ToolTip="От 0 до 99999 минут. Массовая задача или Ansible повторяет подключение каждые 10 секунд и не переходит к следующему действию. После таймаута можно продлить ожидание или остановить задачу."/>

@@ -253,6 +253,10 @@ internal sealed partial class SelfTestRunner
         Test("Остановка до или во время подключения сохраняет причину и шаг", BatchRunCancellationPreservesStopReason);
         Test("Смешанный отказ маршрутов распознаётся как сбой связи", MixedRouteFailureIsConnectivityFailure);
         Test("Лимит endpoint-зонда по умолчанию 4 секунды и сохраняется в JSON", EndpointProbeTimeoutRoundTrip);
+        Test("Лимит вариантов маршрутов по умолчанию 10, нормализуется и сохраняется в JSON", RouteAttemptLimitDefaultsAndRoundTrip);
+        Test("Бюджет попыток маршрутов ограничивает попытки и генерирует исключение", RouteAttemptBudgetEnforcementAndException);
+        Test("Исключение лимита маршрутов не считается сбоем связи в задачах", RouteAttemptLimitNonRetryableInBatchTasks);
+        Test("Параллельная проверка маршрутов делит общий бюджет при вызове без явного бюджета", ConnectFirstSuccessfulSharesBudgetWhenOmitted);
         Test("Отрицательный endpoint-кэш изолирован по JH и предыдущему серверу", EndpointFailureCacheContexts);
         Test("Фоновая проверка одной сессии имеет единственного владельца", BackgroundProbeRegistrySerializesPerServer);
         Test("Фоновая проверка не пропускает короткий маршрут после текущего", BackgroundProbePrioritizesShorterRoute);
@@ -7044,28 +7048,34 @@ internal sealed partial class SelfTestRunner
     {
         // 1. Config defaults and serialization
         var freshConfig = new ManagerConfig();
-        Equal(false, freshConfig.MaximizeKittyWindows);
+        Equal(true, freshConfig.MaximizeKittyWindows);
 
         var tempConfigPath = TempFile();
         var oldProtector = ConfigStore.SecretProtector;
         try
         {
             ConfigStore.SecretProtector = new TestConfigSecretProtector();
-            freshConfig.MaximizeKittyWindows = true;
+            freshConfig.MaximizeKittyWindows = false;
             ConfigStore.Save(tempConfigPath, freshConfig);
             var loaded = ConfigStore.Load(tempConfigPath);
-            Equal(true, loaded.MaximizeKittyWindows);
+            Equal(false, loaded.MaximizeKittyWindows);
 
-            // Legacy JSON without MaximizeKittyWindows
+            // Legacy JSON without MaximizeKittyWindows (deserializes with default value true)
             var legacyJson = "{\"SchemaVersion\": 9, \"Groups\": []}";
             File.WriteAllText(tempConfigPath, legacyJson);
             var legacyLoaded = ConfigStore.Load(tempConfigPath);
-            Equal(false, legacyLoaded.MaximizeKittyWindows);
+            Equal(true, legacyLoaded.MaximizeKittyWindows);
 
-            // Export resets MaximizeKittyWindows without altering source
+            // Explicitly disabled in JSON
+            var disabledJson = "{\"SchemaVersion\": 9, \"MaximizeKittyWindows\": false, \"Groups\": []}";
+            File.WriteAllText(tempConfigPath, disabledJson);
+            var disabledLoaded = ConfigStore.Load(tempConfigPath);
+            Equal(false, disabledLoaded.MaximizeKittyWindows);
+
+            // Export resets MaximizeKittyWindows to default without altering source
             var export = ConfigTransfer.CreateExport(freshConfig, [], false);
-            Equal(false, export.MaximizeKittyWindows);
-            Equal(true, freshConfig.MaximizeKittyWindows);
+            Equal(true, export.MaximizeKittyWindows);
+            Equal(false, freshConfig.MaximizeKittyWindows);
         }
         finally
         {

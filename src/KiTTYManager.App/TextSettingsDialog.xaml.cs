@@ -27,6 +27,7 @@ public partial class TextSettingsDialog : Window
     public bool FirefoxAcceptInsecureCerts => FirefoxAcceptInsecureCertsBox.IsChecked == true;
     public int ConnectionTimeoutSeconds { get; private set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; private set; } = 4;
+    public int MaxRouteAttempts { get; private set; } = 10;
     public int TaskConnectionRecoveryMinutes { get; private set; } = 1;
     public TextSettingsDialog(string kittyPath, string firefoxPath, bool closeToTray,
         bool enableLogging = false, int connectionTimeoutSeconds = 10, int endpointProbeTimeoutSeconds = 4,
@@ -43,7 +44,8 @@ public partial class TextSettingsDialog : Window
         bool firefoxClearCacheOnShutdown = true,
         bool firefoxCleanRemovedServerContainers = true,
         bool firefoxAcceptInsecureCerts = true,
-        bool maximizeKittyWindows = false)
+        bool maximizeKittyWindows = true,
+        int maxRouteAttempts = 10)
     {
         InitializeComponent();
         Width = Math.Min(760, Math.Max(MinWidth, SystemParameters.WorkArea.Width - 48));
@@ -55,6 +57,7 @@ public partial class TextSettingsDialog : Window
         UpdateTemplateControls();
         ConnectionTimeoutBox.Text = connectionTimeoutSeconds.ToString(); CloseToTrayBox.IsChecked = closeToTray;
         EndpointProbeTimeoutBox.Text = endpointProbeTimeoutSeconds.ToString();
+        MaxRouteAttemptsBox.Text = maxRouteAttempts.ToString();
         TaskConnectionRecoveryBox.Text = taskConnectionRecoveryMinutes.ToString();
         EnableLoggingBox.IsChecked = enableLogging;
         WriteToKittyBox.IsChecked = writeChangesImmediatelyToKitty;
@@ -112,6 +115,14 @@ public partial class TextSettingsDialog : Window
             return;
         }
         EndpointProbeTimeoutSeconds = probeTimeout;
+        if (!int.TryParse(MaxRouteAttemptsBox.Text.Trim(), out var maxAttempts) || maxAttempts is < 1 or > 100)
+        {
+            ThemedMessageDialog.Show(this, "Укажите лимит вариантов маршрутов от 1 до 100.", "Настройки", MessageBoxButton.OK, MessageBoxImage.Warning);
+            MaxRouteAttemptsBox.Focus();
+            MaxRouteAttemptsBox.SelectAll();
+            return;
+        }
+        MaxRouteAttempts = maxAttempts;
         if (!int.TryParse(TaskConnectionRecoveryBox.Text.Trim(), out var recoveryMinutes) || recoveryMinutes is < 0 or > 99999)
         {
             ThemedMessageDialog.Show(this, "Укажите ожидание восстановления связи от 0 до 99999 минут.", "Настройки", MessageBoxButton.OK, MessageBoxImage.Warning);

@@ -1506,6 +1506,7 @@ public partial class MainWindow : Window
             return "Использован маршрут: " + string.Join(" → ", parts);
         }
 
+        var budget = new RouteAttemptBudget(config.MaxRouteAttempts);
         for (var candidateIdx = 0; candidateIdx < candidates.Count; candidateIdx++)
         {
             var candidate = candidates[candidateIdx];
@@ -1513,6 +1514,7 @@ public partial class MainWindow : Window
             var attemptCount = candidates.Count;
             if (racedCandidates.Contains(candidate)) continue;
             cancellationToken.ThrowIfCancellationRequested();
+            if (!budget.HasCapacity) break;
             var candidateSw = Stopwatch.StartNew();
             if (!proxyReady.TryGetValue(candidate.Proxy.Id, out var ready))
             {
@@ -1590,38 +1592,43 @@ public partial class MainWindow : Window
 
                     if (shorterReady)
                     {
-                        racedCandidates.Add(candidate);
-                        racedCandidates.Add(shorter);
-                        try
+                        if (budget.Remaining >= 2)
                         {
-                            Status($"Параллельно проверяю короткий путь «{RouteLabel(shorter)}» и текущий «{RouteLabel(candidate)}» для «{server.Name}»…");
-                            var shorterIndex = candidates.TakeWhile(c => !ReferenceEquals(c, shorter)).Count() + 1;
-                            if (shorterIndex > attemptCount) shorterIndex = attemptIndex;
-                            var raced = await ssh.ConnectFirstSuccessfulAsync(
-                                config, [shorter, candidate], cancellationToken, consoleOnly,
-                                progress: progress,
-                                candidateIndices: [shorterIndex, attemptIndex],
-                                totalAttempts: attemptCount);
-                            if (ReferenceEquals(raced.Candidate, shorter))
-                                RouteLog($"Shorter route race WON: target={server.Name}; winner={RouteLabel(shorter)}");
-                            else
-                                RouteLog($"Primary candidate finished first: target={server.Name}; winner={RouteLabel(candidate)}");
-                            return CompleteRoute(raced);
-                        }
-                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                        catch (Exception raceError)
-                        {
-                            errors.Add(raceError);
-                            var failedHops = ExceptionChain(raceError).OfType<SshHopException>()
-                                .DistinctBy(h => (h.SourceId, h.TargetId)).ToArray();
-                            if (failedHops.Length > 0)
+                            racedCandidates.Add(candidate);
+                            racedCandidates.Add(shorter);
+                            try
                             {
-                                foreach (var hop in failedHops)
-                                    ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
-                                SaveConfig();
+                                Status($"Параллельно проверяю короткий путь «{RouteLabel(shorter)}» и текущий «{RouteLabel(candidate)}» для «{server.Name}»…");
+                                RouteLog($"Shorter route race started: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}");
+                                var shorterIndex = candidates.TakeWhile(c => !ReferenceEquals(c, shorter)).Count() + 1;
+                                if (shorterIndex > attemptCount) shorterIndex = attemptIndex;
+                                var raced = await ssh.ConnectFirstSuccessfulAsync(
+                                    config, [shorter, candidate], cancellationToken, consoleOnly,
+                                    progress: progress,
+                                    candidateIndices: [shorterIndex, attemptIndex],
+                                    totalAttempts: attemptCount,
+                                    budget: budget);
+                                if (ReferenceEquals(raced.Candidate, shorter))
+                                    RouteLog($"Shorter route race WON: target={server.Name}; winner={RouteLabel(shorter)}");
+                                else
+                                    RouteLog($"Primary candidate finished first: target={server.Name}; winner={RouteLabel(candidate)}");
+                                return CompleteRoute(raced);
                             }
-                            RouteLog($"Shorter route race failed: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}; error={raceError.GetType().Name}: {raceError.Message}");
-                            continue;
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                            catch (Exception raceError)
+                            {
+                                errors.Add(raceError);
+                                var failedHops = ExceptionChain(raceError).OfType<SshHopException>()
+                                    .DistinctBy(h => (h.SourceId, h.TargetId)).ToArray();
+                                if (failedHops.Length > 0)
+                                {
+                                    foreach (var hop in failedHops)
+                                        ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
+                                    SaveConfig();
+                                }
+                                RouteLog($"Shorter route race failed: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}; error={raceError.GetType().Name}: {raceError.Message}");
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1638,31 +1645,35 @@ public partial class MainWindow : Window
                 if (second is not null &&
                     await IsSocks5ReadyAsync(second.Proxy, TimeSpan.FromSeconds(1), cancellationToken))
                 {
-                    raceAttempted = true;
-                    racedCandidates.Add(candidate);
-                    racedCandidates.Add(second);
-                    try
+                    if (budget.Remaining >= 2)
                     {
-                        Status($"Параллельно проверяю две точки входа для «{server.Name}»…");
-                        var secondIndex = candidates.TakeWhile(c => !ReferenceEquals(c, second)).Count() + 1;
-                        if (secondIndex > attemptCount) secondIndex = attemptIndex;
-                        return CompleteRoute(await ssh.ConnectFirstSuccessfulAsync(
-                            config, [candidate, second], cancellationToken, consoleOnly,
-                            progress: progress,
-                            candidateIndices: [attemptIndex, secondIndex],
-                            totalAttempts: attemptCount));
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                    catch (Exception error)
-                    {
-                        errors.Add(error);
-                        if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
+                        raceAttempted = true;
+                        racedCandidates.Add(candidate);
+                        racedCandidates.Add(second);
+                        try
                         {
-                            ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
-                            SaveConfig();
+                            Status($"Параллельно проверяю две точки входа для «{server.Name}»…");
+                            var secondIndex = candidates.TakeWhile(c => !ReferenceEquals(c, second)).Count() + 1;
+                            if (secondIndex > attemptCount) secondIndex = attemptIndex;
+                            return CompleteRoute(await ssh.ConnectFirstSuccessfulAsync(
+                                config, [candidate, second], cancellationToken, consoleOnly,
+                                progress: progress,
+                                candidateIndices: [attemptIndex, secondIndex],
+                                totalAttempts: attemptCount,
+                                budget: budget));
                         }
-                        RouteLog($"Entry point race failed: target={server.Name}; routes={RouteLabel(candidate)} | {RouteLabel(second)}; error={error.GetType().Name}: {error.Message}");
-                        continue;
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                        catch (Exception error)
+                        {
+                            errors.Add(error);
+                            if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
+                            {
+                                ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
+                                SaveConfig();
+                            }
+                            RouteLog($"Entry point race failed: target={server.Name}; routes={RouteLabel(candidate)} | {RouteLabel(second)}; error={error.GetType().Name}: {error.Message}");
+                            continue;
+                        }
                     }
                 }
             }
@@ -1675,7 +1686,8 @@ public partial class MainWindow : Window
                     rememberTargetPreference: forcedViaServerId is null,
                     progress: progress,
                     attemptIndex: attemptIndex,
-                    attemptCount: attemptCount));
+                    attemptCount: attemptCount,
+                    budget: budget));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception error)
@@ -1696,13 +1708,14 @@ public partial class MainWindow : Window
 
         // Mechanism B: all routes failed. Check if a jumphost's access script
         // expired (all control servers unreachable) and try to restore it.
-        if (await TryRestoreAccessAsync(candidates, cancellationToken))
+        if (budget.HasCapacity && await TryRestoreAccessAsync(candidates, cancellationToken))
         {
-            // Access restored — retry all candidates once.
+            // Access restored — retry all candidates once within remaining budget.
             for (var retryIdx = 0; retryIdx < candidates.Count; retryIdx++)
             {
                 var candidate = candidates[retryIdx];
                 cancellationToken.ThrowIfCancellationRequested();
+                if (!budget.HasCapacity) break;
                 if (!candidate.WithoutProxy &&
                     !await IsSocks5ReadyAsync(candidate.Proxy, TimeSpan.FromSeconds(1), cancellationToken))
                     continue;
@@ -1714,7 +1727,8 @@ public partial class MainWindow : Window
                         rememberTargetPreference: forcedViaServerId is null,
                         progress: progress,
                         attemptIndex: retryIdx + 1,
-                        attemptCount: candidates.Count));
+                        attemptCount: candidates.Count,
+                        budget: budget));
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch (Exception error)
@@ -1728,6 +1742,14 @@ public partial class MainWindow : Window
                     RouteLog($"Route retry failed: target={server.Name}; route={RouteLabel(candidate)}; error={error.GetType().Name}: {error.Message}");
                 }
             }
+        }
+
+        if (!budget.HasCapacity)
+        {
+            var limitMsg = RouteAttemptLimitException.FormatMessage(budget.Limit);
+            RouteLog(limitMsg);
+            throw new RouteAttemptLimitException(budget.Limit, budget.AttemptCount,
+                errors.Count == 0 ? null : new AggregateException(errors));
         }
 
         throw new InvalidOperationException(
@@ -3487,7 +3509,8 @@ public partial class MainWindow : Window
             config.FirefoxClearCacheOnShutdown,
             config.FirefoxCleanRemovedServerContainers,
             config.FirefoxAcceptInsecureCerts,
-            config.MaximizeKittyWindows) { Owner = this };
+            config.MaximizeKittyWindows,
+            config.MaxRouteAttempts) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
         config.WinScpPath = dialog.WinScpPath;
@@ -3496,6 +3519,7 @@ public partial class MainWindow : Window
             RouteLog("Журналирование отключено пользователем; дальнейшие записи прекращены.");
         config.EnableLogging = dialog.EnableLogging; config.ConnectionTimeoutSeconds = dialog.ConnectionTimeoutSeconds;
         config.EndpointProbeTimeoutSeconds = dialog.EndpointProbeTimeoutSeconds;
+        config.MaxRouteAttempts = dialog.MaxRouteAttempts;
         config.TaskConnectionRecoveryMinutes = dialog.TaskConnectionRecoveryMinutes;
         config.WriteChangesImmediatelyToKitty = dialog.WriteChangesImmediatelyToKitty;
         config.MaximizeKittyWindows = dialog.MaximizeKittyWindows;
