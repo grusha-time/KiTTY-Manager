@@ -24,7 +24,11 @@ public static class ImportedSessionMerger
         Text(nameof(ManagedServer.UseKeyboardInteractive), "Keyboard-interactive", s => s.UseKeyboardInteractive.ToString(), (s, v) => s.UseKeyboardInteractive = bool.Parse(v), b => b.UseKeyboardInteractive.ToString(), (b, v) => b.UseKeyboardInteractive = bool.Parse(v)),
         Text(nameof(ManagedServer.RootLogin), "Повышение прав", s => s.RootLogin, (s, v) => s.RootLogin = v, b => b.RootLogin, (b, v) => b.RootLogin = v),
         Text(nameof(ManagedServer.RootPassword), "Root-пароль", s => s.RootPassword, (s, v) => s.RootPassword = v, b => b.RootPassword, (b, v) => b.RootPassword = v, true),
-        Text(nameof(ManagedServer.ImportedCommand), "Команда KiTTY", s => s.ImportedCommand, (s, v) => s.ImportedCommand = v, b => b.ImportedCommand, (b, v) => b.ImportedCommand = v)
+        Text(nameof(ManagedServer.ImportedCommand), "Команда KiTTY", s => s.ImportedCommand, (s, v) => s.ImportedCommand = v, b => b.ImportedCommand, (b, v) => b.ImportedCommand = v),
+        Text(nameof(ManagedServer.KeepaliveIntervalSeconds), "Интервал keepalive", s => s.KeepaliveIntervalSeconds.ToString(), (s, v) => s.KeepaliveIntervalSeconds = int.Parse(v), b => b.KeepaliveIntervalSeconds.ToString(), (b, v) => b.KeepaliveIntervalSeconds = int.Parse(v)),
+        Text(nameof(ManagedServer.EnableTcpKeepalives), "TCP keepalive", s => s.EnableTcpKeepalives.ToString(), (s, v) => s.EnableTcpKeepalives = bool.Parse(v), b => b.EnableTcpKeepalives.ToString(), (b, v) => b.EnableTcpKeepalives = bool.Parse(v)),
+        Text(nameof(ManagedServer.ReconnectOnConnectionFailure), "Переподключение при сбое", s => s.ReconnectOnConnectionFailure.ToString(), (s, v) => s.ReconnectOnConnectionFailure = bool.Parse(v), b => b.ReconnectOnConnectionFailure.ToString(), (b, v) => b.ReconnectOnConnectionFailure = bool.Parse(v)),
+        Text(nameof(ManagedServer.ReconnectOnSystemWakeup), "Переподключение при выходе из сна", s => s.ReconnectOnSystemWakeup.ToString(), (s, v) => s.ReconnectOnSystemWakeup = bool.Parse(v), b => b.ReconnectOnSystemWakeup.ToString(), (b, v) => b.ReconnectOnSystemWakeup = bool.Parse(v))
     ];
 
     public static IReadOnlyList<string> TrackedProperties { get; } = Fields.Select(field => field.PropertyName).ToArray();
@@ -133,7 +137,11 @@ public static class ImportedSessionMerger
         Name = server.Name, Host = server.Host, Port = server.Port, Username = server.Username,
         Password = server.Password, PrivateKeyPath = server.PrivateKeyPath,
         UseKeyboardInteractive = server.UseKeyboardInteractive, RootLogin = server.RootLogin,
-        RootPassword = server.RootPassword, ImportedCommand = server.ImportedCommand
+        RootPassword = server.RootPassword, ImportedCommand = server.ImportedCommand,
+        KeepaliveIntervalSeconds = server.KeepaliveIntervalSeconds,
+        EnableTcpKeepalives = server.EnableTcpKeepalives,
+        ReconnectOnConnectionFailure = server.ReconnectOnConnectionFailure,
+        ReconnectOnSystemWakeup = server.ReconnectOnSystemWakeup
     };
 
     public static void Restore(ManagedServer server, KittySessionSnapshot snapshot)

@@ -13,7 +13,11 @@ public static class KittySessionWriter
         [nameof(ManagedServer.Password)] = "Password",
         [nameof(ManagedServer.PrivateKeyPath)] = "PublicKeyFile",
         [nameof(ManagedServer.UseKeyboardInteractive)] = "AuthKI",
-        [nameof(ManagedServer.ImportedCommand)] = "Autocommand"
+        [nameof(ManagedServer.ImportedCommand)] = "Autocommand",
+        [nameof(ManagedServer.KeepaliveIntervalSeconds)] = "PingInterval",
+        [nameof(ManagedServer.EnableTcpKeepalives)] = "TCPKeepalives",
+        [nameof(ManagedServer.ReconnectOnConnectionFailure)] = "FailureReconnect",
+        [nameof(ManagedServer.ReconnectOnSystemWakeup)] = "WakeupReconnect"
     };
 
     public static IReadOnlySet<string> WritableProperties { get; } =
@@ -54,6 +58,13 @@ public static class KittySessionWriter
         foreach (var property in selected)
         {
             if (property is nameof(ManagedServer.Name) or nameof(ManagedServer.RootPassword)) continue;
+            if (property == nameof(ManagedServer.KeepaliveIntervalSeconds))
+            {
+                var total = Math.Max(0, server.KeepaliveIntervalSeconds);
+                Set(lines, "PingInterval", (total / 60).ToString(CultureInfo.InvariantCulture));
+                Set(lines, "PingIntervalSecs", (total % 60).ToString(CultureInfo.InvariantCulture));
+                continue;
+            }
             var key = Keys[property];
             var value = property switch
             {
@@ -64,6 +75,9 @@ public static class KittySessionWriter
                 nameof(ManagedServer.UseKeyboardInteractive) => server.UseKeyboardInteractive ? "1" : "0",
                 nameof(ManagedServer.ImportedCommand) => server.ImportedCommand,
                 nameof(ManagedServer.Password) => EncodePassword(root, server, values),
+                nameof(ManagedServer.EnableTcpKeepalives) => server.EnableTcpKeepalives ? "1" : "0",
+                nameof(ManagedServer.ReconnectOnConnectionFailure) => server.ReconnectOnConnectionFailure ? "1" : "0",
+                nameof(ManagedServer.ReconnectOnSystemWakeup) => server.ReconnectOnSystemWakeup ? "1" : "0",
                 _ => ""
             };
             Set(lines, key, value);

@@ -72,6 +72,62 @@ public sealed class ManagedServer
     public string ShellPrompt { get; set; } = "$";
     public string ImportedCommand { get; set; } = "";
     public bool IgnoreImportedCommand { get; set; }
+    private int _keepaliveIntervalSeconds = 15;
+    private bool _enableTcpKeepalives = true;
+    private bool _reconnectOnConnectionFailure = true;
+    private bool _reconnectOnSystemWakeup = true;
+
+    [JsonIgnore] internal bool HasPersistedKeepaliveIntervalSeconds { get; set; }
+    [JsonIgnore] internal bool HasPersistedEnableTcpKeepalives { get; set; }
+    [JsonIgnore] internal bool HasPersistedReconnectOnConnectionFailure { get; set; }
+    [JsonIgnore] internal bool HasPersistedReconnectOnSystemWakeup { get; set; }
+
+    [JsonIgnore]
+    internal bool HasAllPersistedKeepaliveSettings =>
+        HasPersistedKeepaliveIntervalSeconds &&
+        HasPersistedEnableTcpKeepalives &&
+        HasPersistedReconnectOnConnectionFailure &&
+        HasPersistedReconnectOnSystemWakeup;
+
+    public int KeepaliveIntervalSeconds
+    {
+        get => _keepaliveIntervalSeconds;
+        set
+        {
+            _keepaliveIntervalSeconds = value;
+            HasPersistedKeepaliveIntervalSeconds = true;
+        }
+    }
+
+    public bool EnableTcpKeepalives
+    {
+        get => _enableTcpKeepalives;
+        set
+        {
+            _enableTcpKeepalives = value;
+            HasPersistedEnableTcpKeepalives = true;
+        }
+    }
+
+    public bool ReconnectOnConnectionFailure
+    {
+        get => _reconnectOnConnectionFailure;
+        set
+        {
+            _reconnectOnConnectionFailure = value;
+            HasPersistedReconnectOnConnectionFailure = true;
+        }
+    }
+
+    public bool ReconnectOnSystemWakeup
+    {
+        get => _reconnectOnSystemWakeup;
+        set
+        {
+            _reconnectOnSystemWakeup = value;
+            HasPersistedReconnectOnSystemWakeup = true;
+        }
+    }
     public KittySessionSnapshot? KittyBaseline { get; set; }
     public string HostKeyFingerprint { get; set; } = "";
     public string HostKeyAlgorithm { get; set; } = "";
@@ -161,6 +217,10 @@ public sealed class KittySessionSnapshot
     public string RootLogin { get; set; } = "";
     public string RootPassword { get; set; } = "";
     public string ImportedCommand { get; set; } = "";
+    public int KeepaliveIntervalSeconds { get; set; } = -1;
+    public bool EnableTcpKeepalives { get; set; } = true;
+    public bool ReconnectOnConnectionFailure { get; set; } = true;
+    public bool ReconnectOnSystemWakeup { get; set; } = true;
 }
 
 public sealed class CachedRoute

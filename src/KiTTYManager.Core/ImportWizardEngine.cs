@@ -413,6 +413,10 @@ public static class ImportWizardEngine
             Add("PreferredProxyId", "Предпочтительная JH", before.PreferredProxyId?.ToString() ?? "не задана", after.PreferredProxyId?.ToString() ?? "не задана");
             Add("BackupEndpoints", "Резервные адреса", EndpointSummary(before.BackupEndpoints), EndpointSummary(after.BackupEndpoints));
             Add("WebInterfaces", "Веб-интерфейсы", WebSummary(before.WebInterfaces), WebSummary(after.WebInterfaces));
+            Add("KeepaliveIntervalSeconds", "Интервал keepalive", before.KeepaliveIntervalSeconds.ToString(), after.KeepaliveIntervalSeconds.ToString());
+            Add("EnableTcpKeepalives", "TCP keepalive", before.EnableTcpKeepalives.ToString(), after.EnableTcpKeepalives.ToString());
+            Add("ReconnectOnConnectionFailure", "Переподключение при сбое", before.ReconnectOnConnectionFailure.ToString(), after.ReconnectOnConnectionFailure.ToString());
+            Add("ReconnectOnSystemWakeup", "Переподключение при выходе из сна", before.ReconnectOnSystemWakeup.ToString(), after.ReconnectOnSystemWakeup.ToString());
 
             void Add(string property, string label, string oldValue, string newValue, bool secret = false, bool keepCurrent = false)
             {
@@ -509,6 +513,10 @@ public static class ImportWizardEngine
                 case "PreferredProxyId": target.PreferredProxyId = source.PreferredProxyId; break;
                 case "BackupEndpoints": target.BackupEndpoints = Clone(source.BackupEndpoints); break;
                 case "WebInterfaces": target.WebInterfaces = Clone(source.WebInterfaces); break;
+                case "KeepaliveIntervalSeconds": target.KeepaliveIntervalSeconds = source.KeepaliveIntervalSeconds; break;
+                case "EnableTcpKeepalives": target.EnableTcpKeepalives = source.EnableTcpKeepalives; break;
+                case "ReconnectOnConnectionFailure": target.ReconnectOnConnectionFailure = source.ReconnectOnConnectionFailure; break;
+                case "ReconnectOnSystemWakeup": target.ReconnectOnSystemWakeup = source.ReconnectOnSystemWakeup; break;
             }
     }
 

@@ -188,6 +188,31 @@ public static class ConfigStore
         return null;
     }
 
+    public static string? ResolveExistingSessionPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        if (Path.IsPathRooted(path))
+        {
+            if (File.Exists(path)) return Path.GetFullPath(path);
+        }
+        else
+        {
+            try
+            {
+                var candidate = Path.Combine(BaseDirectory, path);
+                if (File.Exists(candidate)) return Path.GetFullPath(candidate);
+            }
+            catch { }
+        }
+        try
+        {
+            var relocated = TryRelocateStalePath(path);
+            if (relocated is not null && File.Exists(relocated)) return relocated;
+        }
+        catch { }
+        return null;
+    }
+
     private static ManagerConfig CloneForSave(ManagerConfig config)
     {
         var json = JsonSerializer.Serialize(config, Options);
@@ -304,6 +329,8 @@ public static class ConfigStore
         if (server.KittyBaseline is not null) server.KittyBaseline.Host = server.KittyBaseline.Host.Trim();
         server.ShellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
         server.ImportedCommand ??= "";
+        MigrateKeepaliveFromSourceSession(server);
+        if (server.KeepaliveIntervalSeconds < 0) server.KeepaliveIntervalSeconds = 15;
         server.WebInterfaces ??= [];
         foreach (var web in server.WebInterfaces)
             web.ResolverAddress = (web.ResolverAddress ?? "").Trim();
@@ -376,5 +403,56 @@ public static class ConfigStore
                  server.PreferredRoute.ServerIds[^2] != required))
                 server.PreferredRoute = null;
         }
+    }
+
+    private static void MigrateKeepaliveFromSourceSession(ManagedServer server)
+    {
+        if (server.HasAllPersistedKeepaliveSettings) return;
+        if (server.KittyBaseline is not null && server.KittyBaseline.KeepaliveIntervalSeconds >= 0) return;
+        if (string.IsNullOrWhiteSpace(server.SourceSessionPath)) return;
+
+        var sessionPath = ResolveExistingSessionPath(server.SourceSessionPath);
+        if (sessionPath is not null)
+        {
+            try
+            {
+                var values = KittySessionImporter.ParseFile(sessionPath);
+                var (ka, tcp, failRec, wakeRec) = KittySessionImporter.ReadKeepaliveSettings(values);
+                if (!server.HasPersistedKeepaliveIntervalSeconds && !server.ManagerOverrides.Contains(nameof(server.KeepaliveIntervalSeconds)))
+                    server.KeepaliveIntervalSeconds = ka;
+                if (!server.HasPersistedEnableTcpKeepalives && !server.ManagerOverrides.Contains(nameof(server.EnableTcpKeepalives)))
+                    server.EnableTcpKeepalives = tcp;
+                if (!server.HasPersistedReconnectOnConnectionFailure && !server.ManagerOverrides.Contains(nameof(server.ReconnectOnConnectionFailure)))
+                    server.ReconnectOnConnectionFailure = failRec;
+                if (!server.HasPersistedReconnectOnSystemWakeup && !server.ManagerOverrides.Contains(nameof(server.ReconnectOnSystemWakeup)))
+                    server.ReconnectOnSystemWakeup = wakeRec;
+
+                if (server.KittyBaseline is not null)
+                {
+                    server.KittyBaseline.KeepaliveIntervalSeconds = ka;
+                    server.KittyBaseline.EnableTcpKeepalives = tcp;
+                    server.KittyBaseline.ReconnectOnConnectionFailure = failRec;
+                    server.KittyBaseline.ReconnectOnSystemWakeup = wakeRec;
+                }
+                server.HasPersistedKeepaliveIntervalSeconds = true;
+                server.HasPersistedEnableTcpKeepalives = true;
+                server.HasPersistedReconnectOnConnectionFailure = true;
+                server.HasPersistedReconnectOnSystemWakeup = true;
+                return;
+            }
+            catch { }
+        }
+
+        if (server.KittyBaseline is not null)
+        {
+            server.KittyBaseline.KeepaliveIntervalSeconds = server.KeepaliveIntervalSeconds;
+            server.KittyBaseline.EnableTcpKeepalives = server.EnableTcpKeepalives;
+            server.KittyBaseline.ReconnectOnConnectionFailure = server.ReconnectOnConnectionFailure;
+            server.KittyBaseline.ReconnectOnSystemWakeup = server.ReconnectOnSystemWakeup;
+        }
+        server.HasPersistedKeepaliveIntervalSeconds = true;
+        server.HasPersistedEnableTcpKeepalives = true;
+        server.HasPersistedReconnectOnConnectionFailure = true;
+        server.HasPersistedReconnectOnSystemWakeup = true;
     }
 }

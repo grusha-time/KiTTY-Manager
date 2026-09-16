@@ -51,6 +51,9 @@ public static class KittySessionImporter
                 rootPassword = scriptPassword;
             }
 
+            var (keepaliveInterval, enableTcpKeepalives, reconnectOnFailure, reconnectOnWakeup) =
+                ReadKeepaliveSettings(values);
+
             result.Add(new ManagedServer
             {
                 Name = DecodeSessionName(fileName),
@@ -70,6 +73,10 @@ public static class KittySessionImporter
                 RootLogin = rootLogin,
                 RootPassword = rootPassword,
                 ImportedCommand = values.GetValueOrDefault("Autocommand") ?? "",
+                KeepaliveIntervalSeconds = keepaliveInterval,
+                EnableTcpKeepalives = enableTcpKeepalives,
+                ReconnectOnConnectionFailure = reconnectOnFailure,
+                ReconnectOnSystemWakeup = reconnectOnWakeup,
                 SourceSessionPath = Path.GetFullPath(path),
                 SourceScriptPath = scriptCredentials.SourcePath,
                 SourceScriptContent = scriptCredentials.Content,
@@ -316,5 +323,37 @@ public static class KittySessionImporter
         return index + 2 < value.Length && value[index] == '%' &&
                byte.TryParse(value.AsSpan(index + 1, 2), System.Globalization.NumberStyles.HexNumber,
                    System.Globalization.CultureInfo.InvariantCulture, out result);
+    }
+
+    public static (int KeepaliveIntervalSeconds, bool EnableTcpKeepalives, bool ReconnectOnConnectionFailure, bool ReconnectOnSystemWakeup)
+        ReadKeepaliveSettings(IReadOnlyDictionary<string, string> values)
+    {
+        int keepaliveInterval = 15;
+        var hasPingInterval = values.ContainsKey("PingInterval");
+        var hasPingIntervalSecs = values.ContainsKey("PingIntervalSecs");
+        if (hasPingInterval || hasPingIntervalSecs)
+        {
+            var rawMin = values.GetValueOrDefault("PingInterval");
+            var rawSec = values.GetValueOrDefault("PingIntervalSecs");
+            long minVal = 0;
+            long secVal = 0;
+            bool validMin = string.IsNullOrWhiteSpace(rawMin) || (long.TryParse(rawMin, out minVal) && minVal >= 0);
+            bool validSec = string.IsNullOrWhiteSpace(rawSec) || (long.TryParse(rawSec, out secVal) && secVal >= 0);
+            if (!validMin || !validSec)
+            {
+                keepaliveInterval = 15;
+            }
+            else
+            {
+                var total = minVal * 60L + secVal;
+                keepaliveInterval = total > int.MaxValue ? int.MaxValue : (int)total;
+            }
+        }
+
+        var enableTcpKeepalives = ReadBoolean(values.GetValueOrDefault("TCPKeepalives"), true);
+        var reconnectOnFailure = ReadBoolean(values.GetValueOrDefault("FailureReconnect"), true);
+        var reconnectOnWakeup = ReadBoolean(values.GetValueOrDefault("WakeupReconnect"), true);
+
+        return (keepaliveInterval, enableTcpKeepalives, reconnectOnFailure, reconnectOnWakeup);
     }
 }

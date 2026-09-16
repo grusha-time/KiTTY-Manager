@@ -11,7 +11,7 @@ public sealed class KittyRoutedSession : IDisposable
 
     public static KittyRoutedSession Create(
         string sourceSessionPath, int localSshPort, string importedCommand = "", bool ignoreImportedCommand = false,
-        int? dynamicPort = null, bool maximize = false)
+        int? dynamicPort = null, bool maximize = false, ManagedServer? server = null)
     {
         if (!File.Exists(sourceSessionPath)) throw new FileNotFoundException("Сессия KiTTY не найдена.", sourceSessionPath);
         var name = "KiTTYManager-route-" + Guid.NewGuid().ToString("N");
@@ -45,13 +45,15 @@ public sealed class KittyRoutedSession : IDisposable
         {
             Set(lines, "Maximize", "1");
         }
+        if (server is not null)
+            ApplyKeepaliveAndReconnect(lines, server);
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
         return new KittyRoutedSession(name, path);
     }
 
     public static KittyRoutedSession CreateDirect(
         string sourceSessionPath, string host, int port, string importedCommand = "",
-        bool ignoreImportedCommand = false, bool maximize = false)
+        bool ignoreImportedCommand = false, bool maximize = false, ManagedServer? server = null)
     {
         if (!File.Exists(sourceSessionPath))
             throw new FileNotFoundException("Сессия KiTTY не найдена.", sourceSessionPath);
@@ -76,6 +78,8 @@ public sealed class KittyRoutedSession : IDisposable
             ignoreImportedCommand || isPrivilegeCommand ? "" : importedCommand);
         if (maximize)
             Set(lines, "Maximize", "1");
+        if (server is not null)
+            ApplyKeepaliveAndReconnect(lines, server);
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
         return new KittyRoutedSession(name, path);
     }
@@ -84,41 +88,60 @@ public sealed class KittyRoutedSession : IDisposable
     /// Creates a minimal temporary session file from scratch when no saved KiTTY
     /// session exists. Used for web tunnels on manager-only sessions (duplicates).
     /// </summary>
-    public static KittyRoutedSession CreateMinimal(int localSshPort, int dynamicPort)
+    public static KittyRoutedSession CreateMinimal(int localSshPort, int dynamicPort) =>
+        CreateMinimal("127.0.0.1", localSshPort, dynamicPort: dynamicPort);
+
+    public static KittyRoutedSession CreateMinimal(
+        string host, int port, string importedCommand = "", bool ignoreImportedCommand = false,
+        int? dynamicPort = null, bool maximize = false, ManagedServer? server = null)
     {
         var name = "KiTTYManager-route-" + Guid.NewGuid().ToString("N");
         var runtimeDirectory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "KiTTYManager", "RoutedSessions");
         Directory.CreateDirectory(runtimeDirectory);
         var path = System.IO.Path.Combine(runtimeDirectory, name);
+        var isPrivilegeCommand = KittyCredentialDecoder.NormalizeRootCommand(importedCommand) is not null;
+        var autoCmd = ignoreImportedCommand || isPrivilegeCommand ? "" : importedCommand;
         var lines = new List<string>
         {
             "Present\\1\\",
             "Protocol\\ssh\\",
-            "HostName\\127.0.0.1\\",
-            $"PortNumber\\{localSshPort}\\",
+            $"HostName\\{KittySessionWriter.EncodeValue(host)}\\",
+            $"PortNumber\\{port}\\",
             "TerminalType\\xterm\\",
             "Nopty\\0\\",
             "ProxyMethod\\0\\",
             "ProxyLocalhost\\0\\",
-            $"PortForwardings\\D{dynamicPort}=\\",
+            dynamicPort is > 0 ? $"PortForwardings\\D{dynamicPort}=\\" : "PortForwardings\\\\",
             "Password\\\\",
             "Scriptfile\\\\",
             "ScriptfileContent\\\\",
-            "Autocommand\\\\",
+            $"Autocommand\\{KittySessionWriter.EncodeValue(autoCmd)}\\",
             "RemoteCommand\\\\",
             "SendToTray\\0\\",
-            "Maximize\\0\\",
+            dynamicPort is > 0 ? "Maximize\\0\\" : (maximize ? "Maximize\\1\\" : "Maximize\\0\\"),
             "Fullscreen\\0\\"
         };
+        if (server is not null)
+            ApplyKeepaliveAndReconnect(lines, server);
         File.WriteAllLines(path, lines, new UTF8Encoding(false));
         return new KittyRoutedSession(name, path);
+    }
+
+    private static void ApplyKeepaliveAndReconnect(List<string> lines, ManagedServer server)
+    {
+        var total = Math.Max(0, server.KeepaliveIntervalSeconds);
+        Set(lines, "PingInterval", (total / 60).ToString());
+        Set(lines, "PingIntervalSecs", (total % 60).ToString());
+        Set(lines, "TCPKeepalives", server.EnableTcpKeepalives ? "1" : "0");
+        Set(lines, "FailureReconnect", server.ReconnectOnConnectionFailure ? "1" : "0");
+        Set(lines, "WakeupReconnect", server.ReconnectOnSystemWakeup ? "1" : "0");
     }
 
     private static void Set(List<string> lines, string key, string value)
     {
         var prefix = key + "\\";
         var index = lines.FindIndex(line => line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-        var replacement = $"{key}\\{value}\\";
+        var replacement = $"{key}\\{KittySessionWriter.EncodeValue(value)}\\";
         if (index < 0) lines.Add(replacement);
         else lines[index] = replacement;
     }

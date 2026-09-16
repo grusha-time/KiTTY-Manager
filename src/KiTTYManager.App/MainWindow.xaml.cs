@@ -422,6 +422,10 @@ public partial class MainWindow : Window
         ImportedCommandBox.Text = server.ImportedCommand;
         IgnoreImportedCommandBox.IsChecked = server.IgnoreImportedCommand;
         TryDirectWithoutJumphostBox.IsChecked = server.TryDirectWithoutJumphost;
+        KeepaliveIntervalBox.Text = server.KeepaliveIntervalSeconds.ToString();
+        EnableTcpKeepalivesBox.IsChecked = server.EnableTcpKeepalives;
+        ReconnectOnConnectionFailureBox.IsChecked = server.ReconnectOnConnectionFailure;
+        ReconnectOnSystemWakeupBox.IsChecked = server.ReconnectOnSystemWakeup;
         requiredRouteOptions = new[]
             {
                 new RequiredRouteOption(null, "Автоматически (без ограничения)")
@@ -803,6 +807,7 @@ public partial class MainWindow : Window
     {
         if (selectedServer is null) return;
         if (!int.TryParse(PortBox.Text, out var port) || port is < 1 or > 65535) { Warn("SSH-порт должен быть от 1 до 65535."); return; }
+        if (!int.TryParse(KeepaliveIntervalBox.Text, out var keepalive) || keepalive < 0) { Warn("Интервал keepalive должен быть неотрицательным числом секунд (0 — отключено)."); return; }
         if (string.IsNullOrWhiteSpace(HostBox.Text)) { Warn("Укажите адрес сервера."); return; }
         var before = ImportedSessionMerger.Snapshot(selectedServer);
         var beforeKeyPassphrase = selectedServer.PrivateKeyPassphrase;
@@ -825,6 +830,14 @@ public partial class MainWindow : Window
             ImportedCommandBox.Text, value => selectedServer.ImportedCommand = value);
         selectedServer.IgnoreImportedCommand = IgnoreImportedCommandBox.IsChecked == true;
         selectedServer.TryDirectWithoutJumphost = TryDirectWithoutJumphostBox.IsChecked == true;
+        SetManagerOverride(selectedServer, nameof(ManagedServer.KeepaliveIntervalSeconds),
+            selectedServer.KeepaliveIntervalSeconds, keepalive, value => selectedServer.KeepaliveIntervalSeconds = value);
+        SetManagerOverride(selectedServer, nameof(ManagedServer.EnableTcpKeepalives),
+            selectedServer.EnableTcpKeepalives, EnableTcpKeepalivesBox.IsChecked == true, value => selectedServer.EnableTcpKeepalives = value);
+        SetManagerOverride(selectedServer, nameof(ManagedServer.ReconnectOnConnectionFailure),
+            selectedServer.ReconnectOnConnectionFailure, ReconnectOnConnectionFailureBox.IsChecked == true, value => selectedServer.ReconnectOnConnectionFailure = value);
+        SetManagerOverride(selectedServer, nameof(ManagedServer.ReconnectOnSystemWakeup),
+            selectedServer.ReconnectOnSystemWakeup, ReconnectOnSystemWakeupBox.IsChecked == true, value => selectedServer.ReconnectOnSystemWakeup = value);
         var requiredPreviousServerId = selectedRequiredRouteOption?.Id;
         try
         {
@@ -1191,10 +1204,18 @@ public partial class MainWindow : Window
                     routedSession = directEndpoint is null
                         ? KittyRoutedSession.Create(
                             server.SourceSessionPath!, route.LocalSshPort, server.ImportedCommand,
-                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows)
+                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server)
                         : KittyRoutedSession.CreateDirect(
                             server.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
-                            server.ImportedCommand, server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows);
+                            server.ImportedCommand, server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server);
+                else
+                    routedSession = directEndpoint is null
+                        ? KittyRoutedSession.CreateMinimal(
+                            "127.0.0.1", route.LocalSshPort, server.ImportedCommand,
+                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server)
+                        : KittyRoutedSession.CreateMinimal(
+                            directEndpoint.Host, directEndpoint.Port, server.ImportedCommand,
+                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server);
                 loginScript = KittyLoginScript.Create(server);
                 var startInfo = new ProcessStartInfo(kitty)
                 {
@@ -1203,10 +1224,10 @@ public partial class MainWindow : Window
                 };
                 var arguments = directEndpoint is null
                     ? KittyLaunchPlan.RoutedConsoleArguments(
-                        server, route.LocalSshPort, loadSavedSession, routedSession?.Path,
+                        server, route.LocalSshPort, true, routedSession?.Path,
                         loginScript?.Path)
                     : KittyLaunchPlan.DirectConsoleArguments(
-                        server, directEndpoint.Host, directEndpoint.Port, loadSavedSession,
+                        server, directEndpoint.Host, directEndpoint.Port, true,
                         routedSession?.Path, loginScript?.Path);
                 foreach (var argument in arguments)
                     startInfo.ArgumentList.Add(argument);
@@ -1320,8 +1341,9 @@ public partial class MainWindow : Window
                     : ResolveProgram(config.KittyPath);
                 routedSession = loadSavedSession
                     ? KittyRoutedSession.Create(server.SourceSessionPath!, route.LocalSshPort,
-                        server.ImportedCommand, true, webPort)
-                    : KittyRoutedSession.CreateMinimal(route.LocalSshPort, webPort);
+                        server.ImportedCommand, true, webPort, server: server)
+                    : KittyRoutedSession.CreateMinimal(
+                        "127.0.0.1", route.LocalSshPort, dynamicPort: webPort, server: server);
                 // No login script for the tunnel: it connects to an already-
                 // authenticated local SSH port. A login script waiting for a
                 // shell prompt blocks the tunnel console until timeout.
