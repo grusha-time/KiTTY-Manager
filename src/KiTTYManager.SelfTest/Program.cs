@@ -434,6 +434,12 @@ internal sealed partial class SelfTestRunner
         Test("Политика выбора пар с учётом асимметричных связей", AsymmetricConnectivityPairSelection);
         Test("Отображение направлений связей в дереве сохранённых связей", AsymmetricSavedLinkTreeItemStatus);
         Test("Адаптивное построение связей сохраняет известные односторонние связи", AsymmetricAdaptiveLinkDiscoveryPreservesKnownOneWay);
+        Test("Keepalive и автопереподключение KiTTY: настройки по умолчанию и дублирование", KittyKeepaliveAndReconnectModelAndDuplication);
+        Test("Keepalive и автопереподключение KiTTY: импорт сессий KiTTY", KittyKeepaliveAndReconnectImportParsing);
+        Test("Keepalive и автопереподключение KiTTY: запись в session-файл и слияние", KittyKeepaliveAndReconnectWriterAndMerger);
+        Test("Keepalive и автопереподключение KiTTY: генерация routed и minimal сессий", KittyKeepaliveAndReconnectRoutedAndMinimalSessions);
+        Test("Keepalive и автопереподключение KiTTY: миграция существующих сессий при обновлении", KittyKeepaliveAndReconnectUpgradeMigration);
+        Test("Keepalive и автопереподключение KiTTY: мастер импорта конфигурации", KittyKeepaliveAndReconnectImportWizard);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {
@@ -7145,6 +7151,560 @@ internal sealed partial class SelfTestRunner
             }
         }
         finally { try { File.Delete(sourceSessionPath); } catch { } }
+    }
+
+    private static void KittyKeepaliveAndReconnectModelAndDuplication()
+    {
+        var server = new ManagedServer();
+        Equal(15, server.KeepaliveIntervalSeconds);
+        Equal(true, server.EnableTcpKeepalives);
+        Equal(true, server.ReconnectOnConnectionFailure);
+        Equal(true, server.ReconnectOnSystemWakeup);
+
+        server.KeepaliveIntervalSeconds = 45;
+        server.EnableTcpKeepalives = false;
+        server.ReconnectOnConnectionFailure = false;
+        server.ReconnectOnSystemWakeup = false;
+
+        var config = new ManagerConfig();
+        var copy = ManagedServerDuplicator.Duplicate(config, server);
+        Equal(45, copy.KeepaliveIntervalSeconds);
+        Equal(false, copy.EnableTcpKeepalives);
+        Equal(false, copy.ReconnectOnConnectionFailure);
+        Equal(false, copy.ReconnectOnSystemWakeup);
+
+        var quickCopy = ManagedServerDuplicator.CreateQuickDuplicate(config, server);
+        Equal(45, quickCopy.KeepaliveIntervalSeconds);
+        Equal(false, quickCopy.EnableTcpKeepalives);
+        Equal(false, quickCopy.ReconnectOnConnectionFailure);
+        Equal(false, quickCopy.ReconnectOnSystemWakeup);
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "KiTTYManager-test-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(tempDir);
+            var configFile = Path.Combine(tempDir, "config.json");
+            config.UngroupedServers.Add(server);
+            ConfigStore.Save(configFile, config);
+            var loaded = ConfigStore.Load(configFile);
+            var loadedServer = loaded.UngroupedServers.Single(s => s.Id == server.Id);
+            Equal(45, loadedServer.KeepaliveIntervalSeconds);
+            Equal(false, loadedServer.EnableTcpKeepalives);
+            Equal(false, loadedServer.ReconnectOnConnectionFailure);
+            Equal(false, loadedServer.ReconnectOnSystemWakeup);
+
+            // Normalize negative keepalive
+            loadedServer.KeepaliveIntervalSeconds = -10;
+            ConfigStore.Save(configFile, loaded);
+            var reloaded = ConfigStore.Load(configFile);
+            Equal(15, reloaded.UngroupedServers.Single(s => s.Id == server.Id).KeepaliveIntervalSeconds);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    private static void KittyKeepaliveAndReconnectImportParsing()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "KiTTYManager-import-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(tempDir);
+            // 1. Explicit minutes + seconds, all disabled
+            File.WriteAllLines(Path.Combine(tempDir, "session1"),
+            [
+                "HostName\\192.0.2.1\\",
+                "PortNumber\\22\\",
+                "PingInterval\\1\\",
+                "PingIntervalSecs\\30\\",
+                "TCPKeepalives\\0\\",
+                "FailureReconnect\\0\\",
+                "WakeupReconnect\\0\\"
+            ]);
+
+            // 2. Explicit zero (keepalive disabled), reconnect enabled
+            File.WriteAllLines(Path.Combine(tempDir, "session2"),
+            [
+                "HostName\\192.0.2.2\\",
+                "PortNumber\\22\\",
+                "PingInterval\\0\\",
+                "PingIntervalSecs\\0\\",
+                "TCPKeepalives\\1\\",
+                "FailureReconnect\\1\\",
+                "WakeupReconnect\\1\\"
+            ]);
+
+            // 3. No keepalive or reconnect keys (defaults applied)
+            File.WriteAllLines(Path.Combine(tempDir, "session3"),
+            [
+                "HostName\\192.0.2.3\\",
+                "PortNumber\\22\\"
+            ]);
+
+            // 4. Malformed/negative values (fallback to 15)
+            File.WriteAllLines(Path.Combine(tempDir, "session4"),
+            [
+                "HostName\\192.0.2.4\\",
+                "PortNumber\\22\\",
+                "PingInterval\\-5\\",
+                "PingIntervalSecs\\abc\\"
+            ]);
+
+            // 5. Overflow value (clamped to int.MaxValue)
+            File.WriteAllLines(Path.Combine(tempDir, "session5"),
+            [
+                "HostName\\192.0.2.5\\",
+                "PortNumber\\22\\",
+                "PingInterval\\99999999999\\",
+                "PingIntervalSecs\\0\\"
+            ]);
+
+            var imported = KittySessionImporter.ImportDirectory(tempDir);
+            var s1 = imported.Single(s => s.Name == "session1");
+            Equal(90, s1.KeepaliveIntervalSeconds);
+            Equal(false, s1.EnableTcpKeepalives);
+            Equal(false, s1.ReconnectOnConnectionFailure);
+            Equal(false, s1.ReconnectOnSystemWakeup);
+
+            var s2 = imported.Single(s => s.Name == "session2");
+            Equal(0, s2.KeepaliveIntervalSeconds);
+            Equal(true, s2.EnableTcpKeepalives);
+            Equal(true, s2.ReconnectOnConnectionFailure);
+            Equal(true, s2.ReconnectOnSystemWakeup);
+
+            var s3 = imported.Single(s => s.Name == "session3");
+            Equal(15, s3.KeepaliveIntervalSeconds);
+            Equal(true, s3.EnableTcpKeepalives);
+            Equal(true, s3.ReconnectOnConnectionFailure);
+            Equal(true, s3.ReconnectOnSystemWakeup);
+
+            var s4 = imported.Single(s => s.Name == "session4");
+            Equal(15, s4.KeepaliveIntervalSeconds);
+
+            var s5 = imported.Single(s => s.Name == "session5");
+            Equal(int.MaxValue, s5.KeepaliveIntervalSeconds);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, true); } catch { }
+        }
+    }
+
+    private static void KittyKeepaliveAndReconnectWriterAndMerger()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "KiTTYManager-writer-" + Guid.NewGuid().ToString("N"));
+        var sessions = Path.Combine(root, "KiTTY", "Sessions");
+        try
+        {
+            Directory.CreateDirectory(sessions);
+            File.WriteAllText(Path.Combine(root, "KiTTY", "kitty.ini"), "cryptsalt=1\n");
+            var server = new ManagedServer
+            {
+                Name = "test-writer",
+                Host = "192.0.2.10",
+                Port = 22,
+                Password = "secret",
+                KeepaliveIntervalSeconds = 75,
+                EnableTcpKeepalives = false,
+                ReconnectOnConnectionFailure = false,
+                ReconnectOnSystemWakeup = true
+            };
+
+            // Write all properties to fresh session
+            KittySessionWriter.Write(sessions, server, KittySessionWriter.WritableProperties);
+            var file = Path.Combine(sessions, "test-writer");
+            Equal(true, File.Exists(file));
+            var parsed = KittySessionImporter.ParseFile(file);
+            Equal("1", parsed["PingInterval"]);
+            Equal("15", parsed["PingIntervalSecs"]);
+            Equal("0", parsed["TCPKeepalives"]);
+            Equal("0", parsed["FailureReconnect"]);
+            Equal("1", parsed["WakeupReconnect"]);
+
+            // Selective write of 0 keepalive
+            server.KeepaliveIntervalSeconds = 0;
+            server.SourceSessionPath = file;
+            KittySessionWriter.Write(sessions, server, [nameof(ManagedServer.KeepaliveIntervalSeconds)]);
+            parsed = KittySessionImporter.ParseFile(file);
+            Equal("0", parsed["PingInterval"]);
+            Equal("0", parsed["PingIntervalSecs"]);
+            Equal("0", parsed["TCPKeepalives"]);
+
+            // ImportedSessionMerger baseline and conflicts
+            var snapshot = ImportedSessionMerger.Snapshot(server);
+            Equal(0, snapshot.KeepaliveIntervalSeconds);
+            Equal(false, snapshot.EnableTcpKeepalives);
+            Equal(false, snapshot.ReconnectOnConnectionFailure);
+            Equal(true, snapshot.ReconnectOnSystemWakeup);
+
+            var importedServer = new ManagedServer
+            {
+                Name = "test-writer",
+                Host = "192.0.2.10",
+                Port = 22,
+                Password = "secret",
+                KeepaliveIntervalSeconds = 30,
+                EnableTcpKeepalives = true,
+                ReconnectOnConnectionFailure = true,
+                ReconnectOnSystemWakeup = true
+            };
+            server.KittyBaseline = ImportedSessionMerger.Snapshot(server);
+            var conflicts = ImportedSessionMerger.Apply(server, importedServer);
+            Equal(3, conflicts.Count);
+            Equal(true, conflicts.Any(c => c.PropertyName == nameof(ManagedServer.KeepaliveIntervalSeconds)));
+            Equal(true, conflicts.Any(c => c.PropertyName == nameof(ManagedServer.EnableTcpKeepalives)));
+            Equal(true, conflicts.Any(c => c.PropertyName == nameof(ManagedServer.ReconnectOnConnectionFailure)));
+
+            // Resolve conflict choosing Kitty
+            var kaConflict = conflicts.Single(c => c.PropertyName == nameof(ManagedServer.KeepaliveIntervalSeconds));
+            ImportedSessionMerger.Resolve(kaConflict, KittyConflictChoice.Kitty);
+            Equal(30, server.KeepaliveIntervalSeconds);
+
+            // Restore from snapshot
+            ImportedSessionMerger.Restore(server, snapshot);
+            Equal(0, server.KeepaliveIntervalSeconds);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    private static void KittyKeepaliveAndReconnectRoutedAndMinimalSessions()
+    {
+        var tempFile = TempFile();
+        try
+        {
+            File.WriteAllLines(tempFile,
+            [
+                "HostName\\192.0.2.20\\",
+                "PortNumber\\22\\",
+                "PingInterval\\0\\",
+                "PingIntervalSecs\\0\\",
+                "TCPKeepalives\\0\\"
+            ]);
+
+            var server = new ManagedServer
+            {
+                Name = "server-custom",
+                Host = "192.0.2.20",
+                Port = 22,
+                KeepaliveIntervalSeconds = 40,
+                EnableTcpKeepalives = true,
+                ReconnectOnConnectionFailure = true,
+                ReconnectOnSystemWakeup = false
+            };
+
+            // 1. Routed session with server applies server's keepalive/reconnect settings
+            using (var routed = KittyRoutedSession.Create(tempFile, 43130, server: server))
+            {
+                var parsed = KittySessionImporter.ParseFile(routed.Path);
+                Equal("0", parsed["PingInterval"]);
+                Equal("40", parsed["PingIntervalSecs"]);
+                Equal("1", parsed["TCPKeepalives"]);
+                Equal("1", parsed["FailureReconnect"]);
+                Equal("0", parsed["WakeupReconnect"]);
+            }
+
+            // 2. Direct session with server applies settings
+            using (var direct = KittyRoutedSession.CreateDirect(tempFile, "192.0.2.20", 22, server: server))
+            {
+                var parsed = KittySessionImporter.ParseFile(direct.Path);
+                Equal("0", parsed["PingInterval"]);
+                Equal("40", parsed["PingIntervalSecs"]);
+                Equal("1", parsed["TCPKeepalives"]);
+                Equal("1", parsed["FailureReconnect"]);
+                Equal("0", parsed["WakeupReconnect"]);
+            }
+
+            // 3. CreateMinimal for manager-only session applies settings and command with percent and newline encoding
+            using (var minimal = KittyRoutedSession.CreateMinimal(
+                "192.0.2.30", 2222, importedCommand: "echo %41\necho line2", server: server))
+            {
+                var parsed = KittySessionImporter.ParseFile(minimal.Path);
+                Equal("192.0.2.30", parsed["HostName"]);
+                Equal("2222", parsed["PortNumber"]);
+                Equal("0", parsed["PingInterval"]);
+                Equal("40", parsed["PingIntervalSecs"]);
+                Equal("1", parsed["TCPKeepalives"]);
+                Equal("1", parsed["FailureReconnect"]);
+                Equal("0", parsed["WakeupReconnect"]);
+                Equal("echo %41\necho line2", parsed["Autocommand"]);
+
+                var rawLines = File.ReadAllLines(minimal.Path);
+                var rawCmd = rawLines.Single(l => l.StartsWith("Autocommand\\", StringComparison.OrdinalIgnoreCase));
+                Equal(true, rawCmd.Contains("%2541"));
+                Equal(true, rawCmd.Contains("%0A"));
+            }
+        }
+        finally
+        {
+            try { File.Delete(tempFile); } catch { }
+        }
+    }
+
+    private static void KittyKeepaliveAndReconnectUpgradeMigration()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "kitty-migration-" + Guid.NewGuid().ToString("N"));
+        var sessionDir = Path.Combine(root, "KiTTY", "Sessions");
+        var nestedDir = Path.Combine(sessionDir, "group");
+        Directory.CreateDirectory(nestedDir);
+        var sessionFile = Path.Combine(sessionDir, "old-session");
+        var nestedFile = Path.Combine(nestedDir, "old-session");
+        var noBaselineFile = Path.Combine(sessionDir, "no-baseline-session");
+        var overriddenFile = Path.Combine(sessionDir, "overridden-session");
+
+        File.WriteAllLines(sessionFile,
+        [
+            "HostName\\192.0.2.77\\", "PortNumber\\22\\",
+            "PingInterval\\2\\", "PingIntervalSecs\\10\\",
+            "TCPKeepalives\\0\\", "FailureReconnect\\0\\", "WakeupReconnect\\0\\"
+        ]);
+        File.WriteAllLines(nestedFile,
+        [
+            "HostName\\192.0.2.78\\", "PortNumber\\22\\",
+            "PingInterval\\0\\", "PingIntervalSecs\\45\\",
+            "TCPKeepalives\\1\\", "FailureReconnect\\1\\", "WakeupReconnect\\0\\"
+        ]);
+        File.WriteAllLines(noBaselineFile,
+        [
+            "HostName\\192.0.2.79\\", "PortNumber\\22\\",
+            "PingInterval\\1\\", "PingIntervalSecs\\0\\",
+            "TCPKeepalives\\0\\", "FailureReconnect\\1\\", "WakeupReconnect\\1\\"
+        ]);
+        File.WriteAllLines(overriddenFile,
+        [
+            "HostName\\192.0.2.80\\", "PortNumber\\22\\",
+            "PingInterval\\1\\", "PingIntervalSecs\\30\\",
+            "TCPKeepalives\\0\\", "FailureReconnect\\0\\", "WakeupReconnect\\0\\"
+        ]);
+
+        var baseDirKitty = Path.Combine(ConfigStore.BaseDirectory, "KiTTY", "Sessions");
+        var baseDirNested = Path.Combine(baseDirKitty, "rel_test_nested_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(baseDirNested);
+        var baseNestedFile = Path.Combine(baseDirNested, "dup-rel-session");
+        var baseRootFile = Path.Combine(baseDirKitty, "dup-rel-session");
+        var relativeNestedPath = "KiTTY/Sessions/" + Path.GetFileName(baseDirNested) + "/dup-rel-session";
+
+        File.WriteAllLines(baseNestedFile, ["HostName\\192.0.2.99\\", "PortNumber\\22\\", "PingInterval\\0\\", "PingIntervalSecs\\75\\"]);
+        File.WriteAllLines(baseRootFile, ["HostName\\192.0.2.99\\", "PortNumber\\22\\", "PingInterval\\0\\", "PingIntervalSecs\\12\\"]);
+
+        try
+        {
+            var oldJson = $$"""
+            {
+                "SchemaVersion": 9,
+                "UngroupedServers": [
+                    {
+                        "Name": "old-session",
+                        "Host": "192.0.2.77",
+                        "Port": 22,
+                        "SourceSessionPath": "{{sessionFile.Replace("\\", "\\\\")}}",
+                        "KittyBaseline": {
+                            "Name": "old-session",
+                            "Host": "192.0.2.77",
+                            "Port": 22
+                        }
+                    },
+                    {
+                        "Name": "nested-session",
+                        "Host": "192.0.2.78",
+                        "Port": 22,
+                        "SourceSessionPath": "{{nestedFile.Replace("\\", "\\\\")}}",
+                        "KittyBaseline": {
+                            "Name": "nested-session",
+                            "Host": "192.0.2.78",
+                            "Port": 22
+                        }
+                    },
+                    {
+                        "Name": "rel-nested-session",
+                        "Host": "192.0.2.99",
+                        "Port": 22,
+                        "SourceSessionPath": "{{relativeNestedPath}}"
+                    },
+                    {
+                        "Name": "no-baseline-session",
+                        "Host": "192.0.2.79",
+                        "Port": 22,
+                        "SourceSessionPath": "{{noBaselineFile.Replace("\\", "\\\\")}}"
+                    },
+                    {
+                        "Name": "no-baseline-wizard",
+                        "Host": "192.0.2.79",
+                        "Port": 22,
+                        "SourceSessionPath": "{{noBaselineFile.Replace("\\", "\\\\")}}"
+                    },
+                    {
+                        "Name": "overridden-session",
+                        "Host": "192.0.2.80",
+                        "Port": 22,
+                        "SourceSessionPath": "{{overriddenFile.Replace("\\", "\\\\")}}",
+                        "KeepaliveIntervalSeconds": 300,
+                        "ManagerOverrides": ["KeepaliveIntervalSeconds"]
+                    }
+                ]
+            }
+            """;
+            var configFile = Path.Combine(root, "config.json");
+            File.WriteAllText(configFile, oldJson);
+
+            var config = ConfigStore.Load(configFile);
+
+            // 1. Session with baseline adopted its own values
+            var server = config.UngroupedServers.Single(s => s.Name == "old-session");
+            Equal(130, server.KeepaliveIntervalSeconds);
+            Equal(false, server.EnableTcpKeepalives);
+            Equal(false, server.ReconnectOnConnectionFailure);
+            Equal(false, server.ReconnectOnSystemWakeup);
+            Equal(130, server.KittyBaseline!.KeepaliveIntervalSeconds);
+            Equal(false, server.KittyBaseline.EnableTcpKeepalives);
+            Equal(false, server.KittyBaseline.ReconnectOnConnectionFailure);
+            Equal(false, server.KittyBaseline.ReconnectOnSystemWakeup);
+
+            // 2. Nested session with duplicate filename resolved to its exact folder, not parent folder
+            var nested = config.UngroupedServers.Single(s => s.Name == "nested-session");
+            Equal(45, nested.KeepaliveIntervalSeconds);
+            Equal(true, nested.EnableTcpKeepalives);
+            Equal(true, nested.ReconnectOnConnectionFailure);
+            Equal(false, nested.ReconnectOnSystemWakeup);
+            Equal(45, nested.KittyBaseline!.KeepaliveIntervalSeconds);
+
+            // Relative nested session resolved through BaseDirectory branch, not parent fallback
+            var relNested = config.UngroupedServers.Single(s => s.Name == "rel-nested-session");
+            Equal(75, relNested.KeepaliveIntervalSeconds);
+
+            // 3. Legacy session without baseline adopted file values while keeping baseline null
+            var noBaseline = config.UngroupedServers.Single(s => s.Name == "no-baseline-session");
+            Equal(60, noBaseline.KeepaliveIntervalSeconds);
+            Equal(false, noBaseline.EnableTcpKeepalives);
+            Equal(true, noBaseline.ReconnectOnConnectionFailure);
+            Equal(true, noBaseline.ReconnectOnSystemWakeup);
+            Equal(null, noBaseline.KittyBaseline);
+
+            // Reconciliation with disk for session without baseline creates NO conflicts
+            var noBaselineDisk = KittySessionImporter.ImportDirectory(sessionDir)
+                .Single(s => s.Name == "no-baseline-session");
+            var conflictsNoBaseline = ImportedSessionMerger.Apply(noBaseline, noBaselineDisk);
+            Equal(0, conflictsNoBaseline.Count);
+
+            // 4. Session with explicit Manager override retains its overridden value
+            var overridden = config.UngroupedServers.Single(s => s.Name == "overridden-session");
+            Equal(300, overridden.KeepaliveIntervalSeconds);
+            Equal(false, overridden.EnableTcpKeepalives);
+            Equal(false, overridden.ReconnectOnConnectionFailure);
+            Equal(false, overridden.ReconnectOnSystemWakeup);
+
+            // Reconcile server 1: no conflicts
+            var imported = KittySessionImporter.ImportDirectory(sessionDir).Single(s => s.SourceSessionPath == sessionFile);
+            var conflicts = ImportedSessionMerger.Apply(server, imported);
+            Equal(0, conflicts.Count);
+
+            // 5. Migration -> selective import -> save/load regression:
+            // Selectively importing keepalive 90 into baseline-less session whose source file specifies 60
+            // must persist 90 across save/load, without being overwritten by 60 on reload.
+            var wizardSession = config.UngroupedServers.Single(s => s.Name == "no-baseline-wizard");
+            Equal(60, wizardSession.KeepaliveIntervalSeconds);
+            Equal(null, wizardSession.KittyBaseline);
+
+            var incomingConfig = new ManagerConfig
+            {
+                UngroupedServers =
+                [
+                    new ManagedServer
+                    {
+                        Id = wizardSession.Id,
+                        Name = wizardSession.Name,
+                        Host = wizardSession.Host,
+                        Port = wizardSession.Port,
+                        KeepaliveIntervalSeconds = 90
+                    }
+                ]
+            };
+            var wizardPlan = ImportWizardEngine.Analyze(config, incomingConfig);
+            var kaDecision = wizardPlan.Fields.Single(f => f.IncomingSessionId == wizardSession.Id && f.PropertyName == nameof(ManagedServer.KeepaliveIntervalSeconds));
+            kaDecision.UseIncoming = true;
+            var merged = ImportWizardEngine.Merge(config, incomingConfig, wizardPlan);
+            var mergedWizard = merged.UngroupedServers.Single(s => s.Id == wizardSession.Id);
+            Equal(90, mergedWizard.KeepaliveIntervalSeconds);
+            Equal(null, mergedWizard.KittyBaseline);
+
+            var savedConfigFile = Path.Combine(root, "saved_config.json");
+            ConfigStore.Save(savedConfigFile, merged);
+            var reloadedConfig = ConfigStore.Load(savedConfigFile);
+            var reloadedWizard = reloadedConfig.UngroupedServers.Single(s => s.Id == wizardSession.Id);
+            Equal(90, reloadedWizard.KeepaliveIntervalSeconds);
+            Equal(null, reloadedWizard.KittyBaseline);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+            try { Directory.Delete(baseDirNested, true); } catch { }
+            try { File.Delete(baseRootFile); } catch { }
+        }
+    }
+
+    private static void KittyKeepaliveAndReconnectImportWizard()
+    {
+        var id = Guid.NewGuid();
+        var currentServer = new ManagedServer
+        {
+            Id = id,
+            Name = "Server-A",
+            Host = "192.0.2.1",
+            Port = 22,
+            KeepaliveIntervalSeconds = 15,
+            EnableTcpKeepalives = true,
+            ReconnectOnConnectionFailure = true,
+            ReconnectOnSystemWakeup = true
+        };
+        var current = new ManagerConfig { UngroupedServers = [currentServer] };
+
+        var incomingServer = new ManagedServer
+        {
+            Id = id,
+            Name = "Server-A",
+            Host = "192.0.2.1",
+            Port = 22,
+            KeepaliveIntervalSeconds = 90,
+            EnableTcpKeepalives = false,
+            ReconnectOnConnectionFailure = false,
+            ReconnectOnSystemWakeup = false
+        };
+        var incoming = new ManagerConfig { UngroupedServers = [incomingServer] };
+
+        var plan = ImportWizardEngine.Analyze(current, incoming);
+        var sessionRow = plan.Sessions.Single(s => s.IncomingId == id);
+        Equal(ImportDecision.KeepCurrent, sessionRow.Decision);
+
+        var kaField = plan.Fields.Single(f => f.IncomingSessionId == id && f.PropertyName == "KeepaliveIntervalSeconds");
+        var tcpField = plan.Fields.Single(f => f.IncomingSessionId == id && f.PropertyName == "EnableTcpKeepalives");
+        var failField = plan.Fields.Single(f => f.IncomingSessionId == id && f.PropertyName == "ReconnectOnConnectionFailure");
+        var wakeField = plan.Fields.Single(f => f.IncomingSessionId == id && f.PropertyName == "ReconnectOnSystemWakeup");
+
+        Equal("15", kaField.CurrentValue);
+        Equal("90", kaField.IncomingValue);
+        Equal(true, kaField.UseIncoming);
+
+        Equal("True", tcpField.CurrentValue);
+        Equal("False", tcpField.IncomingValue);
+        Equal(true, tcpField.UseIncoming);
+
+        Equal("True", failField.CurrentValue);
+        Equal("False", failField.IncomingValue);
+        Equal(true, failField.UseIncoming);
+
+        Equal("True", wakeField.CurrentValue);
+        Equal("False", wakeField.IncomingValue);
+        Equal(true, wakeField.UseIncoming);
+
+        var merged = ImportWizardEngine.Merge(current, incoming, plan);
+        var mergedServer = merged.UngroupedServers.Single(s => s.Id == id);
+        Equal(90, mergedServer.KeepaliveIntervalSeconds);
+        Equal(false, mergedServer.EnableTcpKeepalives);
+        Equal(false, mergedServer.ReconnectOnConnectionFailure);
+        Equal(false, mergedServer.ReconnectOnSystemWakeup);
     }
 }
 
