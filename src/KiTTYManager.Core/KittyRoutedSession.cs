@@ -37,7 +37,7 @@ public sealed class KittyRoutedSession : IDisposable
         Set(lines, "Autocommand", ignoreImportedCommand || isPrivilegeCommand ? "" : importedCommand);
         if (dynamicPort is > 0)
         {
-            Set(lines, "SendToTray", "1");
+            Set(lines, "SendToTray", "0");
             Set(lines, "Maximize", "0");
             Set(lines, "Fullscreen", "0");
         }
@@ -106,7 +106,7 @@ public sealed class KittyRoutedSession : IDisposable
             "ScriptfileContent\\\\",
             "Autocommand\\\\",
             "RemoteCommand\\\\",
-            "SendToTray\\1\\",
+            "SendToTray\\0\\",
             "Maximize\\0\\",
             "Fullscreen\\0\\"
         };
