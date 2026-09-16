@@ -67,6 +67,7 @@ internal sealed partial class SelfTestRunner
     {
         Console.WriteLine("KiTTY Manager: автономные тесты");
         Test("Поиск справки находит поля во всех разделах", HelpSearchFindsFieldsAcrossSections);
+        Test("Разрешение полей веб-интерфейсов для копирования и сортировки", WebFieldValueResolverTests);
         Test("Валидация параметров и отображение SSH-туннелей", TunnelDefinitionAndPolicyValidation);
         Test("Фабрика портов создаёт Local, Remote и Dynamic порты SSH.NET", TunnelPortFactoryCreatesCorrectPortTypes);
         Test("Служба туннелей отслеживает состояние и освобождает ресурсы при ошибке", TunnelServiceStateTrackingAndErrorHandling);

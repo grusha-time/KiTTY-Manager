@@ -136,6 +136,7 @@
                       MouseDoubleClick="WebGrid_MouseDoubleClick"
                       PreviewMouseRightButtonDown="WebGrid_PreviewMouseRightButtonDown"
                       CellEditEnding="WebGrid_CellEditEnding"
+                      ContextMenuOpening="WebGrid_ContextMenuOpening"
                       Sorting="WebGrid_Sorting">
               <DataGrid.ColumnHeaderStyle>
                 <Style TargetType="DataGridColumnHeader" BasedOn="{StaticResource {x:Type DataGridColumnHeader}}">
@@ -148,25 +149,25 @@
                   <MenuItem Header="Переместить вверх" Click="MoveWebUp_Click"/>
                   <MenuItem Header="Переместить вниз" Click="MoveWebDown_Click"/>
                   <Separator/>
-                  <MenuItem Header="Редактировать поле" Click="EditWebField_Click"/>
+                  <MenuItem x:Name="EditWebFieldMenuItem" Header="Редактировать поле" Click="EditWebField_Click"/>
                   <Separator/>
-                  <MenuItem Header="Копировать строку" Command="ApplicationCommands.Copy"/>
+                  <MenuItem x:Name="CopyWebFieldValueMenuItem" Header="Копировать значение поля" Click="CopyWebFieldValue_Click"/>
                 </ContextMenu>
               </DataGrid.ContextMenu>
               <DataGrid.Columns>
                 <DataGridTextColumn Header="Название" Binding="{Binding Name, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
                 <DataGridTextColumn Header="URL" Binding="{Binding Url, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="2*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
-                <DataGridTextColumn Binding="{Binding ResolverAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}">
+                <DataGridTextColumn SortMemberPath="ResolverAddress" Binding="{Binding ResolverAddress, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}">
                   <DataGridTextColumn.Header>
                     <TextBlock Text="Адрес DNS"
                                ToolTip="Если указан IP, менеджер сам разрешает домен через веб-туннель. Если поле пустое, используется системное разрешение DNS и файл hosts."/>
                   </DataGridTextColumn.Header>
                 </DataGridTextColumn>
                 <DataGridTextColumn Header="Логин" Binding="{Binding Username, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="*" EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
-                <DataGridTemplateColumn Header="Пароль" Width="*">
+                <DataGridTemplateColumn Header="Пароль" Width="*" SortMemberPath="Password">
                   <DataGridTemplateColumn.CellTemplate>
                     <DataTemplate>
-                      <local:SecretBox Value="{Binding Password}" IsHitTestVisible="False" Margin="4"/>
+                      <local:SecretBox Value="{Binding Password, Mode=OneWay}" IsReadOnly="True" Margin="4"/>
                     </DataTemplate>
                   </DataGridTemplateColumn.CellTemplate>
                   <DataGridTemplateColumn.CellEditingTemplate>
