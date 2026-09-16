@@ -1403,7 +1403,7 @@ public partial class MainWindow : Window
 
     private async Task<ActiveRoute> Connect(
         ManagedServer server, CancellationToken cancellationToken, bool consoleOnly = false,
-        Guid? forcedViaServerId = null)
+        Guid? forcedViaServerId = null, Action<SshConnectionProgress>? progress = null)
     {
         if (!server.TryDirectWithoutJumphost && config.BaseProxies.All(p => !p.Enabled))
             throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
@@ -1436,6 +1436,7 @@ public partial class MainWindow : Window
             .ToHashSet();
         var errors = new List<Exception>();
         var proxyReady = new Dictionary<Guid, bool>();
+        var proxyErrors = new Dictionary<Guid, Exception>();
         var racedCandidates = new HashSet<RouteCandidate>();
         var raceAttempted = false;
         RouteLog($"Route order for {server.Name}: preferred=" +
@@ -1496,12 +1497,27 @@ public partial class MainWindow : Window
             return "Использован маршрут: " + string.Join(" → ", parts);
         }
 
-        foreach (var candidate in candidates)
+        for (var candidateIdx = 0; candidateIdx < candidates.Count; candidateIdx++)
         {
+            var candidate = candidates[candidateIdx];
+            var attemptIndex = candidateIdx + 1;
+            var attemptCount = candidates.Count;
             if (racedCandidates.Contains(candidate)) continue;
             cancellationToken.ThrowIfCancellationRequested();
+            var candidateSw = Stopwatch.StartNew();
             if (!proxyReady.TryGetValue(candidate.Proxy.Id, out var ready))
             {
+                if (!candidate.WithoutProxy && candidate.Proxy.StartupServerId is not null)
+                {
+                    progress?.Invoke(new SshConnectionProgress(
+                        SshConnectionProgressKind.AttemptStarting,
+                        attemptIndex, attemptCount, RouteAttemptFormatter.FormatCandidate(candidate),
+                        TimeoutSeconds: (int)Math.Ceiling(ssh.Timeout.TotalSeconds)));
+                    progress?.Invoke(new SshConnectionProgress(
+                        SshConnectionProgressKind.EndpointProbing,
+                        attemptIndex, attemptCount, RouteAttemptFormatter.FormatCandidate(candidate),
+                        EndpointDisplay: $"{candidate.Proxy.Name} [{candidate.Proxy.Host}:{candidate.Proxy.Port}]"));
+                }
                 ready = candidate.WithoutProxy || await IsSocks5ReadyAsync(
                     candidate.Proxy, TimeSpan.FromSeconds(1), cancellationToken);
                 if (!ready && candidate.Proxy.StartupServerId is not null)
@@ -1514,17 +1530,34 @@ public partial class MainWindow : Window
                             accessTargetServerId: server.Id);
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                    catch (Exception error)
+                    catch (Exception ex)
                     {
-                        errors.Add(error);
-                        RouteLog($"Jumphost startup failed: name={candidate.Proxy.Name}; endpoint={candidate.Proxy.Host}:{candidate.Proxy.Port}; error={error.GetType().Name}: {error.Message}");
+                        errors.Add(ex);
+                        proxyErrors[candidate.Proxy.Id] = ex;
+                        RouteLog($"Jumphost startup probe failed: proxy={candidate.Proxy.Name}; error={ex.GetType().Name}: {ex.Message}");
+                        progress?.Invoke(new SshConnectionProgress(
+                            SshConnectionProgressKind.AttemptFailed,
+                            attemptIndex, attemptCount, RouteAttemptFormatter.FormatCandidate(candidate),
+                            Duration: candidateSw.Elapsed,
+                            ErrorMessage: $"сбой запуска точки входа {candidate.Proxy.Name}: {ex.Message}"));
+                        ready = false;
                     }
                 }
                 proxyReady[candidate.Proxy.Id] = ready;
             }
             if (!ready)
             {
-                RouteLog($"Proxy not ready, skipping: target={server.Name}; proxy={candidate.Proxy.Name}:{candidate.Proxy.Port}");
+                if (!proxyErrors.ContainsKey(candidate.Proxy.Id))
+                {
+                    var notReadyEx = new InvalidOperationException(
+                        $"Точка входа «{candidate.Proxy.Name}» ({candidate.Proxy.Host}:{candidate.Proxy.Port}) недоступна.");
+                    errors.Add(notReadyEx);
+                    progress?.Invoke(new SshConnectionProgress(
+                        SshConnectionProgressKind.AttemptFailed,
+                        attemptIndex, attemptCount, RouteAttemptFormatter.FormatCandidate(candidate),
+                        Duration: candidateSw.Elapsed,
+                        ErrorMessage: $"точка входа «{candidate.Proxy.Name}» ({candidate.Proxy.Host}:{candidate.Proxy.Port}) недоступна"));
+                }
                 continue;
             }
 
@@ -1553,9 +1586,13 @@ public partial class MainWindow : Window
                         try
                         {
                             Status($"Параллельно проверяю короткий путь «{RouteLabel(shorter)}» и текущий «{RouteLabel(candidate)}» для «{server.Name}»…");
-                            RouteLog($"Shorter route race started: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}");
+                            var shorterIndex = candidates.TakeWhile(c => !ReferenceEquals(c, shorter)).Count() + 1;
+                            if (shorterIndex > attemptCount) shorterIndex = attemptIndex;
                             var raced = await ssh.ConnectFirstSuccessfulAsync(
-                                config, [shorter, candidate], cancellationToken, consoleOnly);
+                                config, [shorter, candidate], cancellationToken, consoleOnly,
+                                progress: progress,
+                                candidateIndices: [shorterIndex, attemptIndex],
+                                totalAttempts: attemptCount);
                             if (ReferenceEquals(raced.Candidate, shorter))
                                 RouteLog($"Shorter route race WON: target={server.Name}; winner={RouteLabel(shorter)}");
                             else
@@ -1598,8 +1635,13 @@ public partial class MainWindow : Window
                     try
                     {
                         Status($"Параллельно проверяю две точки входа для «{server.Name}»…");
+                        var secondIndex = candidates.TakeWhile(c => !ReferenceEquals(c, second)).Count() + 1;
+                        if (secondIndex > attemptCount) secondIndex = attemptIndex;
                         return CompleteRoute(await ssh.ConnectFirstSuccessfulAsync(
-                            config, [candidate, second], cancellationToken, consoleOnly));
+                            config, [candidate, second], cancellationToken, consoleOnly,
+                            progress: progress,
+                            candidateIndices: [attemptIndex, secondIndex],
+                            totalAttempts: attemptCount));
                     }
                     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                     catch (Exception error)
@@ -1621,7 +1663,10 @@ public partial class MainWindow : Window
                 Status($"Проверяю маршрут: {RouteLabel(candidate)}…");
                 return CompleteRoute(await ssh.ConnectCandidateAsync(
                     config, candidate, cancellationToken, consoleOnly,
-                    rememberTargetPreference: forcedViaServerId is null));
+                    rememberTargetPreference: forcedViaServerId is null,
+                    progress: progress,
+                    attemptIndex: attemptIndex,
+                    attemptCount: attemptCount));
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception error)
@@ -1645,8 +1690,9 @@ public partial class MainWindow : Window
         if (await TryRestoreAccessAsync(candidates, cancellationToken))
         {
             // Access restored — retry all candidates once.
-            foreach (var candidate in candidates)
+            for (var retryIdx = 0; retryIdx < candidates.Count; retryIdx++)
             {
+                var candidate = candidates[retryIdx];
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!candidate.WithoutProxy &&
                     !await IsSocks5ReadyAsync(candidate.Proxy, TimeSpan.FromSeconds(1), cancellationToken))
@@ -1656,7 +1702,10 @@ public partial class MainWindow : Window
                     Status($"Повторяю маршрут: {RouteLabel(candidate)}…");
                     return CompleteRoute(await ssh.ConnectCandidateAsync(
                         config, candidate, cancellationToken, consoleOnly,
-                        rememberTargetPreference: forcedViaServerId is null));
+                        rememberTargetPreference: forcedViaServerId is null,
+                        progress: progress,
+                        attemptIndex: retryIdx + 1,
+                        attemptCount: candidates.Count));
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch (Exception error)
@@ -3645,10 +3694,10 @@ public partial class MainWindow : Window
             batchTaskWindow.Activate();
             return;
         }
-        async Task<ActiveRoute> OpenRoute(Guid serverId, CancellationToken token)
+        async Task<ActiveRoute> OpenRoute(Guid serverId, Action<SshConnectionProgress>? progress, CancellationToken token)
         {
             var server = config.FindServer(serverId) ?? throw new InvalidOperationException("Сессия не найдена.");
-            var operation = await Dispatcher.InvokeAsync(() => Connect(server, token));
+            var operation = await Dispatcher.InvokeAsync(() => Connect(server, token, progress: progress));
             return await operation;
         }
         void CloseRoute(ActiveRoute route) => Dispatcher.Invoke(() => ReleaseRoute(route));

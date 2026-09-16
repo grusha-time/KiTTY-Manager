@@ -19,6 +19,49 @@ public enum SshTraceStage
     RouteReady
 }
 
+public enum SshConnectionProgressKind
+{
+    AttemptStarting,
+    EndpointProbing,
+    CachedSkip,
+    AttemptFailed,
+    AttemptSucceeded
+}
+
+public sealed record SshConnectionProgress(
+    SshConnectionProgressKind Kind,
+    int AttemptIndex,
+    int AttemptCount,
+    string RouteDescription,
+    string? EndpointDisplay = null,
+    int TimeoutSeconds = 0,
+    TimeSpan Duration = default,
+    string? ErrorMessage = null);
+
+public static class RouteAttemptFormatter
+{
+    public static string Format(SshConnectionProgress p) => p.Kind switch
+    {
+        SshConnectionProgressKind.AttemptStarting =>
+            $"Попытка {p.AttemptIndex}/{p.AttemptCount}: {p.RouteDescription} (таймаут маршрута {p.TimeoutSeconds} с)",
+        SshConnectionProgressKind.EndpointProbing =>
+            $"Попытка {p.AttemptIndex}/{p.AttemptCount}: проверка {p.EndpointDisplay}",
+        SshConnectionProgressKind.CachedSkip =>
+            $"Маршрут {p.RouteDescription} пропущен: недавний сбой в кэше",
+        SshConnectionProgressKind.AttemptFailed =>
+            $"Попытка {p.AttemptIndex}/{p.AttemptCount} не удалась за {p.Duration.TotalSeconds.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)} с: {p.ErrorMessage}",
+        SshConnectionProgressKind.AttemptSucceeded =>
+            $"Маршрут готов: {p.RouteDescription}",
+        _ => p.RouteDescription
+    };
+
+    public static string FormatCandidate(RouteCandidate candidate) =>
+        (candidate.WithoutProxy
+            ? "Прямо без JH → "
+            : $"{candidate.Proxy.Name}:{candidate.Proxy.Port} → ") +
+        string.Join(" → ", candidate.Servers.Select(item => item.Name));
+}
+
 public sealed record SshTraceEvent(
     SshTraceStage Stage, string Subject, string Status, Exception? Error = null);
 
@@ -103,68 +146,87 @@ public sealed class SshConnectionService
     }
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectBestAsync(
-        ManagerConfig config, Guid targetId, CancellationToken cancellationToken = default, bool consoleOnly = false)
+        ManagerConfig config, Guid targetId, CancellationToken cancellationToken = default, bool consoleOnly = false,
+        Action<SshConnectionProgress>? progress = null)
     {
         var ranked = RoutePlanner.Candidates(config, targetId);
         var target = config.FindServer(targetId);
         var ordered = RoutePlanner.OrderPreferred(config, ranked, target?.PreferredRoute);
         return await ConnectCandidatesAsync(config, ordered,
-            "Не найден рабочий маршрут. Запустите ручную проверку связности.", cancellationToken, consoleOnly);
+            "Не найден рабочий маршрут. Запустите ручную проверку связности.", cancellationToken, consoleOnly,
+            progress: progress);
     }
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectBestUsingAsync(
         ManagerConfig config, Guid targetId, IEnumerable<Guid> proxyIds,
-        CancellationToken cancellationToken = default, bool consoleOnly = false)
+        CancellationToken cancellationToken = default, bool consoleOnly = false,
+        Action<SshConnectionProgress>? progress = null)
     {
         var allowed = proxyIds.ToHashSet();
         return await ConnectCandidatesAsync(
             config, RoutePlanner.Candidates(config, targetId).Where(candidate => allowed.Contains(candidate.Proxy.Id)),
-            "Ни одна из готовых точек входа не дала рабочий маршрут.", cancellationToken, consoleOnly);
+            "Ни одна из готовых точек входа не дала рабочий маршрут.", cancellationToken, consoleOnly,
+            progress: progress);
     }
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectBestViaAsync(
-        ManagerConfig config, Guid sourceId, Guid targetId, CancellationToken cancellationToken = default)
+        ManagerConfig config, Guid sourceId, Guid targetId, CancellationToken cancellationToken = default,
+        Action<SshConnectionProgress>? progress = null)
         => await ConnectCandidatesAsync(
             config, RoutePlanner.ViaCandidates(config, sourceId, targetId),
-            "Не удалось подключиться к целевому серверу через выбранный исходный сервер.", cancellationToken, false);
+            "Не удалось подключиться к целевому серверу через выбранный исходный сервер.", cancellationToken, false,
+            progress: progress);
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectUsingFinalHopAsync(
         ManagerConfig config, Guid viaServerId, Guid targetId,
-        CancellationToken cancellationToken = default, bool consoleOnly = false)
+        CancellationToken cancellationToken = default, bool consoleOnly = false,
+        Action<SshConnectionProgress>? progress = null)
         => await ConnectCandidatesAsync(
             config, RoutePlanner.ForcedFinalHopCandidates(config, viaServerId, targetId),
             "Не удалось подключиться через выбранную сохранённую связь.",
-            cancellationToken, consoleOnly, rememberTargetPreference: false);
+            cancellationToken, consoleOnly, rememberTargetPreference: false,
+            progress: progress);
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectViaAsync(
         ManagerConfig config, Guid sourceId, Guid targetId, BaseProxy proxy,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action<SshConnectionProgress>? progress = null)
     {
         var candidate = RoutePlanner.ViaCandidates(config, sourceId, targetId)
             .FirstOrDefault(item => item.Proxy.Id == proxy.Id)
             ?? throw new InvalidOperationException("Для указанного SOCKS отсутствует маршрут через выбранную пару.");
         return await ConnectCandidatesAsync(config, [candidate],
-            "Не удалось подключиться через указанный SOCKS.", cancellationToken, false);
+            "Не удалось подключиться через указанный SOCKS.", cancellationToken, false,
+            progress: progress);
     }
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectCandidateAsync(
         ManagerConfig config, RouteCandidate candidate,
         CancellationToken cancellationToken = default, bool consoleOnly = false,
-        bool rememberTargetPreference = true) =>
+        bool rememberTargetPreference = true,
+        Action<SshConnectionProgress>? progress = null,
+        int attemptIndex = 1, int attemptCount = 1) =>
         await ConnectCandidatesAsync(config, [candidate],
             "Указанный маршрут недоступен.", cancellationToken, consoleOnly,
-            rememberTargetPreference);
+            rememberTargetPreference, progress, attemptIndex, attemptCount);
 
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectFirstSuccessfulAsync(
         ManagerConfig config, IReadOnlyList<RouteCandidate> candidates,
-        CancellationToken cancellationToken = default, bool consoleOnly = false)
+        CancellationToken cancellationToken = default, bool consoleOnly = false,
+        Action<SshConnectionProgress>? progress = null,
+        IReadOnlyList<int>? candidateIndices = null,
+        int totalAttempts = 0)
     {
         if (candidates.Count == 0)
             throw new InvalidOperationException("Не указаны маршруты для параллельной проверки.");
 
+        var attemptCount = totalAttempts > 0 ? totalAttempts : candidates.Count;
         using var raceCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var tasks = candidates.Select(candidate => ConnectCandidateAsync(
-            config, candidate, raceCancellation.Token, consoleOnly)).ToList();
+        var tasks = candidates.Select((candidate, index) => ConnectCandidateAsync(
+            config, candidate, raceCancellation.Token, consoleOnly,
+            progress: progress,
+            attemptIndex: candidateIndices is not null && index < candidateIndices.Count ? candidateIndices[index] : (index + 1),
+            attemptCount: attemptCount)).ToList();
         var failures = new List<Exception>();
         while (tasks.Count > 0)
         {
@@ -197,7 +259,9 @@ public sealed class SshConnectionService
     private async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectCandidatesAsync(
         ManagerConfig config, IEnumerable<RouteCandidate> candidates, string failureMessage,
         CancellationToken cancellationToken, bool consoleOnly,
-        bool rememberTargetPreference = true)
+        bool rememberTargetPreference = true,
+        Action<SshConnectionProgress>? progress = null,
+        int overrideAttemptIndex = 0, int overrideAttemptCount = 0)
     {
         var failures = new List<Exception>();
         var candidateList = candidates
@@ -206,13 +270,22 @@ public sealed class SshConnectionService
         if (candidateList.Length == 0)
             Emit(SshTraceStage.RouteCandidate, "route", "FAIL",
                 new InvalidOperationException("No enabled global SOCKS route candidates."));
-        foreach (var candidate in candidateList)
+
+        var totalAttempts = overrideAttemptCount > 0 ? overrideAttemptCount : candidateList.Length;
+        for (var i = 0; i < candidateList.Length; i++)
         {
+            var candidate = candidateList[i];
+            var attemptNumber = overrideAttemptIndex > 0 ? overrideAttemptIndex : (i + 1);
+            var routeDesc = RouteAttemptFormatter.FormatCandidate(candidate);
+
             // Кэш относится к входу proxy -> первый сервер, в том числе в длинной цепочке.
             // Неудачу multi-hop целиком не запоминаем: сбой мог произойти на другом переходе.
             if (failureCache.ShouldSkip(candidate, DateTimeOffset.UtcNow))
             {
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "SKIP_CACHED_FAILURE");
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.CachedSkip,
+                    attemptNumber, totalAttempts, routeDesc));
                 continue;
             }
             cancellationToken.ThrowIfCancellationRequested();
@@ -222,9 +295,13 @@ public sealed class SshConnectionService
                 .Select(server => (Server: server, Key: CaptureHostKey(server)))
                 .ToArray();
             Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "START");
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.AttemptStarting,
+                attemptNumber, totalAttempts, routeDesc,
+                TimeoutSeconds: (int)Math.Ceiling(Timeout.TotalSeconds)));
             try
             {
-                var route = await Task.Run(() => Connect(candidate, true, attempt.Token, consoleOnly), attempt.Token)
+                var route = await Task.Run(() => Connect(candidate, true, attempt.Token, consoleOnly, progress, attemptNumber, totalAttempts, routeDesc), attempt.Token)
                     .ConfigureAwait(false);
                 RememberSuccessfulProxy(
                     candidate, route.Target, sw.Elapsed, rememberTargetPreference);
@@ -241,15 +318,23 @@ public sealed class SshConnectionService
                         LastSuccessUtc = DateTimeOffset.UtcNow
                     };
                 Emit(SshTraceStage.RouteReady, route.Target.Name, "PASS");
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.AttemptSucceeded,
+                    attemptNumber, totalAttempts, routeDesc,
+                    Duration: sw.Elapsed));
                 return (route, candidate, sw.Elapsed);
             }
             catch (SshAuthenticationException ex)
             {
                 foreach (var item in originalHostKeys)
                     RestoreHostKey(item.Server, item.Key);
-                failures.Add(new InvalidOperationException(
-                    $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}", ex));
+                var message = $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}";
+                failures.Add(new InvalidOperationException(message, ex));
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "FAIL", ex);
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.AttemptFailed,
+                    attemptNumber, totalAttempts, routeDesc,
+                    Duration: sw.Elapsed, ErrorMessage: SafeMessage(ex)));
             }
             catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
             {
@@ -264,6 +349,10 @@ public sealed class SshConnectionService
                 failures.Add(timeout);
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.AttemptFailed,
+                    attemptNumber, totalAttempts, routeDesc,
+                    Duration: sw.Elapsed, ErrorMessage: "таймаут подключения"));
             }
             catch (SshOperationTimeoutException ex)
             {
@@ -273,6 +362,10 @@ public sealed class SshConnectionService
                 failures.Add(timeout);
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.AttemptFailed,
+                    attemptNumber, totalAttempts, routeDesc,
+                    Duration: sw.Elapsed, ErrorMessage: "таймаут подключения"));
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested && attempt.IsCancellationRequested)
             {
@@ -282,15 +375,23 @@ public sealed class SshConnectionService
                 failures.Add(timeout);
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "TIMEOUT", timeout);
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.AttemptFailed,
+                    attemptNumber, totalAttempts, routeDesc,
+                    Duration: sw.Elapsed, ErrorMessage: "таймаут подключения"));
             }
             catch (Exception ex)
             {
                 foreach (var item in originalHostKeys)
                     RestoreHostKey(item.Server, item.Key);
-                failures.Add(new InvalidOperationException(
-                    $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}", ex));
+                var message = $"{ProxyLabel(candidate.Proxy)}: {SafeMessage(ex)}";
+                failures.Add(new InvalidOperationException(message, ex));
                 failureCache.RememberDirectFailure(candidate, DateTimeOffset.UtcNow);
                 Emit(SshTraceStage.RouteCandidate, ProxyLabel(candidate.Proxy), "FAIL", ex);
+                progress?.Invoke(new SshConnectionProgress(
+                    SshConnectionProgressKind.AttemptFailed,
+                    attemptNumber, totalAttempts, routeDesc,
+                    Duration: sw.Elapsed, ErrorMessage: SafeMessage(ex)));
             }
         }
         throw new InvalidOperationException(AddTimeoutHint(failureMessage, failures), CombineFailures(failures));
@@ -740,7 +841,9 @@ public sealed class SshConnectionService
 
     private ActiveRoute Connect(
         RouteCandidate candidate, bool exposePorts = true,
-        CancellationToken cancellationToken = default, bool consoleOnly = false)
+        CancellationToken cancellationToken = default, bool consoleOnly = false,
+        Action<SshConnectionProgress>? progress = null,
+        int attemptIndex = 1, int attemptCount = 1, string routeDesc = "")
     {
         var resources = new List<IDisposable>();
         var hops = new List<RouteHop>();
@@ -763,9 +866,9 @@ public sealed class SshConnectionService
                 var consoleTarget = candidate.Servers[0];
                 var context = EndpointContext.Direct(candidate.Proxy.Id);
                 var consoleEndpoint = (candidate.WithoutProxy
-                        ? SelectEndpointDirectAsync(consoleTarget, context, cancellationToken)
+                        ? SelectEndpointDirectAsync(consoleTarget, context, cancellationToken, progress, attemptIndex, attemptCount, routeDesc)
                         : SelectEndpointViaProxyAsync(
-                            candidate.Proxy, consoleTarget, context, cancellationToken))
+                            candidate.Proxy, consoleTarget, context, cancellationToken, progress, attemptIndex, attemptCount, routeDesc))
                     .ConfigureAwait(false).GetAwaiter().GetResult();
                 Emit(SshTraceStage.ProxyConnect,
                     candidate.WithoutProxy ? "direct" : ProxyLabel(candidate.Proxy), "START");
@@ -799,9 +902,9 @@ public sealed class SshConnectionService
                 if (previous is null)
                 {
                     hopEndpoint = (candidate.WithoutProxy
-                            ? SelectEndpointDirectAsync(server, hopContext, cancellationToken)
+                            ? SelectEndpointDirectAsync(server, hopContext, cancellationToken, progress, attemptIndex, attemptCount, routeDesc)
                             : SelectEndpointViaProxyAsync(
-                                candidate.Proxy, server, hopContext, cancellationToken))
+                                candidate.Proxy, server, hopContext, cancellationToken, progress, attemptIndex, attemptCount, routeDesc))
                         .ConfigureAwait(false).GetAwaiter().GetResult();
                     Emit(SshTraceStage.ProxyConnect,
                         candidate.WithoutProxy ? "direct" : ProxyLabel(candidate.Proxy), "START");
@@ -813,7 +916,7 @@ public sealed class SshConnectionService
                 else
                 {
                     hopEndpoint = SelectEndpointViaClientAsync(
-                            previous, server, hopContext, cancellationToken)
+                            previous, server, hopContext, cancellationToken, progress, attemptIndex, attemptCount, routeDesc)
                         .ConfigureAwait(false).GetAwaiter().GetResult();
                     var ingressOwner = previous;
                     Emit(SshTraceStage.ChannelForward, server.Name, "START");
@@ -1075,13 +1178,27 @@ public sealed class SshConnectionService
 
     private async Task<ServerEndpoint> SelectEndpointDirectAsync(
         ManagedServer server, EndpointContext context,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<SshConnectionProgress>? progress = null,
+        int attemptIndex = 1, int attemptCount = 1, string routeDesc = "")
     {
         var endpoints = ServerEndpointPolicy.Ordered(server, context);
-        if (endpoints.Count == 1) return endpoints[0];
+        if (endpoints.Count == 1)
+        {
+            var ep = endpoints[0];
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.EndpointProbing,
+                attemptIndex, attemptCount, routeDesc,
+                EndpointDisplay: $"{server.Name} [{ep.Host}:{ep.Port}]"));
+            return ep;
+        }
         foreach (var endpoint in endpoints)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.EndpointProbing,
+                attemptIndex, attemptCount, routeDesc,
+                EndpointDisplay: $"{server.Name} [{endpoint.Host}:{endpoint.Port}]"));
             try
             {
                 using var probeCancellation =
@@ -1111,10 +1228,20 @@ public sealed class SshConnectionService
     /// </summary>
     private async Task<ServerEndpoint> SelectEndpointViaProxyAsync(
         BaseProxy proxy, ManagedServer server, EndpointContext context,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<SshConnectionProgress>? progress = null,
+        int attemptIndex = 1, int attemptCount = 1, string routeDesc = "")
     {
         var endpoints = ServerEndpointPolicy.Ordered(server, context);
-        if (endpoints.Count == 1) return endpoints[0];
+        if (endpoints.Count == 1)
+        {
+            var ep = endpoints[0];
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.EndpointProbing,
+                attemptIndex, attemptCount, routeDesc,
+                EndpointDisplay: $"{server.Name} [{ep.Host}:{ep.Port}]"));
+            return ep;
+        }
         var now = DateTimeOffset.UtcNow;
         var candidates = endpoints
             .Where(endpoint => !endpointFailureCache.ShouldSkip(server.Id, context, endpoint, now))
@@ -1123,6 +1250,10 @@ public sealed class SshConnectionService
         foreach (var endpoint in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.EndpointProbing,
+                attemptIndex, attemptCount, routeDesc,
+                EndpointDisplay: $"{server.Name} [{endpoint.Host}:{endpoint.Port}]"));
             try
             {
                 using var probeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -1163,10 +1294,20 @@ public sealed class SshConnectionService
     /// </summary>
     private async Task<ServerEndpoint> SelectEndpointViaClientAsync(
         SshClient previous, ManagedServer server, EndpointContext context,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<SshConnectionProgress>? progress = null,
+        int attemptIndex = 1, int attemptCount = 1, string routeDesc = "")
     {
         var endpoints = ServerEndpointPolicy.Ordered(server, context);
-        if (endpoints.Count == 1) return endpoints[0];
+        if (endpoints.Count == 1)
+        {
+            var ep = endpoints[0];
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.EndpointProbing,
+                attemptIndex, attemptCount, routeDesc,
+                EndpointDisplay: $"{server.Name} [{ep.Host}:{ep.Port}]"));
+            return ep;
+        }
         var now = DateTimeOffset.UtcNow;
         var candidates = endpoints
             .Where(endpoint => !endpointFailureCache.ShouldSkip(server.Id, context, endpoint, now))
@@ -1175,6 +1316,10 @@ public sealed class SshConnectionService
         foreach (var endpoint in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            progress?.Invoke(new SshConnectionProgress(
+                SshConnectionProgressKind.EndpointProbing,
+                attemptIndex, attemptCount, routeDesc,
+                EndpointDisplay: $"{server.Name} [{endpoint.Host}:{endpoint.Port}]"));
             ForwardedPortLocal? probe = null;
             try
             {

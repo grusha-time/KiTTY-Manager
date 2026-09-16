@@ -248,6 +248,9 @@ internal sealed partial class SelfTestRunner
         Test("Отказ связи синхронно инвалидирует оба направления", LinkPairFailureInvalidatesBothDirections);
         Test("Гонка точек входа по умолчанию выключена и сохраняется в JSON", EntryPointRaceSettingRoundTrip);
         Test("Пропуск существующих связей карты по умолчанию включён и сохраняется", MapCheckSettingRoundTrip);
+        Test("Информативные логи подключения в массовых задачах выводят попытки и узлы", BatchConnectionProgressLogging);
+        Test("Остановка до или во время подключения сохраняет причину и шаг", BatchRunCancellationPreservesStopReason);
+        Test("Смешанный отказ маршрутов распознаётся как сбой связи", MixedRouteFailureIsConnectivityFailure);
         Test("Лимит endpoint-зонда по умолчанию 4 секунды и сохраняется в JSON", EndpointProbeTimeoutRoundTrip);
         Test("Отрицательный endpoint-кэш изолирован по JH и предыдущему серверу", EndpointFailureCacheContexts);
         Test("Фоновая проверка одной сессии имеет единственного владельца", BackgroundProbeRegistrySerializesPerServer);
@@ -6742,6 +6745,272 @@ internal sealed partial class SelfTestRunner
         Equal(false, endpoints.ShouldSkip(server.Id, context, endpoint, now));
         ssh.ClearFailureCache();
         Equal(false, routes.ShouldSkip(candidate, now));
+    }
+
+    private static void BatchConnectionProgressLogging()
+    {
+        var proxy = new BaseProxy { Name = "Jumphost", Host = "127.0.0.1", Port = 5555 };
+        var server = new ManagedServer { Name = "Server-A", Host = "10.0.0.1", Port = 22 };
+        var candidate = new RouteCandidate(proxy, [server]);
+        var routeDesc = RouteAttemptFormatter.FormatCandidate(candidate);
+        Equal("Jumphost:5555 → Server-A", routeDesc);
+
+        // 1. Starting attempt progress
+        var startingProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.AttemptStarting,
+            AttemptIndex: 1,
+            AttemptCount: 3,
+            RouteDescription: routeDesc,
+            TimeoutSeconds: 10);
+        var formattedStart = RouteAttemptFormatter.Format(startingProgress);
+        Equal("Попытка 1/3: Jumphost:5555 → Server-A (таймаут маршрута 10 с)", formattedStart);
+
+        // 2. Endpoint probing progress
+        var probeProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.EndpointProbing,
+            AttemptIndex: 1,
+            AttemptCount: 3,
+            RouteDescription: routeDesc,
+            EndpointDisplay: "Server-A [10.0.0.1:22]");
+        var formattedProbe = RouteAttemptFormatter.Format(probeProgress);
+        Equal("Попытка 1/3: проверка Server-A [10.0.0.1:22]", formattedProbe);
+
+        // 3. Cached skip progress
+        var skipProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.CachedSkip,
+            AttemptIndex: 1,
+            AttemptCount: 3,
+            RouteDescription: routeDesc);
+        var formattedSkip = RouteAttemptFormatter.Format(skipProgress);
+        Equal("Маршрут Jumphost:5555 → Server-A пропущен: недавний сбой в кэше", formattedSkip);
+
+        // 4. Attempt failed progress (timeout/error)
+        var failProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.AttemptFailed,
+            AttemptIndex: 1,
+            AttemptCount: 3,
+            RouteDescription: routeDesc,
+            Duration: TimeSpan.FromSeconds(10.05),
+            ErrorMessage: "таймаут подключения");
+        var formattedFail = RouteAttemptFormatter.Format(failProgress);
+        Equal(true, formattedFail.StartsWith("Попытка 1/3 не удалась за 10.1 с: таймаут подключения"));
+
+        // 5. Attempt succeeded progress
+        var successProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.AttemptSucceeded,
+            AttemptIndex: 2,
+            AttemptCount: 3,
+            RouteDescription: routeDesc);
+        var formattedSuccess = RouteAttemptFormatter.Format(successProgress);
+        Equal("Маршрут готов: Jumphost:5555 → Server-A", formattedSuccess);
+
+        // 6. Test that Single-endpoint probe emits EndpointProbing
+        var progressList = new List<SshConnectionProgress>();
+        var ssh = new SshConnectionService();
+        var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        var method = typeof(SshConnectionService).GetMethod("SelectEndpointDirectAsync", flags);
+        if (method is not null)
+        {
+            var targetServer = new ManagedServer { Name = "Srv1", Host = "192.168.1.10", Port = 22 };
+            var ctx = EndpointContext.Direct(proxy.Id);
+            var taskResult = (Task<ServerEndpoint>)method.Invoke(ssh, new object?[]
+            {
+                targetServer, ctx, CancellationToken.None,
+                new Action<SshConnectionProgress>(p => progressList.Add(p)),
+                1, 2, "TestRoute"
+            })!;
+            var chosenEp = taskResult.GetAwaiter().GetResult();
+            Equal("192.168.1.10", chosenEp.Host);
+            Equal(1, progressList.Count);
+            Equal(SshConnectionProgressKind.EndpointProbing, progressList[0].Kind);
+            Equal("Srv1 [192.168.1.10:22]", progressList[0].EndpointDisplay);
+        }
+
+        // 7. Verify Ansible secret masking on route progress and warnings
+        var server1Name = "Server-Alpha";
+        var secrets = new[] { "super-secret-password" };
+        var rawRouteLog = $"[{server1Name}] Маршрут: Попытка 1/3 не удалась: Auth failed for password super-secret-password";
+        var redactedRouteLog = AnsibleSecretRedactor.Redact(rawRouteLog, secrets);
+        Equal(false, redactedRouteLog.Contains("super-secret-password"));
+        Equal(true, redactedRouteLog.Contains("***"));
+
+        // Verify with actual AnsibleLogFormatter.Filter
+        var nowEntry = DateTimeOffset.Now;
+        var infoEntry = new AnsibleLogEntry(nowEntry, $"[{server1Name}] Маршрут: {formattedStart}", false, false);
+        var failEntry = new AnsibleLogEntry(nowEntry, redactedRouteLog, false, true);
+        var filteredWarns = AnsibleLogFormatter.Filter([infoEntry, failEntry], errorsAndWarningsOnly: true).ToList();
+        Equal(1, filteredWarns.Count);
+        Equal(redactedRouteLog, filteredWarns[0].Text);
+
+        // 8. Verify race preserving global candidate indices and total attempt count
+        var raceCandidates = new[] { candidate, candidate };
+        var raceEmittedProgress = new List<SshConnectionProgress>();
+        var raceProgressLock = new object();
+        var raceCts = new CancellationTokenSource();
+        var raceTask = ssh.ConnectFirstSuccessfulAsync(
+            new ManagerConfig(), raceCandidates,
+            cancellationToken: raceCts.Token,
+            progress: p =>
+            {
+                lock (raceProgressLock)
+                {
+                    raceEmittedProgress.Add(p);
+                    if (raceEmittedProgress.Count(x => x.Kind == SshConnectionProgressKind.AttemptStarting) >= 2)
+                        raceCts.Cancel();
+                }
+            },
+            candidateIndices: [2, 5],
+            totalAttempts: 5);
+        try { raceTask.GetAwaiter().GetResult(); } catch (OperationCanceledException) { }
+        // AttemptStarting events should carry custom attemptIndex and totalAttempts
+        List<SshConnectionProgress> startEvents;
+        lock (raceProgressLock)
+        {
+            startEvents = raceEmittedProgress.Where(p => p.Kind == SshConnectionProgressKind.AttemptStarting).ToList();
+        }
+        Equal(2, startEvents.Count);
+        Equal(2, startEvents[0].AttemptIndex);
+        Equal(5, startEvents[0].AttemptCount);
+        Equal(5, startEvents[1].AttemptIndex);
+        Equal(5, startEvents[1].AttemptCount);
+
+        // 9. Verify unavailable entry point and startup failure produce formatted AttemptFailed progress with duration
+        var unavailableProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.AttemptFailed,
+            AttemptIndex: 1,
+            AttemptCount: 1,
+            RouteDescription: routeDesc,
+            Duration: TimeSpan.FromSeconds(2.5),
+            ErrorMessage: $"точка входа «{proxy.Name}» ({proxy.Host}:{proxy.Port}) недоступна");
+        var formattedUnavailable = RouteAttemptFormatter.Format(unavailableProgress);
+        Equal(true, formattedUnavailable.Contains("недоступна"));
+        Equal(true, formattedUnavailable.StartsWith("Попытка 1/1 не удалась за 2.5 с: точка входа «Jumphost» (127.0.0.1:5555) недоступна"));
+
+        var startupFailProgress = new SshConnectionProgress(
+            SshConnectionProgressKind.AttemptFailed,
+            AttemptIndex: 1,
+            AttemptCount: 2,
+            RouteDescription: routeDesc,
+            Duration: TimeSpan.FromSeconds(10.1),
+            ErrorMessage: $"сбой запуска точки входа {proxy.Name}: Connection timed out");
+        var formattedStartupFail = RouteAttemptFormatter.Format(startupFailProgress);
+        Equal(true, formattedStartupFail.StartsWith("Попытка 1/2 не удалась за 10.1 с: сбой запуска точки входа Jumphost: Connection timed out"));
+    }
+
+    private static void BatchRunCancellationPreservesStopReason()
+    {
+        var server = new ManagedServer { Name = "Server-StopTest", Host = "10.0.0.1", Port = 22 };
+        var config = new ManagerConfig { UngroupedServers = [server] };
+        var taskDef = new BatchTaskDefinition
+        {
+            Name = "StopTest",
+            Steps = [new BatchTaskStep { Name = "Step1", Kind = BatchTaskStepKind.Command, Command = "echo 1" }]
+        };
+
+        var cts = new CancellationTokenSource();
+        cts.Cancel(); // Cancelled before or during semaphore wait
+
+        var runner = new BatchTaskRunner(new SshConnectionService(),
+            routeFactory: (Guid id, Action<SshConnectionProgress>? p, CancellationToken t) =>
+                Task.FromException<ActiveRoute>(new OperationCanceledException()));
+
+        var logEntries = new List<BatchTaskLog>();
+        runner.Log += log => logEntries.Add(log);
+
+        var runResult = runner.RunAsync(config, taskDef, [server.Id], "/tmp", BatchFailureMode.Continue, cts.Token)
+            .GetAwaiter().GetResult();
+
+        Equal(1, runResult.Servers.Count);
+        var srvResult = runResult.Servers[0];
+        Equal(BatchRunSummary.ConnectStepLabel, srvResult.StoppedAtStep);
+        Equal("Остановлено до начала подключения", srvResult.Message);
+        Equal(true, logEntries.Any(l => l.Message.Contains("Остановлено до начала подключения")));
+
+        // Test cancellation occurring after connection starts
+        var ctsDuring = new CancellationTokenSource();
+        var runnerDuring = new BatchTaskRunner(new SshConnectionService(),
+            routeFactory: (Guid id, Action<SshConnectionProgress>? p, CancellationToken t) =>
+            {
+                ctsDuring.Cancel();
+                throw new OperationCanceledException(ctsDuring.Token);
+            });
+        var logEntriesDuring = new List<BatchTaskLog>();
+        runnerDuring.Log += log => logEntriesDuring.Add(log);
+
+        var runResultDuring = runnerDuring.RunAsync(config, taskDef, [server.Id], "/tmp", BatchFailureMode.Continue, ctsDuring.Token)
+            .GetAwaiter().GetResult();
+
+        var srvResultDuring = runResultDuring.Servers[0];
+        Equal(BatchRunSummary.ConnectStepLabel, srvResultDuring.StoppedAtStep);
+        Equal("Подключение остановлено пользователем", srvResultDuring.Message);
+        Equal(true, logEntriesDuring.Any(l => l.Message.Contains("Подключение остановлено пользователем")));
+
+        // Test tolerated failure (ContinueOnError) followed by cancellation does not report old ErrorMessage
+
+        using var dummyClient = new Renci.SshNet.SshClient("127.0.0.1", 2222, "user", "pass");
+        var mockActiveRoute = new ActiveRoute(
+            server, 2222, 1080, "direct",
+            dummyClient, [], []);
+        var ctsStep = new CancellationTokenSource();
+        var stepRunner = new BatchTaskRunner(new SshConnectionService(),
+            routeFactory: (Guid id, Action<SshConnectionProgress>? p, CancellationToken t) => Task.FromResult(mockActiveRoute));
+        var stepLogs = new List<BatchTaskLog>();
+        stepRunner.Log += log =>
+        {
+            stepLogs.Add(log);
+            if (log.Message.Contains("некритичное"))
+                ctsStep.Cancel();
+        };
+        var taskWithTolerated = new BatchTaskDefinition
+        {
+            Name = "ToleratedThenCancel",
+            Steps =
+            [
+                new BatchTaskStep { Name = "ToleratedFail", Kind = BatchTaskStepKind.Command, Command = "false", ContinueOnError = true },
+                new BatchTaskStep { Name = "SecondStep", Kind = BatchTaskStepKind.Command, Command = "sleep 1" }
+            ]
+        };
+        var resStep = stepRunner.RunAsync(config, taskWithTolerated, [server.Id], "/tmp", BatchFailureMode.Continue, ctsStep.Token)
+            .GetAwaiter().GetResult();
+        Equal(1, resStep.Servers.Count);
+        var resServer = resStep.Servers[0];
+        Equal(true, resServer.Cancelled);
+        Equal(false, resServer.Failed);
+        Equal("Остановлено", resServer.Message);
+        Equal("Шаг 1/2: ToleratedFail", resServer.StoppedAtStep);
+    }
+
+    private static void MixedRouteFailureIsConnectivityFailure()
+    {
+        var unavailableEntryEx = new InvalidOperationException("Точка входа «Jumphost» (127.0.0.1:5555) недоступна.");
+        var socketEx = new System.Net.Sockets.SocketException();
+        var agg = new AggregateException(unavailableEntryEx, socketEx);
+        var mixedFailure = new InvalidOperationException("Не найден рабочий маршрут. Запустите ручную проверку связности.", agg);
+
+        Equal(true, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedFailure));
+        Equal(true, TaskConnectionRecoveryPolicy.IsConnectivityFailure(unavailableEntryEx));
+
+        var nonConnectivityEx = new InvalidOperationException("Другая ошибка конфигурации");
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(nonConnectivityEx));
+
+        var missingDirEx = new InvalidOperationException("Рабочая папка отсутствует или недоступна на сервере: /nonexistent");
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(missingDirEx));
+
+        var jumphostAuthEx = new Renci.SshNet.Common.SshAuthenticationException("Permission denied (password) for jumphost.");
+        var jumphostFailure = new InvalidOperationException("Не найден рабочий маршрут. Запустите ручную проверку связности.", new AggregateException(jumphostAuthEx));
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(jumphostFailure));
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(jumphostAuthEx));
+
+        // Mixed aggregate: both orders must return false because authentication failure is terminal
+        var mixedAggEntryFirst = new AggregateException(unavailableEntryEx, jumphostAuthEx);
+        var mixedAggAuthFirst = new AggregateException(jumphostAuthEx, unavailableEntryEx);
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggEntryFirst));
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggAuthFirst));
+
+        // Nested authentication failure must also be detected and return false
+        var nestedAuthEx = new InvalidOperationException("Wrapper error", jumphostAuthEx);
+        var mixedAggNestedAuth = new AggregateException(unavailableEntryEx, nestedAuthEx);
+        Equal(false, TaskConnectionRecoveryPolicy.IsConnectivityFailure(mixedAggNestedAuth));
     }
 
     private static void RoutedSessionCreateMinimal()
