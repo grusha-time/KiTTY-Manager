@@ -973,15 +973,7 @@ public partial class MainWindow : Window
         view?.Refresh();
         SaveConfig();
     }
-    private static string GetWebSortValue(WebInterface web, string property) => property switch
-    {
-        nameof(WebInterface.Name) => web.Name,
-        nameof(WebInterface.Url) => web.Url,
-        nameof(WebInterface.ResolverAddress) => web.ResolverAddress,
-        nameof(WebInterface.Username) => web.Username,
-        nameof(WebInterface.Password) => web.Password,
-        _ => web.Name
-    };
+    private static string GetWebSortValue(WebInterface web, string property) => WebFieldValueResolver.ResolveForSort(web, property);
     private void SaveToKitty_Click(object sender, RoutedEventArgs e)
     {
         var server = SelectedRow()?.Server ?? selectedServer;
@@ -1008,6 +1000,7 @@ public partial class MainWindow : Window
     private async void WebGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (!WebGrid.IsReadOnly) return;
+        if (FindParent<System.Windows.Controls.Button>(e.OriginalSource as DependencyObject) is not null) return;
         var row = FindParent<DataGridRow>(e.OriginalSource as DependencyObject);
         if (row?.Item is not WebInterface web) return;
         WebGrid.SelectedItem = web;
@@ -1015,18 +1008,51 @@ public partial class MainWindow : Window
         await OpenSelectedWebAsync();
     }
 
+    private DataGridCellInfo? lastClickedWebCell;
+
     private void WebGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
         var cell = FindParent<DataGridCell>(e.OriginalSource as DependencyObject);
-        if (cell is null) return;
+        if (cell is null)
+        {
+            lastClickedWebCell = null;
+            return;
+        }
+        if (cell.IsEditing) return;
+        lastClickedWebCell = new DataGridCellInfo(cell.DataContext, cell.Column);
         WebGrid.SelectedItem = cell.DataContext;
-        WebGrid.CurrentCell = new DataGridCellInfo(cell.DataContext, cell.Column);
+        WebGrid.CurrentCell = lastClickedWebCell.Value;
         cell.Focus();
+    }
+
+    private void WebGrid_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (e.CursorLeft < 0 && WebGrid.CurrentCell.IsValid && WebGrid.CurrentCell.Item is WebInterface)
+        {
+            lastClickedWebCell = WebGrid.CurrentCell;
+        }
+        var hasValidCell = lastClickedWebCell.HasValue && lastClickedWebCell.Value.IsValid && lastClickedWebCell.Value.Item is WebInterface;
+        if (CopyWebFieldValueMenuItem is not null) CopyWebFieldValueMenuItem.IsEnabled = hasValidCell;
+        if (EditWebFieldMenuItem is not null) EditWebFieldMenuItem.IsEnabled = hasValidCell;
+    }
+
+    private void CopyWebFieldValue_Click(object sender, RoutedEventArgs e)
+    {
+        var cellInfo = lastClickedWebCell ?? WebGrid.CurrentCell;
+        if (!cellInfo.IsValid || cellInfo.Item is not WebInterface web || cellInfo.Column is null) return;
+        var value = WebFieldValueResolver.Resolve(web, cellInfo.Column.SortMemberPath);
+        if (!string.IsNullOrEmpty(value))
+        {
+            try { System.Windows.Clipboard.SetText(value); }
+            catch { }
+        }
     }
 
     private void EditWebField_Click(object sender, RoutedEventArgs e)
     {
-        if (!WebGrid.CurrentCell.IsValid || WebGrid.CurrentCell.Item is not WebInterface) return;
+        var cellInfo = lastClickedWebCell ?? WebGrid.CurrentCell;
+        if (!cellInfo.IsValid || cellInfo.Item is not WebInterface) return;
+        WebGrid.CurrentCell = cellInfo;
         WebGrid.IsReadOnly = false;
         WebGrid.BeginEdit();
     }
