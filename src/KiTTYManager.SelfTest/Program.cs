@@ -67,6 +67,13 @@ internal sealed partial class SelfTestRunner
     {
         Console.WriteLine("KiTTY Manager: автономные тесты");
         Test("Поиск справки находит поля во всех разделах", HelpSearchFindsFieldsAcrossSections);
+        Test("Валидация параметров и отображение SSH-туннелей", TunnelDefinitionAndPolicyValidation);
+        Test("Фабрика портов создаёт Local, Remote и Dynamic порты SSH.NET", TunnelPortFactoryCreatesCorrectPortTypes);
+        Test("Служба туннелей отслеживает состояние и освобождает ресурсы при ошибке", TunnelServiceStateTrackingAndErrorHandling);
+        Test("Поиск справки находит раздел управления SSH-туннелями", TunnelHelpContentSearchVerification);
+        Test("Служба туннелей корректно очищает ресурсы при остановке во время запуска", TunnelServiceStopDuringStartupCleansUpProperly);
+        Test("Статус ошибки туннеля сохраняет защиту активных ресурсов и позволяет их освободить", TunnelServiceErrorStatusRetainsActiveResourceProtection);
+        Test("Синхронная остановка всех туннелей освобождает ресурсы без блокировки", TunnelServiceSynchronousStopAllReleasesResourcesWithoutBlocking);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);

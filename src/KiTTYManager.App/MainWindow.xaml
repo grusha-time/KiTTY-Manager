@@ -102,6 +102,7 @@
                 <MenuItem Header="Подключиться" Click="OpenRoutedConsole_Click"/>
                 <MenuItem x:Name="SaveToKittyMenuItem" Header="Сохранить в KiTTY" Click="SaveToKitty_Click"/>
                 <MenuItem Header="Открыть в WinSCP" Click="OpenWinScp_Click"/>
+                <MenuItem Header="Прокинуть туннель…" Click="ForwardTunnel_Click"/>
                 <MenuItem Header="Проверить доступ к другим серверам…" Click="CheckConnectivity_Click"/>
                 <MenuItem Header="Сохранённые связи…" Click="ShowSavedLinks_Click"/>
                 <Separator/>
@@ -192,6 +193,8 @@
               <Button x:Name="StartJumphostButton" Click="StartJumphost_Click" Height="38" Margin="0,0,8,8" Visibility="Collapsed">Запустить как точку входа</Button>
               <Button Click="CheckConnectivity_Click" Height="38" Margin="0,0,8,8">Построить связь с другими серверами…</Button>
               <Button Click="ShowSavedLinks_Click" Height="38" Margin="0,0,8,8">Сохранённые связи…</Button>
+              <Button Click="ForwardTunnel_Click" Height="38" Margin="0,0,8,8"
+                      ToolTip="Пробросить SSH-туннель (Local, Remote или Dynamic/SOCKS)">Прокинуть туннель</Button>
             </WrapPanel>
             <TextBlock x:Name="LastRouteText" Margin="0,4,0,0"
                        Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
