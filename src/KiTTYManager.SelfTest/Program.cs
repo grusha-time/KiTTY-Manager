@@ -427,7 +427,7 @@ internal sealed partial class SelfTestRunner
         Test("Таймаут прямой цели не блокирует обход через ту же JH", DirectTimeoutDoesNotBlockSameProxyMultiHop);
         Test("ClearFailureCache сбрасывает весь кэш", ClearFailureCacheResetsAll);
         Test("CreateMinimal создаёт валидную сессию без Autocommand", RoutedSessionCreateMinimal);
-        Test("Опции окон KiTTY: максимизация обычных консолей и скрытие туннелей в трей", KittyWindowDisplayOptionsAndSessionConfiguration);
+        Test("Опции окон KiTTY: максимизация обычных консолей и сворачивание туннелей", KittyWindowDisplayOptionsAndSessionConfiguration);
         Test("Умный импорт отдаёт приоритет более коротким сохранённым маршрутам", SmartImportAppliesShorterPreferredRoutes);
         Test("Асимметричная проверка связей и инвалидация направления", AsymmetricLinkVerificationAndDirectedInvalidation);
         Test("Определение односторонних и двусторонних связей на карте", AsymmetricLinkMapVisuals);
@@ -1485,8 +1485,7 @@ internal sealed partial class SelfTestRunner
         Equal(true, ContainsPair(arguments, "-loadfile", "runtime-session"));
         Equal(true, ContainsPair(arguments, "-P", "43123"));
         Equal(false, arguments.Contains("-D"));
-        Equal(true, arguments.Contains("-send-to-tray"));
-        Equal(1, arguments.Count(a => a == "-send-to-tray"));
+        Equal(false, arguments.Contains("-send-to-tray"));
         Equal(false, arguments.Contains("-N"));
         Equal(true, ContainsPair(arguments, "-loginscript", "root-login.txt"));
         Equal(false, arguments.Contains("-cmd"));
@@ -7038,7 +7037,8 @@ internal sealed partial class SelfTestRunner
             Equal(true, content.Contains("Autocommand\\\\"));
             Equal(true, content.Contains("Scriptfile\\\\"));
             Equal(true, content.Contains("ScriptfileContent\\\\"));
-            Equal(true, content.Contains("SendToTray\\1\\"));
+            Equal(true, content.Contains("SendToTray\\0\\"));
+            Equal(false, content.Contains("SendToTray\\1\\"));
             Equal(true, content.Contains("Maximize\\0\\"));
             Equal(true, content.Contains("Fullscreen\\0\\"));
         }
@@ -7093,25 +7093,27 @@ internal sealed partial class SelfTestRunner
                 "HostName\\10.0.0.1\\",
                 "PortNumber\\22\\",
                 "Maximize\\1\\",
-                "Fullscreen\\1\\"
+                "Fullscreen\\1\\",
+                "SendToTray\\1\\"
             ]);
 
-            // Web tunnel session (dynamicPort > 0) suppresses source Maximize and Fullscreen, forces SendToTray=1
+            // Web tunnel session (dynamicPort > 0) suppresses source Maximize, Fullscreen and SendToTray (overrides inherited 1 with 0)
             using (var tunnelSession = KittyRoutedSession.Create(sourceSessionPath, 43100, dynamicPort: 49100))
             {
                 var text = File.ReadAllText(tunnelSession.Path);
-                Equal(true, text.Contains("SendToTray\\1\\"));
+                Equal(true, text.Contains("SendToTray\\0\\"));
+                Equal(false, text.Contains("SendToTray\\1\\"));
                 Equal(true, text.Contains("Maximize\\0\\"));
                 Equal(true, text.Contains("Fullscreen\\0\\"));
                 Equal(true, text.Contains("PortForwardings\\D49100=\\"));
             }
 
-            // Routed session with maximize=false preserves source session settings
+            // Routed session with maximize=false preserves source session settings (including SendToTray\1\)
             using (var normalSession = KittyRoutedSession.Create(sourceSessionPath, 43100, maximize: false))
             {
                 var text = File.ReadAllText(normalSession.Path);
                 Equal(true, text.Contains("Maximize\\1\\"));
-                Equal(false, text.Contains("SendToTray\\1\\"));
+                Equal(true, text.Contains("SendToTray\\1\\"));
             }
 
             // Fresh source session without Maximize
