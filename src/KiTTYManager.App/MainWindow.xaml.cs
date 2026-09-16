@@ -48,6 +48,8 @@ public partial class MainWindow : Window
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> backgroundAccessChecks = new();
     private LinkMapWindow? linkMapWindow;
     private BatchTaskWindow? batchTaskWindow;
+    private ActiveTunnelsWindow? activeTunnelsWindow;
+    private readonly TunnelService tunnelService;
     private readonly Dictionary<Guid, QuickDuplicateDialog> quickDuplicateWindows = [];
     private bool batchExitPending;
     private bool configAvailable = true;
@@ -96,6 +98,38 @@ public partial class MainWindow : Window
                 Status(FormatSshStatus(traceEvent));
             });
         };
+        tunnelService = new TunnelService(
+            openRoute: async (serverId, token) =>
+            {
+                var server = config.FindServer(serverId) ?? throw new InvalidOperationException("Сессия не найдена.");
+                var operation = await Dispatcher.InvokeAsync(() => Connect(server, token, consoleOnly: false));
+                return await operation;
+            },
+            releaseRoute: route =>
+            {
+                if (Dispatcher.CheckAccess())
+                    activeRoutes.Remove(route);
+                else
+                    Dispatcher.Invoke(() => activeRoutes.Remove(route));
+
+                route.Dispose();
+            },
+            log: msg =>
+            {
+                if (Dispatcher.CheckAccess())
+                {
+                    RouteLog(msg);
+                    Status(msg);
+                }
+                else
+                {
+                    Dispatcher.BeginInvoke(() =>
+                    {
+                        RouteLog(msg);
+                        Status(msg);
+                    });
+                }
+            });
         RefreshAll();
         accessScriptAlarm.Tick += AccessScriptAlarm_Tick;
         Loaded += async (_, _) =>
@@ -3477,12 +3511,13 @@ public partial class MainWindow : Window
         var changes = new MenuItem { Header = "Изменения KiTTY…" }; changes.Click += (_, _) => ShowKittyChanges();
         var resetIgnored = new MenuItem { Header = "Снова показывать игнорируемые изменения KiTTY" };
         resetIgnored.Click += (_, _) => ResetIgnoredKittyChanges();
+        var activeTunnels = new MenuItem { Header = "Активные туннели…" }; activeTunnels.Click += (_, _) => ShowActiveTunnels();
         var jumphosts = new MenuItem { Header = "Настройки точек входа…" }; jumphosts.Click += Jumphosts_Click;
         var settings = new MenuItem { Header = "Настройки…" }; settings.Click += Settings_Click;
         var help = new MenuItem { Header = "Справка по полям…" }; help.Click += (_, _) => _ = new HelpDialog { Owner = this }.ShowDialog();
         var about = new MenuItem { Header = "О программе…" }; about.Click += (_, _) => ShowAbout();
         var exit = new MenuItem { Header = "Выйти" }; exit.Click += (_, _) => ExitApplication();
-        menu.Items.Add(jumphosts); menu.Items.Add(settings); menu.Items.Add(new Separator());
+        menu.Items.Add(activeTunnels); menu.Items.Add(jumphosts); menu.Items.Add(settings); menu.Items.Add(new Separator());
         menu.Items.Add(changes); menu.Items.Add(resetIgnored); menu.Items.Add(new Separator()); menu.Items.Add(export); menu.Items.Add(import); menu.Items.Add(rollbackImport);
         menu.Items.Add(logs); menu.Items.Add(help); menu.Items.Add(about); menu.Items.Add(exit); menu.PlacementTarget = sender as UIElement; menu.IsOpen = true;
     }
@@ -3527,6 +3562,101 @@ public partial class MainWindow : Window
     }
     private void ShowBatchTasks_Click(object sender, RoutedEventArgs e) => ShowBatchTasks();
     private void ShowLinkMap_Click(object sender, RoutedEventArgs e) => ShowLinkMap();
+
+    private void ShowActiveTunnels()
+    {
+        if (activeTunnelsWindow is not null)
+        {
+            if (activeTunnelsWindow.WindowState == WindowState.Minimized)
+                activeTunnelsWindow.WindowState = WindowState.Normal;
+            activeTunnelsWindow.Activate();
+            return;
+        }
+
+        activeTunnelsWindow = new ActiveTunnelsWindow(tunnelService, RequestForwardTunnelFromWindowAsync);
+        activeTunnelsWindow.Closed += (_, _) => activeTunnelsWindow = null;
+        activeTunnelsWindow.Show();
+    }
+
+    private async void ForwardTunnel_Click(object sender, RoutedEventArgs e)
+    {
+        var server = SelectedRow()?.Server ?? selectedServer;
+        if (server is null)
+        {
+            Warn("Выберите сессию для проброса туннеля.");
+            return;
+        }
+
+        var dialog = new TunnelForwardDialog(server) { Owner = this };
+        if (dialog.ShowDialog() != true || dialog.Result is null) return;
+
+        var definition = dialog.Result;
+        ShowActiveTunnels();
+
+        ActiveTunnelItem? startedItem = null;
+        try
+        {
+            await BusyAsync($"Поднимаю туннель «{definition.Summary}»…", async token =>
+            {
+                startedItem = await tunnelService.StartTunnelAsync(definition, token);
+            });
+            if (startedItem is { IsRunning: true })
+            {
+                Status($"Туннель «{definition.Summary}» успешно поднят.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Error(ex);
+        }
+    }
+
+    private async Task RequestForwardTunnelFromWindowAsync(Window parentWindow)
+    {
+        var allServers = config.AllServers().ToList();
+        if (allServers.Count == 0)
+        {
+            ThemedMessageDialog.Show(parentWindow, "В менеджере нет сохранённых сессий.", "Проброс туннеля", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        ManagedServer? server = SelectedRow()?.Server ?? selectedServer;
+        if (server is null)
+        {
+            if (allServers.Count == 1)
+            {
+                server = allServers[0];
+            }
+            else
+            {
+                var picker = new SearchChoiceDialog("Выбор сессии", "Выберите сессию для проброса туннеля:", allServers) { Owner = parentWindow };
+                if (picker.ShowDialog() != true || picker.Selections.Count == 0) return;
+                server = picker.Selections[0] as ManagedServer;
+            }
+        }
+        if (server is null) return;
+
+        var dialog = new TunnelForwardDialog(server) { Owner = parentWindow };
+        if (dialog.ShowDialog() != true || dialog.Result is null) return;
+
+        var definition = dialog.Result;
+        ActiveTunnelItem? windowStartedItem = null;
+        try
+        {
+            await BusyAsync($"Поднимаю туннель «{definition.Summary}»…", async token =>
+            {
+                windowStartedItem = await tunnelService.StartTunnelAsync(definition, token);
+            });
+            if (windowStartedItem is { IsRunning: true })
+            {
+                Status($"Туннель «{definition.Summary}» успешно поднят.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Error(ex);
+        }
+    }
 
     private async Task CheckLinksFromMapAsync(IReadOnlyList<Guid> serverIds)
     {
@@ -3662,6 +3792,33 @@ public partial class MainWindow : Window
             _ = StopBatchAndExitAsync();
             return;
         }
+        if (tunnelService.HasActiveTunnels())
+        {
+            var promptOwner = (activeTunnelsWindow is not null && activeTunnelsWindow.IsVisible)
+                ? (Window)activeTunnelsWindow
+                : this;
+
+            var choice = ThemedMessageDialog.ShowChoice(
+                promptOwner,
+                "Есть активные SSH-туннели. При выходе из программы все они будут остановлены.\n\nВы действительно хотите выйти и остановить туннели?",
+                "Активные туннели",
+                "Выйти и остановить",
+                "Не выходить",
+                MessageBoxImage.Warning);
+
+            if (choice != ThemedDialogChoice.Primary)
+            {
+                e.Cancel = true;
+                forceExit = false;
+                return;
+            }
+
+            try { activeTunnelsWindow?.ForceClose(); } catch { }
+        }
+        else
+        {
+            try { activeTunnelsWindow?.ForceClose(); } catch { }
+        }
         Cleanup();
     }
     private async Task StopBatchAndExitAsync()
@@ -3694,6 +3851,8 @@ public partial class MainWindow : Window
         accessScriptGates.Clear();
         try { SaveConfig(); } catch { }
         StopFirefoxContainers();
+        try { activeTunnelsWindow?.ForceClose(); } catch { }
+        tunnelService.Dispose();
         foreach (var route in activeRoutes) route.Dispose();
         if (trayIcon is not null) { trayIcon.Visible = false; trayIcon.Dispose(); }
     }

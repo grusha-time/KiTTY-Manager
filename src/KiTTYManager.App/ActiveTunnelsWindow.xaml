@@ -1,0 +1,59 @@
+<Window x:Class="KiTTYManager.App.ActiveTunnelsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource {x:Type Window}}"
+        Title="Активные SSH-туннели"
+        Width="920" Height="520" MinWidth="720" MinHeight="360"
+        WindowStartupLocation="CenterScreen" ShowInTaskbar="True" ResizeMode="CanResize"
+        Background="{DynamicResource WindowBrush}" Foreground="{DynamicResource TextBrush}">
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <Grid Margin="0,0,0,12">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <StackPanel VerticalAlignment="Center">
+        <TextBlock Text="Активные SSH-туннели" FontSize="20" FontWeight="SemiBold"/>
+        <TextBlock x:Name="TunnelCountText" Text="Туннелей: 0" Opacity="0.7" Margin="0,3,0,0"/>
+      </StackPanel>
+      <WrapPanel Grid.Column="1" VerticalAlignment="Center">
+        <Button x:Name="AddTunnelButton" Content="Прокинуть туннель…" Style="{StaticResource SuccessButton}"
+                Click="AddTunnel_Click" Margin="0,0,8,0"/>
+        <Button x:Name="StopSelectedButton" Content="Остановить выбранные" Style="{StaticResource DangerButton}"
+                Click="StopSelected_Click" Margin="0,0,8,0"/>
+        <Button x:Name="StopAllButton" Content="Остановить все" Click="StopAll_Click"/>
+      </WrapPanel>
+    </Grid>
+
+    <DataGrid x:Name="TunnelsGrid" Grid.Row="1"
+              AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" IsReadOnly="True"
+              SelectionMode="Extended"
+              Background="{DynamicResource ControlBackgroundBrush}"
+              BorderBrush="{DynamicResource BorderBrush}"
+              Foreground="{DynamicResource TextBrush}">
+      <DataGrid.ContextMenu>
+        <ContextMenu>
+          <MenuItem Header="Остановить выбранные" Click="StopSelected_Click"/>
+          <MenuItem Header="Копировать адрес привязки" Click="CopyBind_Click"/>
+        </ContextMenu>
+      </DataGrid.ContextMenu>
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Сессия" Binding="{Binding ServerName}" Width="160"/>
+        <DataGridTextColumn Header="Тип" Binding="{Binding KindDisplay}" Width="160"/>
+        <DataGridTextColumn Header="Откуда (bind)" Binding="{Binding BindDisplay}" Width="160"/>
+        <DataGridTextColumn Header="Куда (назначение)" Binding="{Binding DestinationDisplay}" Width="*"/>
+        <DataGridTextColumn Header="Состояние" Binding="{Binding Status}" Width="150"/>
+        <DataGridTextColumn Header="Время" Binding="{Binding CreatedTimeDisplay}" Width="85"/>
+      </DataGrid.Columns>
+    </DataGrid>
+
+    <TextBlock Grid.Row="2" Margin="0,8,0,0" Opacity="0.65" TextWrapping="Wrap" FontSize="12"
+               Text="Окно можно сворачивать. При закрытии окна все активные туннели будут остановлены с подтверждением. Выберите одну или несколько строк для выборочной остановки."/>
+  </Grid>
+</Window>

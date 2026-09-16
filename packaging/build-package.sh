@@ -37,6 +37,7 @@ if [[ "$ZIP_NAME" != *.zip ]]; then
 fi
 
 ZIP_PATH="$ROOT/dist/$ZIP_NAME"
+find "$ROOT/build/package" -type f \( -name "*.md" -o -name "*sha256*" \) -delete
 echo "==> Creating package archive: $ZIP_PATH"
 jar --create --no-manifest --file "$ZIP_PATH" -C "$ROOT/build/package" .
 echo "==> Built: $ZIP_PATH"
