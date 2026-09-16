@@ -688,14 +688,36 @@ public static class TaskConnectionRecoveryPolicy
             BatchTaskStepKind.Download or BatchTaskStepKind.Delete;
     public static bool IsConnectivityFailure(Exception exception)
     {
-        for (Exception? current = exception; current is not null; current = current.InnerException)
-            if (current is SshConnectionException or SshOperationTimeoutException or SocketException or EndOfStreamException ||
-                current is ObjectDisposedException && current.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
-                current is IOException && (current.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
-                                             current.Message.Contains("соединен", StringComparison.OrdinalIgnoreCase) ||
-                                             current.Message.Contains("socket", StringComparison.OrdinalIgnoreCase)))
-                return true;
-        return false;
+        var visited = new HashSet<Exception>();
+        var queue = new Queue<Exception>();
+        queue.Enqueue(exception);
+
+        var allExceptions = new List<Exception>();
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (!visited.Add(current)) continue;
+            allExceptions.Add(current);
+
+            if (current is AggregateException agg)
+            {
+                foreach (var inner in agg.InnerExceptions)
+                    if (inner is not null) queue.Enqueue(inner);
+            }
+            if (current.InnerException is not null)
+                queue.Enqueue(current.InnerException);
+        }
+
+        if (allExceptions.Any(e => e is RouteAttemptLimitException))
+            return false;
+
+        return allExceptions.Any(e =>
+            e is SshConnectionException or SshOperationTimeoutException or SocketException or EndOfStreamException ||
+            e is ObjectDisposedException && e.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
+            e is IOException && (e.Message.Contains("connection", StringComparison.OrdinalIgnoreCase) ||
+                                 e.Message.Contains("соединен", StringComparison.OrdinalIgnoreCase) ||
+                                 e.Message.Contains("socket", StringComparison.OrdinalIgnoreCase)) ||
+            e is InvalidOperationException && e.Message.Contains("точка входа", StringComparison.OrdinalIgnoreCase));
     }
 }
 
@@ -716,7 +738,7 @@ public sealed class BatchTaskRunner
 {
     internal static readonly TimeSpan ConnectionRetryDelay = TimeSpan.FromSeconds(10);
     private readonly SshConnectionService connections;
-    private readonly Func<Guid, CancellationToken, Task<ActiveRoute>>? routeFactory;
+    private readonly Func<Guid, Action<SshConnectionProgress>?, CancellationToken, Task<ActiveRoute>>? routeFactory;
     private readonly Action<ActiveRoute>? routeRelease;
     private string[] activeSecrets = [];
     private int running;
@@ -727,10 +749,19 @@ public sealed class BatchTaskRunner
     public Func<AmbiguousActionRetryPrompt, CancellationToken, Task<bool>>? ConfirmAmbiguousRetry { get; set; }
 
     public BatchTaskRunner(SshConnectionService connections,
-        Func<Guid, CancellationToken, Task<ActiveRoute>>? routeFactory = null,
+        Func<Guid, Action<SshConnectionProgress>?, CancellationToken, Task<ActiveRoute>>? routeFactory = null,
         Action<ActiveRoute>? routeRelease = null) =>
         (this.connections, this.routeFactory, this.routeRelease) =
         (connections, routeFactory, routeRelease);
+
+    public BatchTaskRunner(SshConnectionService connections,
+        Func<Guid, CancellationToken, Task<ActiveRoute>>? routeFactory,
+        Action<ActiveRoute>? routeRelease = null) : this(
+            connections,
+            routeFactory is null ? null : (id, _, token) => routeFactory(id, token),
+            routeRelease)
+    {
+    }
 
     public async Task<BatchRunResult> RunAsync(ManagerConfig config, BatchTaskDefinition task,
         IEnumerable<Guid> serverIds, string taskDirectory, BatchFailureMode failureMode,
@@ -761,15 +792,37 @@ public sealed class BatchTaskRunner
             {
                 var connectJobs = ids.Select(async id =>
                 {
-                    await gate.WaitAsync(token).ConfigureAwait(false);
+                    var acquired = false;
+                    var connectionStarted = false;
                     try
                     {
+                        await gate.WaitAsync(token).ConfigureAwait(false);
+                        acquired = true;
                         token.ThrowIfCancellationRequested();
+                        connectionStarted = true;
                         await ConnectWithRecoveryAsync(config, task, states[id], "первичное подключение", token).ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) { states[id].StoppedAtStep = BatchRunSummary.ConnectStepLabel; }
-                    catch (Exception ex) { states[id].Failed = true; states[id].ErrorMessage = SecretRedactor.Redact(ex.Message, states[id].Server, activeSecrets); states[id].StoppedAtStep = BatchRunSummary.ConnectStepLabel; Emit(states[id], "", "Ошибка подключения: " + states[id].ErrorMessage, BatchLogLevel.Error); }
-                    finally { gate.Release(); }
+                    catch (OperationCanceledException)
+                    {
+                        states[id].StoppedAtStep = BatchRunSummary.ConnectStepLabel;
+                        var cancelReason = connectionStarted
+                            ? "Подключение остановлено пользователем"
+                            : "Остановлено до начала подключения";
+                        states[id].CancellationReason ??= cancelReason;
+                        states[id].ErrorMessage ??= cancelReason;
+                        Emit(states[id], BatchRunSummary.ConnectStepLabel, cancelReason, BatchLogLevel.Warning);
+                    }
+                    catch (Exception ex)
+                    {
+                        states[id].Failed = true;
+                        states[id].ErrorMessage = SecretRedactor.Redact(ex.Message, states[id].Server, activeSecrets);
+                        states[id].StoppedAtStep = BatchRunSummary.ConnectStepLabel;
+                        Emit(states[id], "", "Ошибка подключения: " + states[id].ErrorMessage, BatchLogLevel.Error);
+                    }
+                    finally
+                    {
+                        if (acquired) gate.Release();
+                    }
                 }).ToArray();
                 await Task.WhenAll(connectJobs).ConfigureAwait(false);
             }
@@ -878,7 +931,7 @@ public sealed class BatchTaskRunner
             // Этап 3: туннели. По умолчанию закрываются после шагов; если включено
             // KeepTunnelsAfterSteps — держат соединения до остановки.
             // Снимок состояния делаем ДО очистки: CleanupConnection сбрасывает Connected.
-            var snapshot = states.ToDictionary(kv => kv.Key, kv => (kv.Value.Connected, kv.Value.Failed, kv.Value.ErrorMessage, kv.Value.StoppedAtStep));
+            var snapshot = states.ToDictionary(kv => kv.Key, kv => (kv.Value.Connected, kv.Value.Failed, kv.Value.ErrorMessage, kv.Value.CancellationReason, kv.Value.StoppedAtStep));
             var keepAlive = task.KeepTunnelsAfterSteps
                 ? connectedIds.Where(id => states[id].Tunnels.Count > 0 && !states[id].Failed).ToArray()
                 : [];
@@ -898,12 +951,16 @@ public sealed class BatchTaskRunner
             {
                 var state = states[id];
                 var snap = snapshot[id];
-                var success = snap.Connected && !snap.Failed && !cancellationToken.IsCancellationRequested;
-                var message = cancellationToken.IsCancellationRequested && !snap.Failed ? "Остановлено"
-                    : !snap.Connected ? snap.ErrorMessage ?? "Не подключено"
-                    : snap.Failed ? snap.ErrorMessage ?? "Ошибка"
+                var failed = snap.Failed || state.Failed;
+                var errorMessage = snap.Failed ? snap.ErrorMessage : (state.ErrorMessage ?? snap.ErrorMessage);
+                var stoppedAtStep = snap.StoppedAtStep ?? state.StoppedAtStep;
+                var success = snap.Connected && !failed && !cancellationToken.IsCancellationRequested;
+                var message = cancellationToken.IsCancellationRequested && !failed
+                    ? (!string.IsNullOrEmpty(snap.CancellationReason) ? snap.CancellationReason : "Остановлено")
+                    : !snap.Connected ? errorMessage ?? "Не подключено"
+                    : failed ? errorMessage ?? "Ошибка"
                     : "Готово";
-                return new BatchServerResult(id, state.Server.Name, success, cancellationToken.IsCancellationRequested, message, state.Backups, snap.StoppedAtStep, snap.Failed);
+                return new BatchServerResult(id, state.Server.Name, success, cancellationToken.IsCancellationRequested, message, state.Backups, stoppedAtStep, failed);
             }).ToList();
             return new(results.OrderBy(x => x.ServerName).ToArray(), cancellationToken.IsCancellationRequested);
         }
@@ -933,6 +990,7 @@ public sealed class BatchTaskRunner
         public bool Connected { get; set; }
         public bool Failed { get; set; }
         public string? ErrorMessage { get; set; }
+        public string? CancellationReason { get; set; }
         public string? StoppedAtStep { get; set; }
     }
 
@@ -940,10 +998,20 @@ public sealed class BatchTaskRunner
         ServerRunState state, CancellationToken token)
     {
         var server = state.Server;
+        Action<SshConnectionProgress> onProgress = p =>
+        {
+            var formatted = RouteAttemptFormatter.Format(p);
+            var level = p.Kind switch
+            {
+                SshConnectionProgressKind.AttemptFailed => BatchLogLevel.Warning,
+                _ => BatchLogLevel.Info
+            };
+            Emit(state, BatchRunSummary.ConnectStepLabel, formatted, level);
+        };
         Emit(state, "", $"Подключение к {server.CleanHost}:{server.Port}");
         state.Route = routeFactory is null
-            ? (await connections.ConnectBestAsync(config, server.Id, token).ConfigureAwait(false)).Route
-            : await routeFactory(server.Id, token).ConfigureAwait(false);
+            ? (await connections.ConnectBestAsync(config, server.Id, token, progress: onProgress).ConfigureAwait(false)).Route
+            : await routeFactory(server.Id, onProgress, token).ConfigureAwait(false);
         var ssh = state.Route.Client ?? throw new InvalidOperationException("Маршрут не предоставляет SSH-канал.");
         Emit(state, "", $"Подключено: {state.Route.Strategy}; локальный SSH-порт {state.Route.LocalSshPort}");
         var applicableTunnels = task.Tunnels.Where(x => BatchTunnelPolicy.AppliesTo(x, server.Id)).ToArray();
@@ -1008,7 +1076,13 @@ public sealed class BatchTaskRunner
             } while (true);
             var extra = RecoveryTimeout is null ? null : await RecoveryTimeout(
                 new(state.Server.Name, operation, waitMinutes), token).ConfigureAwait(false);
-            if (extra is null) throw new OperationCanceledException("Ожидание восстановления связи остановлено пользователем.", last, token);
+            if (extra is null)
+            {
+                state.CancellationReason = "Ожидание восстановления связи остановлено пользователем.";
+                state.ErrorMessage = "Ожидание восстановления связи остановлено пользователем.";
+                state.StoppedAtStep = BatchRunSummary.ConnectStepLabel;
+                throw new OperationCanceledException("Ожидание восстановления связи остановлено пользователем.", last, token);
+            }
             waitMinutes = TaskConnectionRecoveryPolicy.NormalizeMinutes(extra.Value);
         }
     }
@@ -1067,12 +1141,31 @@ public sealed class BatchTaskRunner
             catch (OperationCanceledException) { return; }
             try
             {
+                Action<SshConnectionProgress> onProgress = p =>
+                {
+                    var formatted = RouteAttemptFormatter.Format(p);
+                    var level = p.Kind switch
+                    {
+                        SshConnectionProgressKind.AttemptFailed => BatchLogLevel.Warning,
+                        _ => BatchLogLevel.Info
+                    };
+                    Emit(state, "Туннели", formatted, level, "Туннель");
+                };
                 Emit(state, "", "Переподключение");
                 state.Route = routeFactory is null
-                    ? (await connections.ConnectBestAsync(config, state.Server.Id, token).ConfigureAwait(false)).Route
-                    : await routeFactory(state.Server.Id, token).ConfigureAwait(false);
+                    ? (await connections.ConnectBestAsync(config, state.Server.Id, token, progress: onProgress).ConfigureAwait(false)).Route
+                    : await routeFactory(state.Server.Id, onProgress, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { return; }
+            catch (RouteAttemptLimitException ex)
+            {
+                state.Failed = true;
+                state.ErrorMessage = SecretRedactor.Redact(ex.Message, state.Server, activeSecrets);
+                state.StoppedAtStep = "Туннели";
+                Emit(state, "", "Переподключение не удалось (исчерпан лимит маршрутов): " +
+                    state.ErrorMessage, BatchLogLevel.Warning);
+                return;
+            }
             catch (Exception ex)
             {
                 Emit(state, "", "Переподключение не удалось: " +

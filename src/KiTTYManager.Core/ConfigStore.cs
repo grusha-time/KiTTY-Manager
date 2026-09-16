@@ -231,6 +231,7 @@ public static class ConfigStore
             proxy.AccessProbeServerIds ??= [];
         }
         config.ConnectionTimeoutSeconds = Math.Clamp(config.ConnectionTimeoutSeconds, 3, 600);
+        config.MaxRouteAttempts = RouteAttemptBudget.NormalizeLimit(config.MaxRouteAttempts);
         config.TaskConnectionRecoveryMinutes = Math.Clamp(config.TaskConnectionRecoveryMinutes, 0, 99999);
         if (config.AutoDiscoverFirefoxProfile) config.FirefoxTemplateProfile = "";
         config.EndpointProbeTimeoutSeconds = Math.Clamp(

@@ -1005,7 +1005,11 @@ public partial class MainWindow : Window
             try
             {
                 loginScript = KittyLoginScript.Create(server);
-                var startInfo = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
+                var startInfo = new ProcessStartInfo(kitty)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                    WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
+                };
                 foreach (var argument in KittyLaunchPlan.OriginalSessionArguments(server, loginScript?.Path))
                     startInfo.ArgumentList.Add(argument);
                 Process.Start(startInfo);
@@ -1187,14 +1191,15 @@ public partial class MainWindow : Window
                     routedSession = directEndpoint is null
                         ? KittyRoutedSession.Create(
                             server.SourceSessionPath!, route.LocalSshPort, server.ImportedCommand,
-                            server.IgnoreImportedCommand)
+                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows)
                         : KittyRoutedSession.CreateDirect(
                             server.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
-                            server.ImportedCommand, server.IgnoreImportedCommand);
+                            server.ImportedCommand, server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows);
                 loginScript = KittyLoginScript.Create(server);
                 var startInfo = new ProcessStartInfo(kitty)
                 {
-                    WorkingDirectory = Path.GetDirectoryName(kitty)!
+                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                    WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
                 };
                 var arguments = directEndpoint is null
                     ? KittyLaunchPlan.RoutedConsoleArguments(
@@ -1320,7 +1325,11 @@ public partial class MainWindow : Window
                 // No login script for the tunnel: it connects to an already-
                 // authenticated local SSH port. A login script waiting for a
                 // shell prompt blocks the tunnel console until timeout.
-                var tunnelStart = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
+                var tunnelStart = new ProcessStartInfo(kitty)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                    WindowStyle = ProcessWindowStyle.Minimized
+                };
                 foreach (var argument in KittyLaunchPlan.RoutedTunnelArguments(server, route.LocalSshPort,
                              true, routedSession.Path, null, skipPrivilegeCommand: true))
                     tunnelStart.ArgumentList.Add(argument);
@@ -1403,7 +1412,7 @@ public partial class MainWindow : Window
 
     private async Task<ActiveRoute> Connect(
         ManagedServer server, CancellationToken cancellationToken, bool consoleOnly = false,
-        Guid? forcedViaServerId = null)
+        Guid? forcedViaServerId = null, Action<SshConnectionProgress>? progress = null)
     {
         if (!server.TryDirectWithoutJumphost && config.BaseProxies.All(p => !p.Enabled))
             throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
@@ -1431,13 +1440,6 @@ public partial class MainWindow : Window
         var candidates = forcedViaServerId is null
             ? RoutePlanner.OrderPreferred(config, ranked, server.PreferredRoute)
             : ranked;
-        var sequentialPriority = candidates.Take(1)
-            .Concat(candidates.Skip(1).TakeWhile(candidate => candidate.Servers.Count > 1))
-            .ToHashSet();
-        var errors = new List<Exception>();
-        var proxyReady = new Dictionary<Guid, bool>();
-        var racedCandidates = new HashSet<RouteCandidate>();
-        var raceAttempted = false;
         RouteLog($"Route order for {server.Name}: preferred=" +
                  (server.PreferredRoute is null ? "none" :
                      $"proxy={server.PreferredRoute.ProxyId}; servers={string.Join('>', server.PreferredRoute.ServerIds)}") +
@@ -1445,7 +1447,7 @@ public partial class MainWindow : Window
                      $"[{RoutePlanner.CandidateReason(config, server.Id, candidate, server.PreferredRoute)}] " +
                      RouteLabel(candidate))));
 
-        ActiveRoute CompleteRoute(
+        void CompleteRoute(
             (ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration) result)
         {
             if (!result.Candidate.WithoutProxy)
@@ -1481,7 +1483,6 @@ public partial class MainWindow : Window
             else if (forcedViaServerId is null && consoleOnly &&
                      result.Candidate.Servers.Count > 1 && !IsProvenDirect(server))
                 ScheduleDirectRouteProbe(server, result.Candidate);
-            return result.Route;
         }
 
         static string FormatRouteDisplay(
@@ -1496,187 +1497,28 @@ public partial class MainWindow : Window
             return "Использован маршрут: " + string.Join(" → ", parts);
         }
 
-        foreach (var candidate in candidates)
-        {
-            if (racedCandidates.Contains(candidate)) continue;
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!proxyReady.TryGetValue(candidate.Proxy.Id, out var ready))
+        return await RouteCandidateConnector.ConnectCandidatesAsync(
+            config: config,
+            server: server,
+            candidates: candidates,
+            ssh: ssh,
+            cancellationToken: cancellationToken,
+            consoleOnly: consoleOnly,
+            forcedViaServerId: forcedViaServerId,
+            progress: progress,
+            ensureManagedJumphost: async (proxy, ct) =>
+                await EnsureManagedJumphostAsync(ct, true, proxyId: proxy.Id, accessTargetServerId: server.Id),
+            isSocks5Ready: (proxy, timeout, ct) => IsSocks5ReadyAsync(proxy, timeout, ct),
+            tryRestoreAccess: (cands, ct) => TryRestoreAccessAsync(cands, ct),
+            status: s => Status(s),
+            routeLog: l => RouteLog(l),
+            onHopFailed: (sourceId, targetId) =>
             {
-                ready = candidate.WithoutProxy || await IsSocks5ReadyAsync(
-                    candidate.Proxy, TimeSpan.FromSeconds(1), cancellationToken);
-                if (!ready && candidate.Proxy.StartupServerId is not null)
-                {
-                    Status($"Для маршрута к «{server.Name}» запускаю точку входа «{candidate.Proxy.Name}»…");
-                    try
-                    {
-                        ready = await EnsureManagedJumphostAsync(
-                            cancellationToken, true, proxyId: candidate.Proxy.Id,
-                            accessTargetServerId: server.Id);
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                    catch (Exception error)
-                    {
-                        errors.Add(error);
-                        RouteLog($"Jumphost startup failed: name={candidate.Proxy.Name}; endpoint={candidate.Proxy.Host}:{candidate.Proxy.Port}; error={error.GetType().Name}: {error.Message}");
-                    }
-                }
-                proxyReady[candidate.Proxy.Id] = ready;
-            }
-            if (!ready)
-            {
-                RouteLog($"Proxy not ready, skipping: target={server.Name}; proxy={candidate.Proxy.Name}:{candidate.Proxy.Port}");
-                continue;
-            }
-
-            // Если текущий кандидат многопереходный, а в списке есть более короткие непроверенные
-            // кандидаты (например, прямой 1-хоп), запускаем их параллельную проверку.
-            if (candidate.Servers.Count > 1 && !racedCandidates.Contains(candidate))
-            {
-                var shorter = candidates
-                    .Where(item => !racedCandidates.Contains(item) &&
-                                   !ReferenceEquals(item, candidate) &&
-                                   item.Servers.Count < candidate.Servers.Count)
-                    .OrderBy(item => item.Servers.Count)
-                    .FirstOrDefault();
-
-                if (shorter is not null)
-                {
-                    var shorterReady = shorter.WithoutProxy ||
-                        (proxyReady.TryGetValue(shorter.Proxy.Id, out var pr)
-                            ? pr
-                            : await IsSocks5ReadyAsync(shorter.Proxy, TimeSpan.FromSeconds(1), cancellationToken));
-
-                    if (shorterReady)
-                    {
-                        racedCandidates.Add(candidate);
-                        racedCandidates.Add(shorter);
-                        try
-                        {
-                            Status($"Параллельно проверяю короткий путь «{RouteLabel(shorter)}» и текущий «{RouteLabel(candidate)}» для «{server.Name}»…");
-                            RouteLog($"Shorter route race started: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}");
-                            var raced = await ssh.ConnectFirstSuccessfulAsync(
-                                config, [shorter, candidate], cancellationToken, consoleOnly);
-                            if (ReferenceEquals(raced.Candidate, shorter))
-                                RouteLog($"Shorter route race WON: target={server.Name}; winner={RouteLabel(shorter)}");
-                            else
-                                RouteLog($"Primary candidate finished first: target={server.Name}; winner={RouteLabel(candidate)}");
-                            return CompleteRoute(raced);
-                        }
-                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                        catch (Exception raceError)
-                        {
-                            errors.Add(raceError);
-                            var failedHops = ExceptionChain(raceError).OfType<SshHopException>()
-                                .DistinctBy(h => (h.SourceId, h.TargetId)).ToArray();
-                            if (failedHops.Length > 0)
-                            {
-                                foreach (var hop in failedHops)
-                                    ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
-                                SaveConfig();
-                            }
-                            RouteLog($"Shorter route race failed: target={server.Name}; shorter={RouteLabel(shorter)}; candidate={RouteLabel(candidate)}; error={raceError.GetType().Name}: {raceError.Message}");
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            if (config.RaceBestEntryPoints && !candidate.WithoutProxy && !raceAttempted &&
-                !sequentialPriority.Contains(candidate) && candidate.Servers.Count == 1)
-            {
-                var second = candidates.FirstOrDefault(item =>
-                    !ReferenceEquals(item, candidate) &&
-                    !sequentialPriority.Contains(item) &&
-                    item.Servers.Count == 1 &&
-                    item.Proxy.Id != candidate.Proxy.Id);
-                if (second is not null &&
-                    await IsSocks5ReadyAsync(second.Proxy, TimeSpan.FromSeconds(1), cancellationToken))
-                {
-                    raceAttempted = true;
-                    racedCandidates.Add(candidate);
-                    racedCandidates.Add(second);
-                    try
-                    {
-                        Status($"Параллельно проверяю две точки входа для «{server.Name}»…");
-                        return CompleteRoute(await ssh.ConnectFirstSuccessfulAsync(
-                            config, [candidate, second], cancellationToken, consoleOnly));
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                    catch (Exception error)
-                    {
-                        errors.Add(error);
-                        if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
-                        {
-                            ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
-                            SaveConfig();
-                        }
-                        RouteLog($"Entry point race failed: target={server.Name}; routes={RouteLabel(candidate)} | {RouteLabel(second)}; error={error.GetType().Name}: {error.Message}");
-                        continue;
-                    }
-                }
-            }
-
-            try
-            {
-                Status($"Проверяю маршрут: {RouteLabel(candidate)}…");
-                return CompleteRoute(await ssh.ConnectCandidateAsync(
-                    config, candidate, cancellationToken, consoleOnly,
-                    rememberTargetPreference: forcedViaServerId is null));
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (Exception error)
-            {
-                errors.Add(error);
-                if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
-                {
-                    ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
-                    SaveConfig();
-                }
-                var detail = string.Join(" --> ", ExceptionChain(error).Select(e => $"{e.GetType().Name}: {e.Message}"));
-                RouteLog($"Route failed: target={server.Name}; route={RouteLabel(candidate)}; " +
-                         $"error={detail}");
-                if (forcedViaServerId is null && server.PreferredRoute?.ProxyId == candidate.Proxy.Id)
-                    _ = RestoreFailedPreferredAccessAsync(candidate, cancellationToken);
-            }
-        }
-
-        // Mechanism B: all routes failed. Check if a jumphost's access script
-        // expired (all control servers unreachable) and try to restore it.
-        if (await TryRestoreAccessAsync(candidates, cancellationToken))
-        {
-            // Access restored — retry all candidates once.
-            foreach (var candidate in candidates)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (!candidate.WithoutProxy &&
-                    !await IsSocks5ReadyAsync(candidate.Proxy, TimeSpan.FromSeconds(1), cancellationToken))
-                    continue;
-                try
-                {
-                    Status($"Повторяю маршрут: {RouteLabel(candidate)}…");
-                    return CompleteRoute(await ssh.ConnectCandidateAsync(
-                        config, candidate, cancellationToken, consoleOnly,
-                        rememberTargetPreference: forcedViaServerId is null));
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-                catch (Exception error)
-                {
-                    errors.Add(error);
-                    if (ExceptionChain(error).OfType<SshHopException>().FirstOrDefault() is { } hop)
-                    {
-                        ServerLinkPairPolicy.InvalidateDirection(config, hop.SourceId, hop.TargetId);
-                        SaveConfig();
-                    }
-                    RouteLog($"Route retry failed: target={server.Name}; route={RouteLabel(candidate)}; error={error.GetType().Name}: {error.Message}");
-                }
-            }
-        }
-
-        throw new InvalidOperationException(
-            forcedViaServerId is Guid failedVia
-                ? $"Не удалось подключиться через выбранный сервер «{config.FindServer(failedVia)?.Name ?? failedVia.ToString()}». Обычный маршрут не использован."
-                : "Не найден рабочий маршрут. Запустите ручную проверку связности.",
-            errors.Count == 0 ? null : new AggregateException(errors));
+                ServerLinkPairPolicy.InvalidateDirection(config, sourceId, targetId);
+                SaveConfig();
+            },
+            onRouteSucceeded: CompleteRoute,
+            onPreferredRouteFailed: (candidate, ct) => RestoreFailedPreferredAccessAsync(candidate, ct));
     }
 
     private async Task RestoreFailedPreferredAccessAsync(
@@ -3428,7 +3270,9 @@ public partial class MainWindow : Window
             config.FirefoxDisableHistoryAndIcons,
             config.FirefoxClearCacheOnShutdown,
             config.FirefoxCleanRemovedServerContainers,
-            config.FirefoxAcceptInsecureCerts) { Owner = this };
+            config.FirefoxAcceptInsecureCerts,
+            config.MaximizeKittyWindows,
+            config.MaxRouteAttempts) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
         config.WinScpPath = dialog.WinScpPath;
@@ -3437,8 +3281,10 @@ public partial class MainWindow : Window
             RouteLog("Журналирование отключено пользователем; дальнейшие записи прекращены.");
         config.EnableLogging = dialog.EnableLogging; config.ConnectionTimeoutSeconds = dialog.ConnectionTimeoutSeconds;
         config.EndpointProbeTimeoutSeconds = dialog.EndpointProbeTimeoutSeconds;
+        config.MaxRouteAttempts = dialog.MaxRouteAttempts;
         config.TaskConnectionRecoveryMinutes = dialog.TaskConnectionRecoveryMinutes;
         config.WriteChangesImmediatelyToKitty = dialog.WriteChangesImmediatelyToKitty;
+        config.MaximizeKittyWindows = dialog.MaximizeKittyWindows;
         config.CloseWebTunnelWithFirefox = dialog.CloseWebTunnelWithFirefox;
         config.AutoDiscoverFirefoxProfile = dialog.AutoDiscoverFirefoxProfile;
         config.FirefoxTemplateProfile = dialog.AutoDiscoverFirefoxProfile ? "" : dialog.TemplateProfile;
@@ -3645,10 +3491,10 @@ public partial class MainWindow : Window
             batchTaskWindow.Activate();
             return;
         }
-        async Task<ActiveRoute> OpenRoute(Guid serverId, CancellationToken token)
+        async Task<ActiveRoute> OpenRoute(Guid serverId, Action<SshConnectionProgress>? progress, CancellationToken token)
         {
             var server = config.FindServer(serverId) ?? throw new InvalidOperationException("Сессия не найдена.");
-            var operation = await Dispatcher.InvokeAsync(() => Connect(server, token));
+            var operation = await Dispatcher.InvokeAsync(() => Connect(server, token, progress: progress));
             return await operation;
         }
         void CloseRoute(ActiveRoute route) => Dispatcher.Invoke(() => ReleaseRoute(route));

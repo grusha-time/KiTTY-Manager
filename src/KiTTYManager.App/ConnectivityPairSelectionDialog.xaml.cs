@@ -29,7 +29,14 @@ public partial class ConnectivityPairSelectionDialog : Window
             ? (skipExisting ? "Только недостающие направленные связи" : "Все направленные связи")
             : $"Цели для «{fixedSource.Name}»";
         PairsGrid.ItemsSource = pairs;
-        ServerSelector.Configure(config, selectedServerIds, fixedSource?.Id);
+        if (fixedSource is not null)
+        {
+            IndependentServersOnlyBox.Visibility = Visibility.Visible;
+            IndependentServersOnlyBox.IsChecked = true;
+        }
+        ServerSelector.Configure(config, selectedServerIds, fixedSource?.Id,
+            supportGroupState: fixedSource is not null,
+            filterIndependentGroupServers: IndependentServersOnlyBox.IsChecked == true);
         ServerSelector.SelectionChanged += (_, _) =>
         {
             selectedServerIds.Clear();
@@ -37,6 +44,12 @@ public partial class ConnectivityPairSelectionDialog : Window
             RebuildPairs();
         };
         RebuildPairs();
+    }
+
+    private void IndependentServersOnlyBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (ServerSelector is null) return;
+        ServerSelector.SetFilterIndependentGroupServers(IndependentServersOnlyBox.IsChecked == true);
     }
 
     private void RebuildPairs()
