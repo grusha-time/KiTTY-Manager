@@ -268,6 +268,7 @@ public static class ConfigStore
         }
         config.ConnectionTimeoutSeconds = Math.Clamp(config.ConnectionTimeoutSeconds, 3, 600);
         config.MaxRouteAttempts = RouteAttemptBudget.NormalizeLimit(config.MaxRouteAttempts);
+        config.MaxGroupServersInRouteAttempts = Math.Clamp(config.MaxGroupServersInRouteAttempts, 0, 100);
         config.TaskConnectionRecoveryMinutes = Math.Clamp(config.TaskConnectionRecoveryMinutes, 0, 99999);
         if (config.AutoDiscoverFirefoxProfile) config.FirefoxTemplateProfile = "";
         config.EndpointProbeTimeoutSeconds = Math.Clamp(

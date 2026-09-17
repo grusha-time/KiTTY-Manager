@@ -6,6 +6,7 @@ internal sealed partial class SelfTestRunner
     private static void RouteAttemptLimitDefaultsAndRoundTrip()
     {
         Equal(10, new ManagerConfig().MaxRouteAttempts);
+        Equal(1, new ManagerConfig().MaxGroupServersInRouteAttempts);
 
         // NormalizeLimit checks
         Equal(10, RouteAttemptBudget.NormalizeLimit(0));
@@ -18,15 +19,44 @@ internal sealed partial class SelfTestRunner
         var path = TempFile();
         try
         {
-            ConfigStore.Save(path, new ManagerConfig { MaxRouteAttempts = 25 });
-            Equal(25, ConfigStore.Load(path).MaxRouteAttempts);
+            ConfigStore.Save(path, new ManagerConfig
+            {
+                MaxRouteAttempts = 25,
+                MaxGroupServersInRouteAttempts = 3
+            });
+            var loaded = ConfigStore.Load(path);
+            Equal(25, loaded.MaxRouteAttempts);
+            Equal(3, loaded.MaxGroupServersInRouteAttempts);
 
             // Invalid / boundary values loaded through ConfigStore are normalized
-            ConfigStore.Save(path, new ManagerConfig { MaxRouteAttempts = 0 });
-            Equal(10, ConfigStore.Load(path).MaxRouteAttempts);
+            ConfigStore.Save(path, new ManagerConfig
+            {
+                MaxRouteAttempts = 0,
+                MaxGroupServersInRouteAttempts = 0
+            });
+            loaded = ConfigStore.Load(path);
+            Equal(10, loaded.MaxRouteAttempts);
+            Equal(0, loaded.MaxGroupServersInRouteAttempts);
 
-            ConfigStore.Save(path, new ManagerConfig { MaxRouteAttempts = 150 });
-            Equal(100, ConfigStore.Load(path).MaxRouteAttempts);
+            ConfigStore.Save(path, new ManagerConfig
+            {
+                MaxRouteAttempts = 150,
+                MaxGroupServersInRouteAttempts = 150
+            });
+            loaded = ConfigStore.Load(path);
+            Equal(100, loaded.MaxRouteAttempts);
+            Equal(100, loaded.MaxGroupServersInRouteAttempts);
+
+            // Negative MaxGroupServersInRouteAttempts clamps to 0
+            ConfigStore.Save(path, new ManagerConfig
+            {
+                MaxGroupServersInRouteAttempts = -5
+            });
+            Equal(0, ConfigStore.Load(path).MaxGroupServersInRouteAttempts);
+
+            // Missing JSON property preserves default (1)
+            File.WriteAllText(path, "{}");
+            Equal(1, ConfigStore.Load(path).MaxGroupServersInRouteAttempts);
         }
         finally { File.Delete(path); File.Delete(path + ".tmp"); }
     }
@@ -260,5 +290,165 @@ internal sealed partial class SelfTestRunner
             Equal(0, budget.Remaining);
             Equal(false, budget.HasCapacity);
         }
+    }
+
+    private static void MaxGroupServersInRouteAttemptsCandidateFiltering()
+    {
+        var proxy = new BaseProxy { Id = Guid.NewGuid(), Name = "SOCKS1", Enabled = true, Host = "127.0.0.1", Port = 1080 };
+        var proxy2 = new BaseProxy { Id = Guid.NewGuid(), Name = "SOCKS2", Enabled = true, Host = "127.0.0.1", Port = 1081 };
+        var target = new ManagedServer { Id = Guid.NewGuid(), Name = "Target", TryDirectWithoutJumphost = true };
+        var groupA = new ServerGroup { Id = Guid.NewGuid(), Name = "GroupA", Servers = [target] };
+
+        // Group B has 15 servers
+        var groupBServers = Enumerable.Range(1, 15)
+            .Select(i => new ManagedServer { Id = Guid.NewGuid(), Name = $"B{i:D2}" })
+            .ToList();
+        var groupB = new ServerGroup { Id = Guid.NewGuid(), Name = "GroupB", Servers = groupBServers };
+
+        // Group C has 1 server
+        var serverC1 = new ManagedServer { Id = Guid.NewGuid(), Name = "C01" };
+        var groupC = new ServerGroup { Id = Guid.NewGuid(), Name = "GroupC", Servers = [serverC1] };
+
+        // Ungrouped server
+        var ungrouped = new ManagedServer { Id = Guid.NewGuid(), Name = "U01" };
+
+        var config = new ManagerConfig
+        {
+            BaseProxies = [proxy, proxy2],
+            Groups = [groupA, groupB, groupC],
+            UngroupedServers = [ungrouped],
+            MaxGroupServersInRouteAttempts = 1
+        };
+
+        // 1. Direct candidate to target (1 hop, no intermediate server)
+        var directCandidate = new RouteCandidate(RoutePlanner.DirectConnectionProxy, [target], true);
+
+        // 2. Candidates through Group B (B1..B15)
+        var candidatesB = groupBServers.Select(b => new RouteCandidate(proxy, [b, target])).ToList();
+
+        // 3. Candidate through Group C
+        var candidateC = new RouteCandidate(proxy, [serverC1, target]);
+
+        // 4. Candidate through Ungrouped
+        var candidateU = new RouteCandidate(proxy, [ungrouped, target]);
+
+        // 5. Duplicate entry server B1 through alternative proxy
+        var candidateB1Alt = new RouteCandidate(proxy2, [groupBServers[0], target]);
+
+        // Combine: direct, B1..B15, B1Alt, C1, U1
+        var allCandidates = new List<RouteCandidate> { directCandidate }
+            .Concat(candidatesB)
+            .Append(candidateB1Alt)
+            .Append(candidateC)
+            .Append(candidateU)
+            .ToList();
+
+        // Test with limit = 1:
+        config.MaxGroupServersInRouteAttempts = 1;
+        var filtered1 = RoutePlanner.LimitGroupEntryServers(config, allCandidates);
+        // Direct route kept
+        Equal(true, filtered1.Contains(directCandidate));
+        // Ungrouped kept
+        Equal(true, filtered1.Contains(candidateU));
+        // Group C kept
+        Equal(true, filtered1.Contains(candidateC));
+        // Group B: B1 kept, B1Alt kept (same entry server), B2..B15 excluded
+        Equal(true, filtered1.Contains(candidatesB[0]));
+        Equal(true, filtered1.Contains(candidateB1Alt));
+        for (var i = 1; i < 15; i++)
+        {
+            Equal(false, filtered1.Contains(candidatesB[i]));
+        }
+        // Total count: direct (1) + B1 (1) + B1Alt (1) + C1 (1) + U1 (1) = 5
+        Equal(5, filtered1.Count);
+
+        // Test with limit = 0 (disabled):
+        config.MaxGroupServersInRouteAttempts = 0;
+        var filtered0 = RoutePlanner.LimitGroupEntryServers(config, allCandidates);
+        Equal(allCandidates.Count, filtered0.Count);
+
+        // Test with limit = 2:
+        config.MaxGroupServersInRouteAttempts = 2;
+        var filtered2 = RoutePlanner.LimitGroupEntryServers(config, allCandidates);
+        Equal(true, filtered2.Contains(candidatesB[0]));
+        Equal(true, filtered2.Contains(candidateB1Alt));
+        Equal(true, filtered2.Contains(candidatesB[1]));
+        for (var i = 2; i < 15; i++)
+        {
+            Equal(false, filtered2.Contains(candidatesB[i]));
+        }
+        Equal(6, filtered2.Count);
+    }
+
+    private static void OrderPreferredHonorsGroupServerLimit()
+    {
+        var proxy = new BaseProxy { Id = Guid.NewGuid(), Name = "SOCKS1", Enabled = true, Host = "127.0.0.1", Port = 1080 };
+        var target = new ManagedServer { Id = Guid.NewGuid(), Name = "Target", TryDirectWithoutJumphost = false };
+        var groupA = new ServerGroup { Id = Guid.NewGuid(), Name = "GroupA", Servers = [target] };
+
+        var groupBServers = Enumerable.Range(1, 15)
+            .Select(i => new ManagedServer { Id = Guid.NewGuid(), Name = $"B{i:D2}" })
+            .ToList();
+        var groupB = new ServerGroup { Id = Guid.NewGuid(), Name = "GroupB", Servers = groupBServers };
+
+        var serverC1 = new ManagedServer { Id = Guid.NewGuid(), Name = "C01" };
+        var groupC = new ServerGroup { Id = Guid.NewGuid(), Name = "GroupC", Servers = [serverC1] };
+
+        // Links from all B and C to target
+        var links = groupBServers.Select(b => new ServerLink
+        {
+            FromServerId = b.Id,
+            ToServerId = target.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        }).Append(new ServerLink
+        {
+            FromServerId = serverC1.Id,
+            ToServerId = target.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        }).ToList();
+
+        var config = new ManagerConfig
+        {
+            BaseProxies = [proxy],
+            Groups = [groupA, groupB, groupC],
+            Links = links,
+            MaxGroupServersInRouteAttempts = 1
+        };
+
+        // Target has preferred route through B5
+        var preferredB5 = groupBServers[4];
+        var preferredRoute = new CachedRoute
+        {
+            ProxyId = proxy.Id,
+            ServerIds = [preferredB5.Id, target.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+
+        var ranked = RoutePlanner.Candidates(config, target.Id);
+        // Ranked contains 1 direct candidate + 15 B servers + 1 C server = 17
+        Equal(17, ranked.Count);
+
+        // OrderPreferred with limit = 1:
+        // preferred route B5 is put first, so B5 takes the single slot for Group B!
+        // Direct candidate (1 hop) is kept without consuming group quota.
+        // All other B servers are excluded. C1 is retained!
+        var ordered = RoutePlanner.OrderPreferred(config, ranked, preferredRoute);
+        Equal(3, ordered.Count);
+        Equal(preferredB5.Id, ordered[0].Servers[0].Id);
+        Equal(1, ordered.Count(c => c.Servers.Count > 1 && config.FindServerGroup(c.Servers[0].Id)?.Id == groupB.Id));
+        Equal(1, ordered.Count(c => c.Servers.Count > 1 && config.FindServerGroup(c.Servers[0].Id)?.Id == groupC.Id));
+        Equal(1, ordered.Count(c => c.Servers.Count == 1));
+
+        // Without preferred route: 1 direct candidate + 1 from Group B + 1 from Group C = 3
+        var orderedNoPref = RoutePlanner.OrderPreferred(config, ranked, null);
+        Equal(3, orderedNoPref.Count);
+        Equal(1, orderedNoPref.Count(c => c.Servers.Count > 1 && config.FindServerGroup(c.Servers[0].Id)?.Id == groupB.Id));
+        Equal(1, orderedNoPref.Count(c => c.Servers.Count > 1 && config.FindServerGroup(c.Servers[0].Id)?.Id == groupC.Id));
+        Equal(1, orderedNoPref.Count(c => c.Servers.Count == 1));
+
+        // With limit = 0 (disabled), all 17 candidates are retained
+        config.MaxGroupServersInRouteAttempts = 0;
+        var orderedUnlimited = RoutePlanner.OrderPreferred(config, ranked, preferredRoute);
+        Equal(17, orderedUnlimited.Count);
     }
 }

@@ -163,8 +163,10 @@ public sealed class SshConnectionService
         Action<SshConnectionProgress>? progress = null)
     {
         var allowed = proxyIds.ToHashSet();
+        var filtered = RoutePlanner.LimitGroupEntryServers(
+            config, RoutePlanner.Candidates(config, targetId).Where(candidate => allowed.Contains(candidate.Proxy.Id)));
         return await ConnectCandidatesAsync(
-            config, RoutePlanner.Candidates(config, targetId).Where(candidate => allowed.Contains(candidate.Proxy.Id)),
+            config, filtered,
             "Ни одна из готовых точек входа не дала рабочий маршрут.", cancellationToken, consoleOnly,
             progress: progress);
     }

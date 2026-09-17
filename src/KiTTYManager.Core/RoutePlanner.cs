@@ -220,7 +220,7 @@ public static class RoutePlanner
     public static IReadOnlyList<RouteCandidate> OrderPreferred(
         ManagerConfig config, IReadOnlyList<RouteCandidate> ranked, CachedRoute? preferred)
     {
-        if (preferred is null || preferred.ServerIds.Count == 0) return ranked;
+        if (preferred is null || preferred.ServerIds.Count == 0) return LimitGroupEntryServers(config, ranked);
         var list = ranked.ToList();
         if (!list.Any(candidate => RoutePreferencePolicy.Matches(preferred, candidate)))
         {
@@ -228,19 +228,19 @@ public static class RoutePlanner
             if (reconstructed is not null) list.Add(reconstructed);
         }
         var target = config.FindServer(preferred.ServerIds[^1]);
-        if (target is null) return list.ToArray();
+        if (target is null) return LimitGroupEntryServers(config, list);
         var rankedWithPreferred = Rank(config, target, list, preferred);
         // Явно включённый режим «сначала без JH» остаётся сильнее памяти
         // резервного маршрута: это отдельное решение пользователя.
-        if (target.TryDirectWithoutJumphost) return rankedWithPreferred;
+        if (target.TryDirectWithoutJumphost) return LimitGroupEntryServers(config, rankedWithPreferred);
         var exact = rankedWithPreferred.FirstOrDefault(candidate =>
             RoutePreferencePolicy.Matches(preferred, candidate));
-        if (exact is null) return rankedWithPreferred;
+        if (exact is null) return LimitGroupEntryServers(config, rankedWithPreferred);
 
         // Последний действительно успешный и всё ещё валидный маршрут всегда
         // является первой попыткой. Более короткие варианты доказываются в фоне,
         // а не задерживают пользовательское подключение.
-        return
+        var ordered = (IReadOnlyList<RouteCandidate>)
         [
             exact,
             .. rankedWithPreferred.Where(candidate =>
@@ -252,6 +252,60 @@ public static class RoutePlanner
                 !(candidate.Servers.Count > 1 &&
                   IsVerifiedPath(config, candidate.Servers, candidate.Proxy.Id)))
         ];
+        return LimitGroupEntryServers(config, ordered);
+    }
+
+    /// <summary>
+    /// Ограничивает количество независимых входных серверов одной группы при переборе
+    /// маршрутов (параметр <see cref="ManagerConfig.MaxGroupServersInRouteAttempts"/>).
+    /// Прямые подключения к целевому серверу и сессии «Без группы» не квотируются.
+    /// Повторные варианты одного и того же уже принятого входного сервера сохраняются.
+    /// </summary>
+    public static IReadOnlyList<RouteCandidate> LimitGroupEntryServers(
+        ManagerConfig config, IEnumerable<RouteCandidate> candidates)
+    {
+        var limit = config.MaxGroupServersInRouteAttempts;
+        if (limit <= 0) return candidates as IReadOnlyList<RouteCandidate> ?? candidates.ToArray();
+
+        var acceptedByGroup = new Dictionary<Guid, HashSet<Guid>>();
+        var result = new List<RouteCandidate>();
+
+        foreach (var candidate in candidates)
+        {
+            if (candidate.Servers.Count <= 1)
+            {
+                result.Add(candidate);
+                continue;
+            }
+
+            var entry = candidate.Servers[0];
+            var group = config.FindServerGroup(entry.Id);
+            if (group is null)
+            {
+                result.Add(candidate);
+                continue;
+            }
+
+            if (!acceptedByGroup.TryGetValue(group.Id, out var acceptedServers))
+            {
+                acceptedServers = new HashSet<Guid>();
+                acceptedByGroup[group.Id] = acceptedServers;
+            }
+
+            if (acceptedServers.Contains(entry.Id))
+            {
+                result.Add(candidate);
+                continue;
+            }
+
+            if (acceptedServers.Count < limit)
+            {
+                acceptedServers.Add(entry.Id);
+                result.Add(candidate);
+            }
+        }
+
+        return result;
     }
 
     private static IEnumerable<RouteCandidate> CandidatesForProxy(
@@ -463,7 +517,7 @@ public static class RoutePlanner
                 candidate.WithoutProxy))
             .Where(candidate => SatisfiesRouteConstraints(config, candidate))
             .DistinctBy(CandidateSignature);
-        return Rank(config, target, candidates);
+        return LimitGroupEntryServers(config, Rank(config, target, candidates));
     }
 
     public static IReadOnlyList<BaseProxy> OrderedProxies(

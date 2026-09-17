@@ -280,6 +280,8 @@ internal sealed partial class SelfTestRunner
         Test("Смешанный отказ маршрутов распознаётся как сбой связи", MixedRouteFailureIsConnectivityFailure);
         Test("Лимит endpoint-зонда по умолчанию 4 секунды и сохраняется в JSON", EndpointProbeTimeoutRoundTrip);
         Test("Лимит вариантов маршрутов по умолчанию 10, нормализуется и сохраняется в JSON", RouteAttemptLimitDefaultsAndRoundTrip);
+        Test("Ограничение независимых серверов группы фильтрует кандидатов маршрутов", MaxGroupServersInRouteAttemptsCandidateFiltering);
+        Test("OrderPreferred соблюдает лимит серверов группы с приоритетом сохранённого маршрута", OrderPreferredHonorsGroupServerLimit);
         Test("Бюджет попыток маршрутов ограничивает попытки и генерирует исключение", RouteAttemptBudgetEnforcementAndException);
         Test("Исключение лимита маршрутов не считается сбоем связи в задачах", RouteAttemptLimitNonRetryableInBatchTasks);
         Test("Лимит маршрутов ограничивает запуск нескольких недоступных jumphost", RouteAttemptLimitWithMultipleUnavailableManagedJumphosts);
@@ -4938,6 +4940,7 @@ internal sealed partial class SelfTestRunner
             LastSuccessUtc = DateTimeOffset.UtcNow
         };
         var config = Config(newEntry, anchor, oldEntry, oldMiddleA, oldMiddleB, target);
+        config.MaxGroupServersInRouteAttempts = 0;
         config.BaseProxies = [proxy];
         config.Links =
         [
@@ -5631,6 +5634,7 @@ internal sealed partial class SelfTestRunner
         var target = Server("Server-H");
         target.TryDirectWithoutJumphost = true;
         var config = Config(entry, via, target);
+        config.MaxGroupServersInRouteAttempts = 0;
         config.BaseProxies = [new() { Name = "JH", Port = 5555 }];
         config.Links =
         [
