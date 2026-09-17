@@ -13,6 +13,7 @@ public partial class MainWindow
 
     private void InitializeUpdateScheduler()
     {
+        _ = Task.Run(AppUpdateInstaller.CleanupOldUpdateArtifacts);
         updateSchedulerCancellation = new CancellationTokenSource();
         _ = RunUpdateSchedulerAsync(updateSchedulerCancellation.Token);
     }

@@ -79,7 +79,7 @@ public static class AppUpdateInstaller
 {
     public static UpdateExecutionSession PrepareAndLaunchHelper(string zipFilePath, string targetDirectory)
     {
-        var targetDir = Path.GetFullPath(targetDirectory);
+        var targetDir = Path.GetFullPath(targetDirectory).TrimEnd('\\', '/');
         var validation = AppUpdatePackage.ValidateArchive(zipFilePath);
         if (!validation.IsValid)
             throw new InvalidOperationException(validation.ErrorMessage ?? "Архив обновления не прошёл валидацию.");
@@ -115,16 +115,16 @@ public static class AppUpdateInstaller
         {
             sb.AppendLine($"{item.RelativePath}|{(item.PreserveIfTargetExists ? "1" : "0")}");
         }
-        File.WriteAllText(manifestPath, sb.ToString(), new UTF8Encoding(false));
+        File.WriteAllText(manifestPath, sb.ToString(), new UTF8Encoding(true));
 
-        // Write update.ps1
+        // Write update.ps1 with UTF-8 BOM for Windows PowerShell 5.1 compatibility
         var psScriptPath = Path.Combine(updateRoot, "update.ps1");
-        File.WriteAllText(psScriptPath, GeneratePowerShellScript(), new UTF8Encoding(false));
+        File.WriteAllText(psScriptPath, GeneratePowerShellScript(), new UTF8Encoding(true));
 
         // Write update.cmd wrapper
         var cmdPath = Path.Combine(updateRoot, "update.cmd");
-        var cmdContent = $"@echo off\r\nchcp 65001 >nul\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{psScriptPath}\" -TargetDir \"{targetDir}\" -StagingDir \"{stagingDir}\" -BackupDir \"{backupDir}\" -SignalFile \"{signalFile}\" -DisarmFile \"{disarmFile}\" -ParentPid {Environment.ProcessId} -LogFile \"{logFile}\"\r\n";
-        File.WriteAllText(cmdPath, cmdContent, Encoding.ASCII);
+        var cmdContent = $"@echo off\r\nchcp 65001 >nul\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{psScriptPath}\" -TargetDir \"{targetDir}\" -StagingDir \"{stagingDir}\" -BackupDir \"{backupDir}\" -SignalFile \"{signalFile}\" -DisarmFile \"{disarmFile}\" -ParentPid {Environment.ProcessId} -LogFile \"{logFile}\" -ZipFile \"{zipFilePath}\"\r\n";
+        File.WriteAllText(cmdPath, cmdContent, new UTF8Encoding(false));
 
         var psi = new ProcessStartInfo("powershell.exe")
         {
@@ -140,7 +140,8 @@ public static class AppUpdateInstaller
                 "-SignalFile", signalFile,
                 "-DisarmFile", disarmFile,
                 "-ParentPid", Environment.ProcessId.ToString(),
-                "-LogFile", logFile
+                "-LogFile", logFile,
+                "-ZipFile", zipFilePath
             },
             CreateNoWindow = true,
             UseShellExecute = false
@@ -220,7 +221,8 @@ public static class AppUpdateInstaller
             [string]$SignalFile,
             [string]$DisarmFile,
             [int]$ParentPid,
-            [string]$LogFile
+            [string]$LogFile,
+            [string]$ZipFile = ""
         )
 
         $ErrorActionPreference = 'Stop'
@@ -230,13 +232,12 @@ public static class AppUpdateInstaller
             Add-Content -LiteralPath $LogFile -Value "[$ts] $msg" -ErrorAction SilentlyContinue
         }
 
-        Log "Служба обновления запущена. PID: $ParentPid, Target: $TargetDir"
+        Log "Update service started. PID: $ParentPid, Target: $TargetDir"
 
-        # 1. Ожидание сигнала подтверждения (commit.signal) или отмены (disarm.signal)
-        # Цикл ожидания синхронизирован с активностью родительского процесса
+        # 1. Wait for commit.signal or disarm.signal
         while (!(Test-Path -LiteralPath $SignalFile)) {
             if (Test-Path -LiteralPath $DisarmFile) {
-                Log "Обновление отменено пользователем (disarm). Завершение работы помощника."
+                Log "Update cancelled by user (disarm). Helper exiting."
                 exit 0
             }
 
@@ -246,36 +247,36 @@ public static class AppUpdateInstaller
                 if (Test-Path -LiteralPath $SignalFile) {
                     break
                 }
-                Log "Родительский процесс $ParentPid завершился без подтверждения обновления (commit). Прерывание."
+                Log "Parent process $ParentPid exited without commit signal. Aborting."
                 exit 0
             }
 
             Start-Sleep -Milliseconds 500
         }
 
-        Log "Сигнал подтверждения получен. Ожидание завершения процесса KiTTY Manager ($ParentPid)..."
+        Log "Commit signal received. Waiting for KiTTY Manager process ($ParentPid) to exit..."
 
-        # 2. Ожидание выхода родительского процесса (до 45 секунд)
+        # 2. Wait for parent process exit (up to 45 seconds)
         try {
             $proc = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
             if ($proc) {
                 $exited = $proc.WaitForExit(45000)
                 if (!$exited) {
-                    Log "Родительский процесс не завершился вовремя. Прерывание обновления."
+                    Log "Parent process did not exit within timeout. Aborting update."
                     exit 1
                 }
             }
         } catch {
-            Log "Процесс $ParentPid уже завершён."
+            Log "Parent process $ParentPid already terminated."
         }
 
-        # Пауза для освобождения файловых дескрипторов ОС
+        # Pause to let OS release file handles
         Start-Sleep -Seconds 2
 
-        # 3. Чтение манифеста и копирование файлов с бэкапом
+        # 3. Read manifest and copy files with backup
         $manifestFile = Join-Path $StagingDir "manifest.txt"
         if (!(Test-Path -LiteralPath $manifestFile)) {
-            Log "Манифест manifest.txt отсутствует. Прерывание."
+            Log "Manifest manifest.txt missing. Aborting."
             exit 1
         }
 
@@ -294,10 +295,10 @@ public static class AppUpdateInstaller
             $relPath = $parts[0]
             $preserve = ($parts[1] -eq "1")
 
-            # Защита от попыток записи в защищённые каталоги и обхода путей
+            # Security check: protect Data/, KiTTY/SshHostKeys/, KiTTY/Sessions/
             $normalizedCheck = $relPath.Replace('\', '/').TrimStart('/')
             if ($normalizedCheck -match '^(?i)(Data(\.| )?(/|$)|KiTTY/SshHostKeys(\.| )?(/|$)|KiTTY/Sessions(\.| )?(/|$))') {
-                Log "ОШИБКА БЕЗОПАСНОСТИ: Попытка записи в защищённый каталог: $relPath. Прерывание."
+                Log "SECURITY ERROR: Attempted write to protected directory: $relPath. Aborting."
                 $success = $false
                 break
             }
@@ -306,7 +307,7 @@ public static class AppUpdateInstaller
             $stagedFile = Join-Path $StagingDir $relPath
 
             if ($preserve -and (Test-Path -LiteralPath $targetFile)) {
-                Log "Сохранён существующий файл: $relPath"
+                Log "Preserved existing file: $relPath"
                 continue
             }
 
@@ -329,46 +330,104 @@ public static class AppUpdateInstaller
                 }
                 Copy-Item -LiteralPath $stagedFile -Destination $targetFile -Force -ErrorAction Stop
             } catch {
-                Log "Ошибка копирования $relPath : $_"
+                Log "Error copying $relPath : $_"
                 $success = $false
                 break
             }
         }
 
         if (!$success) {
-            Log "ВНИМАНИЕ: Ошибка применения обновления. Выполняется откат изменений к исходному состоянию..."
+            Log "WARNING: Update failed. Rolling back changes to original state..."
             foreach ($created in $createdFiles) {
                 try {
                     if (Test-Path -LiteralPath $created) {
                         Remove-Item -LiteralPath $created -Force -Recurse -ErrorAction SilentlyContinue
-                        Log "Откат: удалён добавленный файл: $created"
+                        Log "Rollback: removed added file: $created"
                     }
                 } catch {
-                    Log "Откат: не удалось удалить $created : $_"
+                    Log "Rollback: failed to remove $created : $_"
                 }
             }
             foreach ($b in $backedUpFiles) {
                 try {
                     Copy-Item -LiteralPath $b.Backup -Destination $b.Target -Force -ErrorAction Stop
-                    Log "Откат: восстановлен исходный файл: $($b.Target)"
+                    Log "Rollback: restored original file: $($b.Target)"
                 } catch {
-                    Log "Откат: ошибка восстановления $($b.Target) : $_"
+                    Log "Rollback: error restoring $($b.Target) : $_"
                 }
             }
-            Log "Откат завершён. Приложение не перезапущено."
+            Log "Rollback complete. Application not restarted."
             exit 1
         }
 
-        Log "Все файлы обновления успешно применены."
+        Log "All update files successfully applied."
 
-        # 4. Перезапуск обновлённого приложения
+        # 4. Restart updated application
         $targetExe = Join-Path $TargetDir "KiTTYManager.exe"
         if (Test-Path -LiteralPath $targetExe) {
-            Log "Запуск обновлённого $targetExe"
+            Log "Starting updated $targetExe"
             Start-Process -FilePath $targetExe -WorkingDirectory $TargetDir
+        }
+
+        # 5. Cleanup temporary staging, backup, and downloaded archive
+        try {
+            if (Test-Path -LiteralPath $StagingDir) {
+                Remove-Item -LiteralPath $StagingDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $BackupDir) {
+                Remove-Item -LiteralPath $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (![string]::IsNullOrWhiteSpace($ZipFile) -and (Test-Path -LiteralPath $ZipFile)) {
+                Remove-Item -LiteralPath $ZipFile -Force -ErrorAction SilentlyContinue
+            }
+        } catch { /* best effort */ }
+
+        # 6. Schedule delayed removal of update directory after helper exits
+        $updateRoot = Split-Path -Parent $StagingDir
+        if (Test-Path -LiteralPath $updateRoot) {
+            Start-Process -FilePath "cmd.exe" -ArgumentList "/c timeout /t 3 /nobreak >nul & rd /s /q `"$updateRoot`"" -WindowStyle Hidden
         }
 
         exit 0
         """;
+    }
+
+    public static void CleanupOldUpdateArtifacts()
+    {
+        try
+        {
+            var tempPath = Path.GetTempPath();
+            var updateDirs = Directory.GetDirectories(tempPath, "KiTTYManager-Update-*");
+            foreach (var dir in updateDirs)
+            {
+                try
+                {
+                    var dirInfo = new DirectoryInfo(dir);
+                    if (DateTime.UtcNow - dirInfo.LastWriteTimeUtc > TimeSpan.FromMinutes(30))
+                    {
+                        Directory.Delete(dir, true);
+                    }
+                }
+                catch { /* best effort */ }
+            }
+
+            var downloadDir = Path.Combine(tempPath, "KiTTYManager-Updates");
+            if (Directory.Exists(downloadDir))
+            {
+                foreach (var file in Directory.GetFiles(downloadDir, "*.zip"))
+                {
+                    try
+                    {
+                        var fileInfo = new FileInfo(file);
+                        if (DateTime.UtcNow - fileInfo.LastWriteTimeUtc > TimeSpan.FromMinutes(30))
+                        {
+                            File.Delete(file);
+                        }
+                    }
+                    catch { /* best effort */ }
+                }
+            }
+        }
+        catch { /* best effort */ }
     }
 }
