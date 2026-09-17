@@ -743,12 +743,17 @@ public partial class MainWindow : Window
         var copy = dialog.Draft;
         ManagedServerDuplicator.RefreshQuickDuplicateName(config, source, copy, dialog.InitiallyGeneratedName);
         var selectedIds = dialog.SelectedServerIds.Where(id => id != copy.Id).Distinct().ToArray();
-        ManagedServerDuplicator.AddToSourceGroup(config, source, copy);
+        var (targetGroupId, fallbackOccurred) = dialog.PlacementDraft.ApplyTo(config);
+        ManagedServerDuplicator.AddToServerGroup(config, copy, targetGroupId);
         SaveAndRefresh();
         ShowServer(copy);
-        Status($"Создан быстрый дубль «{copy.Name}»");
+        if (fallbackOccurred)
+            Warn($"Выбранная группа не найдена (возможно, была удалена). Сессия «{copy.Name}» сохранена в разделе «Без группы».");
+        else
+            Status($"Создан быстрый дубль «{copy.Name}»");
         if (selectedIds.Length > 0) await BuildQuickDuplicateLinksAsync(copy, selectedIds);
     }
+
 
     private async Task BuildQuickDuplicateLinksAsync(ManagedServer copy, IReadOnlyList<Guid> sourceIds)
     {

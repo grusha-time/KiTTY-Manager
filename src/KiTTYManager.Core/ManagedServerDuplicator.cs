@@ -20,12 +20,15 @@ public static class ManagedServerDuplicator
         copy.Name = UniqueName(config, source.Name);
     }
 
-    public static void AddToSourceGroup(ManagerConfig config, ManagedServer source, ManagedServer copy)
+    public static void AddToServerGroup(ManagerConfig config, ManagedServer copy, Guid? targetGroupId)
     {
-        var group = config.AllGroups().FirstOrDefault(candidate => candidate.Servers.Any(server => server.Id == source.Id));
-        if (group is null) config.UngroupedServers.Add(copy);
-        else group.Servers.Add(copy);
+        var target = targetGroupId.HasValue ? config.FindGroup(targetGroupId.Value) : null;
+        if (target is null) config.UngroupedServers.Add(copy);
+        else target.Servers.Add(copy);
     }
+
+    public static void AddToSourceGroup(ManagerConfig config, ManagedServer source, ManagedServer copy) =>
+        AddToServerGroup(config, copy, config.FindServerGroup(source.Id)?.Id);
 
     private static ManagedServer Create(ManagerConfig config, ManagedServer source, bool resetRuntime)
     {
