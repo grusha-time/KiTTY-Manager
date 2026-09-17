@@ -904,6 +904,38 @@ public partial class MainWindow : Window
         SaveAndRefresh();
     }
 
+    private ServerEditorDraft CaptureEditorDraft() => new()
+    {
+        ServerName = ServerNameBox.Text,
+        Host = HostBox.Text,
+        PortText = PortBox.Text,
+        Username = UsernameBox.Text,
+        Password = PasswordBox.Value,
+        PrivateKeyPath = PrivateKeyPathBox.Text,
+        PrivateKeyPassphrase = PrivateKeyPassphraseBox.Value,
+        RootLogin = RootLoginBox.Text,
+        RootPassword = RootPasswordBox.Value,
+        ShellPrompt = ShellPromptBox.Text,
+        ImportedCommand = ImportedCommandBox.Text,
+        IgnoreImportedCommand = IgnoreImportedCommandBox.IsChecked == true,
+        TryDirectWithoutJumphost = TryDirectWithoutJumphostBox.IsChecked == true,
+        KeepaliveIntervalText = KeepaliveIntervalBox.Text,
+        EnableTcpKeepalives = EnableTcpKeepalivesBox.IsChecked == true,
+        ReconnectOnConnectionFailure = ReconnectOnConnectionFailureBox.IsChecked == true,
+        ReconnectOnSystemWakeup = ReconnectOnSystemWakeupBox.IsChecked == true,
+        RequiredPreviousServerId = selectedRequiredRouteOption?.Id
+    };
+
+    private bool IsServerBeingEditedWithUnsavedChanges(Guid serverId)
+    {
+        if (!Dispatcher.CheckAccess())
+            return Dispatcher.Invoke(() => IsServerBeingEditedWithUnsavedChanges(serverId));
+
+        return selectedServer is not null &&
+               selectedServer.Id == serverId &&
+               ServerEditorDirtyTracker.HasUnsavedChanges(selectedServer, CaptureEditorDraft());
+    }
+
     private static void SetManagerOverride<T>(
         ManagedServer server, string property, T current, T value, Action<T> assign)
     {
@@ -2042,16 +2074,27 @@ public partial class MainWindow : Window
         var handledAny = false;
         try
         {
+            var now = DateTimeOffset.UtcNow;
             foreach (var proxy in config.BaseProxies.Where(proxy =>
                          proxy.Enabled &&
+                         !AccessGrantPolicy.IsStartupInCooldown(proxy, now) &&
                          !AccessScriptConsolePolicy.IsPromptSnoozed(
                              accessPromptCancelledUtc.GetValueOrDefault(proxy.Id),
-                             proxy.ScheduledRestartMinutes, DateTimeOffset.UtcNow) &&
+                             proxy.ScheduledRestartMinutes, now) &&
                          ((!accessStartupPreflightCompleted.Contains(proxy.Id) &&
-                           AccessGrantPolicy.ShouldRunStartupPreflight(proxy)) ||
-                          AccessGrantPolicy.ShouldInitializeAccessBaseline(proxy, DateTimeOffset.UtcNow) ||
-                          AccessGrantPolicy.ShouldRunScheduledRestart(proxy, DateTimeOffset.UtcNow))))
+                           AccessGrantPolicy.ShouldRunStartupPreflight(proxy, now)) ||
+                          AccessGrantPolicy.ShouldInitializeAccessBaseline(proxy, now) ||
+                          AccessGrantPolicy.ShouldRunScheduledRestart(proxy, now))))
             {
+                var startupServer = proxy.StartupServerId is { } sid ? config.FindServer(sid) : null;
+                var alarmEligibility = JumphostStartupPolicy.CheckEligibility(
+                    proxy, startupServer, isManualLaunch: false, IsServerBeingEditedWithUnsavedChanges, now);
+                if (alarmEligibility != JumphostStartupEligibility.Eligible)
+                {
+                    RouteLog($"Access script alarm skipped: proxy={proxy.Name}; reason={alarmEligibility}");
+                    continue;
+                }
+
                 handledAny = true;
                 accessScriptAlarmCancellation.Token.ThrowIfCancellationRequested();
                 try
@@ -2094,6 +2137,14 @@ public partial class MainWindow : Window
         if (server is null)
         {
             RouteLog($"Access script alarm skipped: proxy={proxy.Name}; managed JH session is not configured");
+            return;
+        }
+
+        var eligibility = JumphostStartupPolicy.CheckEligibility(
+            proxy, server, isManualLaunch: false, IsServerBeingEditedWithUnsavedChanges, DateTimeOffset.UtcNow);
+        if (eligibility != JumphostStartupEligibility.Eligible)
+        {
+            RouteLog($"Access script alarm skipped: proxy={proxy.Name}; reason={eligibility}");
             return;
         }
 
@@ -2290,15 +2341,33 @@ public partial class MainWindow : Window
     private async Task<bool> EnsureManagedJumphostAsync(
         CancellationToken cancellationToken, bool startMissing, Guid? startupServerId = null,
         Guid? proxyId = null, Guid? accessTargetServerId = null, bool startAllAutoStart = false,
-        Guid? forceAccessScriptProxyId = null, bool deferAccessScriptUntilReady = false)
+        Guid? forceAccessScriptProxyId = null, bool deferAccessScriptUntilReady = false,
+        bool isManualLaunch = false)
     {
         var ordered = RoutePlanner.OrderedProxies(config)
             .Where(proxy => startupServerId is null || proxy.StartupServerId == startupServerId)
             .Where(proxy => proxyId is null || proxy.Id == proxyId)
             .ToArray();
+        if (isManualLaunch)
+        {
+            foreach (var proxy in ordered)
+                if (proxy.LastStartupFailureUtc is not null)
+                {
+                    proxy.LastStartupFailureUtc = null;
+                    SaveConfig();
+                }
+        }
         if (!startMissing && !startAllAutoStart)
             foreach (var proxy in ordered)
-                if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken)) return true;
+                if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                {
+                    if (proxy.LastStartupFailureUtc is not null)
+                    {
+                        proxy.LastStartupFailureUtc = null;
+                        SaveConfig();
+                    }
+                    return true;
+                }
 
         var anyReady = false;
         foreach (var candidateProxy in ordered.Where(item => item.StartupServerId is not null &&
@@ -2307,9 +2376,26 @@ public partial class MainWindow : Window
             var proxy = candidateProxy;
             if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
             {
+                if (proxy.LastStartupFailureUtc is not null)
+                {
+                    proxy.LastStartupFailureUtc = null;
+                    SaveConfig();
+                }
                 anyReady = true;
                 continue;
             }
+
+            var server = config.FindServer(proxy.StartupServerId!.Value);
+            if (server is null) continue;
+
+            var eligibility = JumphostStartupPolicy.CheckEligibility(
+                proxy, server, isManualLaunch, IsServerBeingEditedWithUnsavedChanges, DateTimeOffset.UtcNow);
+            if (eligibility != JumphostStartupEligibility.Eligible)
+            {
+                RouteLog($"Jumphost startup skipped: name={proxy.Name}; reason={eligibility}");
+                continue;
+            }
+
             var gate = jumphostStartupGates.GetOrAdd(proxy.Id, _ => new SemaphoreSlim(1, 1));
             RouteLog($"Jumphost startup gate waiting: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
             await gate.WaitAsync(cancellationToken);
@@ -2319,10 +2405,27 @@ public partial class MainWindow : Window
                 if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
                 {
                     RouteLog($"Jumphost startup reused: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
+                    if (proxy.LastStartupFailureUtc is not null)
+                    {
+                        proxy.LastStartupFailureUtc = null;
+                        SaveConfig();
+                    }
                     anyReady = true;
                     if (!startAllAutoStart) return true;
                     continue;
                 }
+
+                server = config.FindServer(proxy.StartupServerId!.Value);
+                if (server is null) continue;
+
+                var gateEligibility = JumphostStartupPolicy.CheckEligibility(
+                    proxy, server, isManualLaunch, IsServerBeingEditedWithUnsavedChanges, DateTimeOffset.UtcNow);
+                if (gateEligibility != JumphostStartupEligibility.Eligible)
+                {
+                    RouteLog($"Jumphost startup skipped inside gate: name={proxy.Name}; reason={gateEligibility}");
+                    continue;
+                }
+
                 var stoppedExistingManagedProcess = false;
                 if (jumphostProcesses.TryGetAliveManaged(proxy, out var existingProcess))
                 {
@@ -2344,14 +2447,14 @@ public partial class MainWindow : Window
                         continue;
                     if (!jumphostProcesses.TryStopAliveManaged(proxy))
                     {
+                        JumphostStartupPolicy.HandleStopUnhealthyProcessFailure(proxy, DateTimeOffset.UtcNow);
+                        SaveConfig();
                         Status($"Не удалось безопасно перезапустить собственную KiTTY «{proxy.Name}».");
                         continue;
                     }
                     RouteLog($"Unhealthy managed jumphost stopped for one retry: name={proxy.Name}; pid={existingProcess.ProcessId}");
                     stoppedExistingManagedProcess = true;
                 }
-            var server = config.FindServer(proxy.StartupServerId!.Value);
-            if (server is null) continue;
             var entryTitle = JumphostConsoleTitles.EntryTitle(server.Name, proxy.Name);
             var startupStopwatch = System.Diagnostics.Stopwatch.StartNew();
             var forcedScheduledAccessScript = proxy.Id == forceAccessScriptProxyId;
@@ -2383,6 +2486,7 @@ public partial class MainWindow : Window
                         }
                         proxy.LastSuccessUtc = DateTimeOffset.UtcNow;
                         proxy.LastStartupLatencyMs = startupStopwatch.Elapsed.TotalMilliseconds;
+                        proxy.LastStartupFailureUtc = null;
                         SaveConfig();
                         Status($"Точка входа «{proxy.Name}» готова");
                         return true;
@@ -2412,6 +2516,10 @@ public partial class MainWindow : Window
                     }
                     else
                     {
+                        JumphostStartupPolicy.HandleAdoptedConsoleTimeout(proxy, DateTimeOffset.UtcNow);
+                        SaveConfig();
+                        RouteLog($"Jumphost startup failed on adopted console: name={proxy.Name}; " +
+                                 $"endpoint={proxy.Host}:{proxy.Port}; cooldown until {proxy.LastStartupFailureUtc?.Add(AccessGrantPolicy.StartupFailureCooldown)}");
                         Status($"KiTTY точки входа «{proxy.Name}» открыта (PID {titled.Id}), " +
                                "но SOCKS5 недоступен. Проверьте открытую консоль.");
                     }
@@ -2419,89 +2527,126 @@ public partial class MainWindow : Window
                 }
             }
 
-            var maximumLaunchAttempts = stoppedExistingManagedProcess ? 1 : 2;
+            var maximumLaunchAttempts = isManualLaunch ? (stoppedExistingManagedProcess ? 1 : 2) : 1;
             for (var launchAttempt = 1; launchAttempt <= maximumLaunchAttempts; launchAttempt++)
             {
-            Status($"Запускаю точку входа «{proxy.Name}»…");
-            if (!proxy.UseAutomaticPort &&
-                await IsTcpPortOpenAsync(proxy.Host, proxy.Port, TimeSpan.FromSeconds(1), cancellationToken))
-                throw new InvalidOperationException(
-                    $"Порт {proxy.Host}:{proxy.Port} занят процессом, который не отвечает как SOCKS5. " +
-                    "Освободите порт или включите автоматический выбор порта.");
-            var port = JumphostPortSelector.Select(proxy);
-            KittyLoginScript? loginScript = null;
-            try
-            {
-                if (proxy.TotpSecret.Length > 0)
-                {
-                    var period = Math.Max(1, proxy.TotpPeriodSeconds);
-                    var remaining = period - (DateTimeOffset.UtcNow.ToUnixTimeSeconds() % period);
-                    if (remaining < Math.Min(8, period))
+                Status($"Запускаю точку входа «{proxy.Name}»…");
+                KittyLoginScript? loginScript = null;
+                var launchResult = await JumphostStartupPolicy.ExecuteLaunchSequenceAsync(
+                    proxy,
+                    server,
+                    isManualLaunch,
+                    IsServerBeingEditedWithUnsavedChanges,
+                    preLaunchDelayAsync: async () =>
                     {
-                        Status($"Жду новое окно TOTP для «{proxy.Name}»…");
-                        await Task.Delay(TimeSpan.FromSeconds(remaining + 1), cancellationToken);
-                    }
-                }
-                // The long-lived SOCKS console only authenticates. Access commands
-                // run in a separate visible console with a completion marker.
-                var steps = JumphostStartupPlan.BuildPostLogin(proxy, server, false);
-                loginScript = KittyLoginScript.Create(steps);
-                var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
-                    ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
-                    : ResolveProgram(config.KittyPath);
-                var startInfo = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
-                if (!string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath))
-                {
-                    startInfo.ArgumentList.Add("-load");
-                    startInfo.ArgumentList.Add(server.Name);
-                }
-                if (string.IsNullOrWhiteSpace(server.SourceSessionPath) || !File.Exists(server.SourceSessionPath))
-                {
-                    startInfo.ArgumentList.Add("-ssh"); startInfo.ArgumentList.Add(server.Host);
-                    startInfo.ArgumentList.Add("-P"); startInfo.ArgumentList.Add(server.Port.ToString());
-                    if (server.Username.Length > 0) { startInfo.ArgumentList.Add("-l"); startInfo.ArgumentList.Add(server.Username); }
-                }
-                var preserveSavedAuthentication = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
-                    File.Exists(server.SourceSessionPath) && proxy.TotpSecret.Length == 0;
-                foreach (var argument in JumphostStartupPlan.KittyAuthenticationArguments(
-                             server, preserveSavedAuthentication))
-                    startInfo.ArgumentList.Add(argument);
-                var startupKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
-                if (startupKeyPath is not null)
-                { startInfo.ArgumentList.Add("-i"); startInfo.ArgumentList.Add(startupKeyPath); }
-                startInfo.ArgumentList.Add("-D"); startInfo.ArgumentList.Add(port.ToString());
-                if (loginScript is not null)
-                { startInfo.ArgumentList.Add("-loginscript"); startInfo.ArgumentList.Add(loginScript.Path); }
-                startInfo.ArgumentList.Add("-title"); startInfo.ArgumentList.Add(entryTitle);
-                var process = Process.Start(startInfo)
-                    ?? throw new InvalidOperationException("KiTTY не удалось запустить.");
-                proxy.Port = port;
-                jumphostProcesses.Remember(proxy, JumphostConsoleKind.Entry, process, entryTitle);
-                PersistConsoles();
-                RouteLog($"Jumphost launched: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; pid={process.Id}");
-                if (proxy.TotpSecret.Length > 0)
-                {
-                    var code = TotpGenerator.Generate(proxy.TotpSecret, DateTimeOffset.UtcNow,
-                        proxy.TotpDigits, proxy.TotpPeriodSeconds, proxy.TotpAlgorithm);
-                    await KittyWindowInput.SendLineAsync(process, code, cancellationToken);
-                }
+                        if (proxy.TotpSecret.Length > 0)
+                        {
+                            var period = Math.Max(1, proxy.TotpPeriodSeconds);
+                            var remaining = period - (DateTimeOffset.UtcNow.ToUnixTimeSeconds() % period);
+                            if (remaining < Math.Min(8, period))
+                            {
+                                Status($"Жду новое окно TOTP для «{proxy.Name}»…");
+                                await Task.Delay(TimeSpan.FromSeconds(remaining + 1), cancellationToken);
+                            }
+                        }
+                    },
+                    selectPortAndVerifyAsync: async () =>
+                    {
+                        if (!proxy.UseAutomaticPort &&
+                            await IsTcpPortOpenAsync(proxy.Host, proxy.Port, TimeSpan.FromSeconds(1), cancellationToken))
+                            throw new InvalidOperationException(
+                                $"Порт {proxy.Host}:{proxy.Port} занят процессом, который не отвечает как SOCKS5. " +
+                                "Освободите порт или включите автоматический выбор порта.");
+                        return JumphostPortSelector.Select(proxy);
+                    },
+                    launchProcessAndWaitReadyAsync: async port =>
+                    {
+                        try
+                        {
+                            var steps = JumphostStartupPlan.BuildPostLogin(proxy, server, false);
+                            loginScript = KittyLoginScript.Create(steps);
+                            var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
+                                ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
+                                : ResolveProgram(config.KittyPath);
+                            var startInfo = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
+                            if (!string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath))
+                            {
+                                startInfo.ArgumentList.Add("-load");
+                                startInfo.ArgumentList.Add(server.Name);
+                            }
+                            if (string.IsNullOrWhiteSpace(server.SourceSessionPath) || !File.Exists(server.SourceSessionPath))
+                            {
+                                startInfo.ArgumentList.Add("-ssh"); startInfo.ArgumentList.Add(server.Host);
+                                startInfo.ArgumentList.Add("-P"); startInfo.ArgumentList.Add(server.Port.ToString());
+                                if (server.Username.Length > 0) { startInfo.ArgumentList.Add("-l"); startInfo.ArgumentList.Add(server.Username); }
+                            }
+                            var preserveSavedAuthentication = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
+                                File.Exists(server.SourceSessionPath) && proxy.TotpSecret.Length == 0;
+                            foreach (var argument in JumphostStartupPlan.KittyAuthenticationArguments(
+                                         server, preserveSavedAuthentication))
+                                startInfo.ArgumentList.Add(argument);
+                            var startupKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
+                            if (startupKeyPath is not null)
+                            { startInfo.ArgumentList.Add("-i"); startInfo.ArgumentList.Add(startupKeyPath); }
+                            startInfo.ArgumentList.Add("-D"); startInfo.ArgumentList.Add(port.ToString());
+                            if (loginScript is not null)
+                            { startInfo.ArgumentList.Add("-loginscript"); startInfo.ArgumentList.Add(loginScript.Path); }
+                            startInfo.ArgumentList.Add("-title"); startInfo.ArgumentList.Add(entryTitle);
+                            var process = Process.Start(startInfo)
+                                ?? throw new InvalidOperationException("KiTTY не удалось запустить.");
+                            proxy.Port = port;
+                            jumphostProcesses.Remember(proxy, JumphostConsoleKind.Entry, process, entryTitle);
+                            PersistConsoles();
+                            RouteLog($"Jumphost launched: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; pid={process.Id}");
+                            if (proxy.TotpSecret.Length > 0)
+                            {
+                                var code = TotpGenerator.Generate(proxy.TotpSecret, DateTimeOffset.UtcNow,
+                                    proxy.TotpDigits, proxy.TotpPeriodSeconds, proxy.TotpAlgorithm);
+                                await KittyWindowInput.SendLineAsync(process, code, cancellationToken);
+                            }
 
-                if (await WaitForReadyAsync())
+                            return await WaitForReadyAsync();
+                        }
+                        finally
+                        {
+                            loginScript?.Dispose();
+                        }
+                    },
+                    getNow: () => DateTimeOffset.UtcNow);
+
+                if (launchResult.Status == JumphostLaunchStatus.Success)
                 {
+                    SaveConfig();
                     if (deferAccessScriptUntilReady) return true;
                     anyReady = true;
                     if (!startAllAutoStart) return true;
                     break;
                 }
-            }
-            finally { loginScript?.Dispose(); }
-            if (launchAttempt == 1 && jumphostProcesses.TryStopAliveManaged(proxy))
-            {
-                RouteLog($"New unhealthy jumphost stopped for one retry: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
-                continue;
-            }
-            Status($"Точка входа «{proxy.Name}» не подняла SOCKS5 после запуска.");
-            break;
+
+                if (launchResult.Status == JumphostLaunchStatus.AbortedDueToEditing ||
+                    launchResult.Status == JumphostLaunchStatus.SkippedNotEligible)
+                {
+                    RouteLog($"Jumphost startup skipped: name={proxy.Name}; reason={launchResult.Eligibility}");
+                    break;
+                }
+
+                SaveConfig();
+                if (launchResult.Exception is not null)
+                {
+                    RouteLog($"Jumphost launch error: name={proxy.Name}; error={launchResult.Exception.GetType().Name}: {launchResult.Exception.Message}");
+                    Status($"Ошибка запуска точки входа «{proxy.Name}»: {launchResult.Exception.Message}");
+                    break;
+                }
+
+                if (launchAttempt == 1 && maximumLaunchAttempts > 1 && jumphostProcesses.TryStopAliveManaged(proxy))
+                {
+                    RouteLog($"New unhealthy jumphost stopped for one retry: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
+                    continue;
+                }
+
+                RouteLog($"Jumphost startup failed: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; cooldown until {proxy.LastStartupFailureUtc?.Add(AccessGrantPolicy.StartupFailureCooldown)}");
+                Status($"Точка входа «{proxy.Name}» не подняла SOCKS5 после запуска.");
+                break;
             }
             }
             finally { gate.Release(); }
@@ -2528,8 +2673,12 @@ public partial class MainWindow : Window
             return;
         foreach (var proxy in missing)
         {
-            if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), CancellationToken.None)) continue;
-            await EnsureManagedJumphostAsync(CancellationToken.None, true, proxyId: proxy.Id);
+            if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), CancellationToken.None))
+            {
+                proxy.LastStartupFailureUtc = null;
+                continue;
+            }
+            await EnsureManagedJumphostAsync(CancellationToken.None, true, proxyId: proxy.Id, isManualLaunch: true);
         }
     }
 
@@ -2808,8 +2957,16 @@ public partial class MainWindow : Window
         {
             foreach (var proxy in points)
                 if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
-                { Status($"Точка входа «{server.Name}» уже работает; источник существующего SOCKS5 не подтверждён"); return; }
-            if (!await EnsureManagedJumphostAsync(cancellationToken, true, server.Id))
+                {
+                    if (proxy.LastStartupFailureUtc is not null)
+                    {
+                        proxy.LastStartupFailureUtc = null;
+                        SaveConfig();
+                    }
+                    Status($"Точка входа «{server.Name}» уже работает; источник существующего SOCKS5 не подтверждён");
+                    return;
+                }
+            if (!await EnsureManagedJumphostAsync(cancellationToken, true, server.Id, isManualLaunch: true))
                 throw new InvalidOperationException("Не удалось запустить назначенную точку входа.");
         });
     }
