@@ -287,6 +287,7 @@ public static class AppUpdateInstaller
         $lines = Get-Content -LiteralPath $manifestFile -ErrorAction Stop
         $createdFiles = @()
         $backedUpFiles = @()
+        $renamedOldFiles = @()
         $success = $true
 
         foreach ($line in $lines) {
@@ -328,7 +329,26 @@ public static class AppUpdateInstaller
                 if (!(Test-Path -LiteralPath $targetParent)) {
                     [System.IO.Directory]::CreateDirectory($targetParent) | Out-Null
                 }
-                Copy-Item -LiteralPath $stagedFile -Destination $targetFile -Force -ErrorAction Stop
+
+                $copied = $false
+                for ($attempt = 1; $attempt -le 3; $attempt++) {
+                    try {
+                        Copy-Item -LiteralPath $stagedFile -Destination $targetFile -Force -ErrorAction Stop
+                        $copied = $true
+                        break
+                    } catch {
+                        Start-Sleep -Milliseconds 600
+                    }
+                }
+
+                if (!$copied) {
+                    # If target file is locked by a running process, move it aside and copy fresh
+                    $tempOld = "$targetFile.old." + [Guid]::NewGuid().ToString("N")
+                    Log "File is in use ($relPath). Moving existing file aside to $tempOld..."
+                    Move-Item -LiteralPath $targetFile -Destination $tempOld -Force -ErrorAction Stop
+                    $renamedOldFiles += @{ Target = $targetFile; TempOld = $tempOld }
+                    Copy-Item -LiteralPath $stagedFile -Destination $targetFile -Force -ErrorAction Stop
+                }
             } catch {
                 Log "Error copying $relPath : $_"
                 $success = $false
@@ -348,10 +368,23 @@ public static class AppUpdateInstaller
                     Log "Rollback: failed to remove $created : $_"
                 }
             }
+            foreach ($r in $renamedOldFiles) {
+                try {
+                    if (Test-Path -LiteralPath $r.Target) {
+                        Remove-Item -LiteralPath $r.Target -Force -ErrorAction SilentlyContinue
+                    }
+                    Move-Item -LiteralPath $r.TempOld -Destination $r.Target -Force -ErrorAction Stop
+                    Log "Rollback: restored renamed file: $($r.Target)"
+                } catch {
+                    Log "Rollback: error restoring renamed file $($r.Target) : $_"
+                }
+            }
             foreach ($b in $backedUpFiles) {
                 try {
-                    Copy-Item -LiteralPath $b.Backup -Destination $b.Target -Force -ErrorAction Stop
-                    Log "Rollback: restored original file: $($b.Target)"
+                    if (!($renamedOldFiles | Where-Object { $_.Target -eq $b.Target })) {
+                        Copy-Item -LiteralPath $b.Backup -Destination $b.Target -Force -ErrorAction Stop
+                        Log "Rollback: restored original file: $($b.Target)"
+                    }
                 } catch {
                     Log "Rollback: error restoring $($b.Target) : $_"
                 }
@@ -369,7 +402,7 @@ public static class AppUpdateInstaller
             Start-Process -FilePath $targetExe -WorkingDirectory $TargetDir
         }
 
-        # 5. Cleanup temporary staging, backup, and downloaded archive
+        # 5. Cleanup temporary staging, backup, downloaded archive, and temp old files
         try {
             if (Test-Path -LiteralPath $StagingDir) {
                 Remove-Item -LiteralPath $StagingDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -379,6 +412,11 @@ public static class AppUpdateInstaller
             }
             if (![string]::IsNullOrWhiteSpace($ZipFile) -and (Test-Path -LiteralPath $ZipFile)) {
                 Remove-Item -LiteralPath $ZipFile -Force -ErrorAction SilentlyContinue
+            }
+            foreach ($r in $renamedOldFiles) {
+                if (Test-Path -LiteralPath $r.TempOld) {
+                    Remove-Item -LiteralPath $r.TempOld -Force -ErrorAction SilentlyContinue
+                }
             }
         } catch { /* best effort */ }
 
@@ -420,6 +458,23 @@ public static class AppUpdateInstaller
                     {
                         var fileInfo = new FileInfo(file);
                         if (DateTime.UtcNow - fileInfo.LastWriteTimeUtc > TimeSpan.FromMinutes(30))
+                        {
+                            File.Delete(file);
+                        }
+                    }
+                    catch { /* best effort */ }
+                }
+            }
+
+            var baseDir = AppContext.BaseDirectory;
+            if (Directory.Exists(baseDir))
+            {
+                foreach (var file in Directory.GetFiles(baseDir, "*.old.*", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        var fileInfo = new FileInfo(file);
+                        if (DateTime.UtcNow - fileInfo.LastWriteTimeUtc > TimeSpan.FromMinutes(10))
                         {
                             File.Delete(file);
                         }
