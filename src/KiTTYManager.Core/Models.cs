@@ -37,6 +37,16 @@ public sealed class ManagerConfig
     public bool FirefoxCleanRemovedServerContainers { get; set; } = true;
     public bool FirefoxAcceptInsecureCerts { get; set; } = true;
     public List<FirefoxContainerCleanupTask> PendingFirefoxContainerCleanups { get; set; } = [];
+    public List<string> NotifiedUpdateVersions { get; set; } = [];
+
+    public bool HasNotifiedUpdateVersion(string version) =>
+        NotifiedUpdateVersions.Any(v => string.Equals(v.TrimStart('v', 'V'), version.TrimStart('v', 'V'), StringComparison.OrdinalIgnoreCase));
+
+    public void RecordNotifiedUpdateVersion(string version)
+    {
+        if (!HasNotifiedUpdateVersion(version))
+            NotifiedUpdateVersions.Add(version);
+    }
 }
 
 public sealed class FirefoxContainerCleanupTask

@@ -66,6 +66,14 @@ internal sealed partial class SelfTestRunner
     public bool RunOffline()
     {
         Console.WriteLine("KiTTY Manager: автономные тесты");
+        Test("Обновление: парсинг версий и сравнение", AppUpdateVersionParsingAndComparison);
+        Test("Обновление: расчёт расписания и бэкофф", AppUpdateScheduleCalculations);
+        Test("Обновление: дедупликация уведомлений", AppUpdateNotificationDeduplication);
+        Test("Обновление: парсинг GitHub JSON и выбор ассета", AppUpdateAssetSelectionAndJsonParsing);
+        Test("Обновление: валидация архива и защита Data и KiTTY", AppUpdateArchiveValidation);
+        Test("Обновление: безопасное применение, сохранение файлов и откат", AppUpdateSafeRollbackAndPreservation);
+        Test("Обновление: проверка скрипта PowerShell и сессии обновления", AppUpdatePowerShellScriptAndSessionTests);
+        Test("Обновление: политика отложенного закрытия и массовых задач", AppUpdateDeferredShutdownPolicyTests);
         Test("Поиск справки находит поля во всех разделах", HelpSearchFindsFieldsAcrossSections);
         Test("Разрешение полей веб-интерфейсов для копирования и сортировки", WebFieldValueResolverTests);
         Test("Валидация параметров и отображение SSH-туннелей", TunnelDefinitionAndPolicyValidation);
