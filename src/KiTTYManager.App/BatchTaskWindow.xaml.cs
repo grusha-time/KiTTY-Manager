@@ -38,6 +38,7 @@ public partial class BatchTaskWindow : Window
     private bool closeAfterStop;
     private string savedTaskState = "";
     private TaskCompletionSource<bool>? runCompletion;
+    private TaskCompletionSource<bool>? closeCompletion;
     private readonly HashSet<string> ownedTaskDirectories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Action<string>? fileLog;
     private string? loadedTemplatePath;
@@ -1455,12 +1456,22 @@ public partial class BatchTaskWindow : Window
 
     public bool IsRunning => runActive;
 
-    public async Task StopAndCloseAsync()
+    public async Task<bool> StopAndCloseAsync()
     {
+        if (!IsLoaded) return true;
+        closeCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         closeAfterStop = true;
         cancellation?.Cancel();
-        if (!runActive) { Close(); return; }
-        if (runCompletion is not null) await runCompletion.Task;
+        if (!runActive)
+        {
+            Close();
+            return await closeCompletion.Task;
+        }
+
+        if (runCompletion is not null)
+            await runCompletion.Task;
+
+        return await closeCompletion.Task;
     }
 
     private void BatchTaskWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -1475,7 +1486,17 @@ public partial class BatchTaskWindow : Window
         if (HasUnsavedChanges() && MessageBox.Show(this,
                 "В задаче есть несохранённые изменения. Закрыть без сохранения?",
                 "Массовая задача", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+        {
             e.Cancel = true;
+            closeCompletion?.TrySetResult(false);
+            return;
+        }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+        closeCompletion?.TrySetResult(true);
     }
 
     private string CurrentTaskState() => JsonSerializer.Serialize(ReadTask());

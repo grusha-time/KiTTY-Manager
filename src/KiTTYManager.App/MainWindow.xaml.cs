@@ -139,6 +139,7 @@ public partial class MainWindow : Window
             await OfferStartMissingJumphostsAsync();
             accessScriptAlarm.Start();
             _ = RunAccessScriptAlarmAsync();
+            InitializeUpdateScheduler();
         };
     }
 
@@ -3538,11 +3539,12 @@ public partial class MainWindow : Window
         var jumphosts = new MenuItem { Header = "Настройки точек входа…" }; jumphosts.Click += Jumphosts_Click;
         var settings = new MenuItem { Header = "Настройки…" }; settings.Click += Settings_Click;
         var help = new MenuItem { Header = "Справка по полям…" }; help.Click += (_, _) => _ = new HelpDialog { Owner = this }.ShowDialog();
+        var update = new MenuItem { Header = "Обновление KiTTY Manager" }; update.Click += (_, _) => ShowUpdateDialog();
         var about = new MenuItem { Header = "О программе…" }; about.Click += (_, _) => ShowAbout();
         var exit = new MenuItem { Header = "Выйти" }; exit.Click += (_, _) => ExitApplication();
         menu.Items.Add(activeTunnels); menu.Items.Add(jumphosts); menu.Items.Add(settings); menu.Items.Add(new Separator());
         menu.Items.Add(changes); menu.Items.Add(resetIgnored); menu.Items.Add(new Separator()); menu.Items.Add(export); menu.Items.Add(import); menu.Items.Add(rollbackImport);
-        menu.Items.Add(logs); menu.Items.Add(help); menu.Items.Add(about); menu.Items.Add(exit); menu.PlacementTarget = sender as UIElement; menu.IsOpen = true;
+        menu.Items.Add(logs); menu.Items.Add(help); menu.Items.Add(update); menu.Items.Add(about); menu.Items.Add(exit); menu.PlacementTarget = sender as UIElement; menu.IsOpen = true;
     }
 
     private void ShowAbout()
@@ -3759,9 +3761,14 @@ public partial class MainWindow : Window
     {
         if (!forceExit && config.CloseToTray)
         {
+            if (pendingUpdateSession is not null)
+            {
+                pendingUpdateSession.Disarm();
+                pendingUpdateSession = null;
+            }
             e.Cancel = true; Hide(); EnsureTrayIcon(); trayIcon!.Visible = true; trayIcon.ShowBalloonTip(1500, "KiTTY Manager", "Приложение продолжает работать, активные туннели сохранены.", System.Windows.Forms.ToolTipIcon.Info); return;
         }
-        if (batchTaskWindow?.IsRunning == true && !batchExitPending)
+        if (batchTaskWindow is not null && !batchExitPending)
         {
             e.Cancel = true;
             batchExitPending = true;
@@ -3784,6 +3791,8 @@ public partial class MainWindow : Window
 
             if (choice != ThemedDialogChoice.Primary)
             {
+                pendingUpdateSession?.Disarm();
+                pendingUpdateSession = null;
                 e.Cancel = true;
                 forceExit = false;
                 return;
@@ -3795,13 +3804,58 @@ public partial class MainWindow : Window
         {
             try { activeTunnelsWindow?.ForceClose(); } catch { }
         }
+
+        // Verify update helper process is still alive and commit signal before irreversible cleanup
+        if (pendingUpdateSession is not null)
+        {
+            if (!pendingUpdateSession.IsHelperAlive() || !pendingUpdateSession.Commit())
+            {
+                pendingUpdateSession.Disarm();
+                pendingUpdateSession = null;
+                ThemedMessageDialog.Show(this,
+                    "Не удалось инициировать процедуру обновления: процесс помощника завершился или не удалось записать сигнал подтверждения.\n\nОбновление отменено во избежание сбоя. Приложение продолжит работу.",
+                    "Ошибка обновления",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                e.Cancel = true;
+                forceExit = false;
+                return;
+            }
+        }
+
         Cleanup();
     }
     private async Task StopBatchAndExitAsync()
     {
-        if (batchTaskWindow is not null) await batchTaskWindow.StopAndCloseAsync();
+        bool closed;
+        try
+        {
+            if (batchTaskWindow is not null)
+            {
+                closed = await batchTaskWindow.StopAndCloseAsync();
+            }
+            else
+            {
+                closed = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"[BatchExit] Ошибка остановки пакетных задач: {ex.Message}");
+            closed = false;
+        }
+
         batchExitPending = false;
-        Close();
+
+        if (!closed)
+        {
+            RouteLog("[BatchExit] Закрытие окна массовой задачи отменено пользователем.");
+            pendingUpdateSession?.Disarm();
+            pendingUpdateSession = null;
+            return;
+        }
+
+        _ = Dispatcher.BeginInvoke(new Action(Close));
     }
     private void EnsureTrayIcon()
     {
@@ -3817,6 +3871,7 @@ public partial class MainWindow : Window
     private void ExitApplication() { forceExit = true; Close(); }
     private void Cleanup()
     {
+        updateSchedulerCancellation?.Cancel();
         operationCancellation?.Cancel();
         backgroundRouteProbes.CancelAll();
         accessScriptAlarm.Stop();
@@ -3831,6 +3886,7 @@ public partial class MainWindow : Window
         tunnelService.Dispose();
         foreach (var route in activeRoutes) route.Dispose();
         if (trayIcon is not null) { trayIcon.Visible = false; trayIcon.Dispose(); }
+        pendingUpdateSession?.Commit();
     }
 
     private async Task BusyAsync(

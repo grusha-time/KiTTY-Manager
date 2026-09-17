@@ -11,5 +11,6 @@
     <Compile Include="..\KiTTYManager.App\AccessScriptRunnerPlan.cs" Link="AccessScriptRunnerPlan.cs" />
     <Compile Include="..\KiTTYManager.App\WebSessionCleanupPolicy.cs" Link="WebSessionCleanupPolicy.cs" />
     <Compile Include="..\KiTTYManager.App\HelpContent.cs" Link="HelpContent.cs" />
+    <Compile Include="..\KiTTYManager.App\AppUpdateInstaller.cs" Link="AppUpdateInstaller.cs" />
   </ItemGroup>
 </Project>
