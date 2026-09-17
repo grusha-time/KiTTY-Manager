@@ -14,6 +14,31 @@ public static class AccessGrantPolicy
     /// <summary>Legacy alias used by ShouldRunAccessScript for jumphost cold-start.</summary>
     public static readonly TimeSpan ConfirmedAccessLifetime = ScheduledRestartInterval;
     public static readonly TimeSpan ScriptRetryCooldown = TimeSpan.FromMinutes(15);
+    /// <summary>Cooldown before retrying jumphost startup after connection/SOCKS5 failure.</summary>
+    public static readonly TimeSpan StartupFailureCooldown = TimeSpan.FromMinutes(10);
+
+    public static bool HasConnectionCredentials(ManagedServer? server)
+    {
+        if (server is null) return false;
+        if (string.IsNullOrWhiteSpace(server.Host) || string.IsNullOrWhiteSpace(server.CleanHost)) return false;
+        if (string.IsNullOrWhiteSpace(server.EffectiveUsername)) return false;
+
+        if (!string.IsNullOrEmpty(server.Password)) return true;
+        if (!string.IsNullOrWhiteSpace(server.PrivateKeyPath)) return true;
+
+        if (server.PasswordImportState == ImportedCredentialState.PresentButUndecodable &&
+            !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
+            File.Exists(server.SourceSessionPath))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    public static bool IsStartupInCooldown(BaseProxy proxy, DateTimeOffset now) =>
+        proxy.LastStartupFailureUtc is { } failure &&
+        now - failure < StartupFailureCooldown;
 
     /// <summary>
     /// Cold-start: should the script run when the jumphost is being launched from scratch?
@@ -33,6 +58,7 @@ public static class AccessGrantPolicy
     public static bool ShouldRunScheduledRestart(BaseProxy proxy, DateTimeOffset now) =>
         proxy.EnableScheduledRestart &&
         !string.IsNullOrWhiteSpace(proxy.PostLoginCommand) &&
+        !IsStartupInCooldown(proxy, now) &&
         ((proxy.AccessScheduleBaselineUtc ?? LatestConfirmationUtc(proxy)) is not null ||
          HasUnconfirmedAttempt(proxy)) &&
         now >= ScheduledRunDueUtc(proxy);
@@ -40,6 +66,7 @@ public static class AccessGrantPolicy
     public static bool ShouldInitializeAccessBaseline(BaseProxy proxy, DateTimeOffset now) =>
         proxy.EnableScheduledRestart &&
         !string.IsNullOrWhiteSpace(proxy.PostLoginCommand) &&
+        !IsStartupInCooldown(proxy, now) &&
         (proxy.AccessScheduleBaselineUtc ?? LatestConfirmationUtc(proxy)) is null &&
         (proxy.LastAccessScriptAttemptUtc is null ||
          now - proxy.LastAccessScriptAttemptUtc >= (HasUnconfirmedAttempt(proxy)
@@ -50,6 +77,9 @@ public static class AccessGrantPolicy
         proxy.Enabled &&
         proxy.EnableScheduledRestart &&
         !string.IsNullOrWhiteSpace(proxy.PostLoginCommand);
+
+    public static bool ShouldRunStartupPreflight(BaseProxy proxy, DateTimeOffset now) =>
+        ShouldRunStartupPreflight(proxy) && !IsStartupInCooldown(proxy, now);
 
     /// <summary>
     /// Mechanism B: should we check control servers and potentially restart
@@ -184,9 +214,18 @@ public static class AccessGrantPolicy
         var scheduled = confirmed is { } success
             ? success + TimeSpan.FromMinutes(Math.Max(1, proxy.ScheduledRestartMinutes))
             : DateTimeOffset.MinValue;
-        if (!HasUnconfirmedAttempt(proxy)) return scheduled;
-        var retry = proxy.LastAccessScriptAttemptUtc!.Value + MechanismACooldown;
-        return retry > scheduled ? retry : scheduled;
+        var due = scheduled;
+        if (HasUnconfirmedAttempt(proxy))
+        {
+            var retry = proxy.LastAccessScriptAttemptUtc!.Value + MechanismACooldown;
+            if (retry > due) due = retry;
+        }
+        if (proxy.LastStartupFailureUtc is { } failure)
+        {
+            var cooldownDue = failure + StartupFailureCooldown;
+            if (cooldownDue > due) due = cooldownDue;
+        }
+        return due;
     }
 
     private static bool HasUnconfirmedAttempt(BaseProxy proxy) =>

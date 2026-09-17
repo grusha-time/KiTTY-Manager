@@ -33,10 +33,11 @@ public static class KittySessionImporter
             _ = int.TryParse(values.GetValueOrDefault("ProxyMethod"), out var proxyMethod);
             var username = values.GetValueOrDefault("UserName") ?? values.GetValueOrDefault("Username") ?? "";
             var storedPassword = values.GetValueOrDefault("Password") ?? "";
-            var password = KittyCredentialDecoder.DecodePassword(
+            var decodedPassword = KittyCredentialDecoder.DecodePassword(
                 storedPassword, rawHost,
                 values.GetValueOrDefault("TerminalType") ?? values.GetValueOrDefault("TermType") ?? "xterm",
-                cryptSaltMode) ?? "";
+                cryptSaltMode);
+            var password = decodedPassword ?? "";
             var scriptCredentials = ReadScriptCredentials(values, path, cryptSaltMode);
             var rootLogin = scriptCredentials.RootLogin ?? "";
             var rootPassword = scriptCredentials.RootPassword ?? "";
@@ -67,7 +68,7 @@ public static class KittySessionImporter
                     ? scriptCredentials.Password ?? ""
                     : password,
                 PasswordImportState = storedPassword.Length == 0 ? ImportedCredentialState.Empty :
-                    password is null ? ImportedCredentialState.PresentButUndecodable : ImportedCredentialState.Decoded,
+                    decodedPassword is null ? ImportedCredentialState.PresentButUndecodable : ImportedCredentialState.Decoded,
                 PrivateKeyPath = ResolvePrivateKeyPath(path, values.GetValueOrDefault("PublicKeyFile")) ?? "",
                 UseKeyboardInteractive = ReadBoolean(values.GetValueOrDefault("AuthKI"), true),
                 RootLogin = rootLogin,

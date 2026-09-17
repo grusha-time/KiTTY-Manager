@@ -103,6 +103,10 @@ internal sealed partial class SelfTestRunner
         Test("WinSCP использует локальный маршрут и передаёт пароль напрямую", WinScpRouteArguments);
         Test("WinSCP получает совместимый host key и поддерживает старый конфиг", WinScpLegacyHostKeyArgument);
         Test("Стартовое предложение содержит только неработающие настроенные JH", MissingJumphostOffer);
+        Test("Валидация реквизитов подключения точки входа", JumphostConnectionCredentialsValidation);
+        Test("Импорт сохраняет статус нерасшифрованного пароля KiTTY", KittySessionImporterPreservesPresentButUndecodablePassword);
+        Test("Отслеживание несохранённых изменений в карточке сессии", ServerEditorDirtyTrackingTests);
+        Test("Кулдаун при сбое запуска точки входа и планирование", JumphostStartupCooldownAndSchedulingTests);
         Test("Умный импорт распознаёт ID и endpoint без сравнения секретов", SmartImportMatching);
         Test("Умный импорт не удаляет локальные данные и связи", SmartImportIsNonDestructive);
         Test("Умный импорт не изменяет оставленную локальную JH", SmartImportKeepsCurrentProxyReferences);

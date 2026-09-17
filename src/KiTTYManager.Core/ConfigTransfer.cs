@@ -155,6 +155,7 @@ public static class ConfigTransfer
             proxy.LastSuccessUtc = null;
             proxy.LastConnectLatencyMs = null;
             proxy.LastStartupLatencyMs = null;
+            proxy.LastStartupFailureUtc = null;
         }
 
         // Очищаем логины/пароли серверов, используемых как jumphost —

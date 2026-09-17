@@ -130,6 +130,7 @@ public static class ImportedSessionMerger
         existing.SourceScriptPath = imported.SourceScriptPath;
         existing.SourceScriptContent = imported.SourceScriptContent;
         existing.ImportedProxy = imported.ImportedProxy;
+        existing.PasswordImportState = imported.PasswordImportState;
     }
 
     public static KittySessionSnapshot Snapshot(ManagedServer server) => new()

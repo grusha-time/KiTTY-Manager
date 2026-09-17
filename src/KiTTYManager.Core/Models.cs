@@ -284,6 +284,7 @@ public sealed class BaseProxy
     public DateTimeOffset? LastSuccessUtc { get; set; }
     public double? LastConnectLatencyMs { get; set; }
     public double? LastStartupLatencyMs { get; set; }
+    public DateTimeOffset? LastStartupFailureUtc { get; set; }
     public override string ToString() => $"{Name} ({Host}:{Port})";
 }
 
