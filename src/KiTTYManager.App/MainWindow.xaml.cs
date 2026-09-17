@@ -72,15 +72,7 @@ public partial class MainWindow : Window
         KittySessionWriter.RelocateLegacyBackups(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
         WinScpCredentialFiles.CleanupStale(Path.Combine(dataDirectory, "Temp"), DateTime.UtcNow);
         configPath = Path.Combine(dataDirectory, "config.json");
-        try { config = ConfigStore.Load(configPath, migratePlaintextSecrets: true); }
-        catch (Exception ex)
-        {
-            config = new();
-            configAvailable = false;
-            ThemedMessageDialog.Show(null,
-                ex.Message + "\n\nМенеджер будет закрыт, исходный config.json не изменён.",
-                "Ошибка конфигурации", MessageBoxButton.OK, MessageBoxImage.Error);
-        }
+        config = LoadInitialConfig(configPath, out configAvailable);
         if (configAvailable) MigrateLegacyPrototypeConfig();
         RestoreRememberedConsoles();
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
@@ -3894,6 +3886,63 @@ public partial class MainWindow : Window
         Status("Отменяю операцию…");
         operationCancellation.Cancel();
     }
+    private static ManagerConfig LoadInitialConfig(string path, out bool isAvailable)
+    {
+        var hadExistingFile = File.Exists(path);
+        while (true)
+        {
+            try
+            {
+                var loaded = ConfigStore.Load(path, migratePlaintextSecrets: true, requireExisting: hadExistingFile);
+                isAvailable = true;
+                return loaded;
+            }
+            catch (Exception ex)
+            {
+                var isCrypto = ConfigStore.TryGetCryptographicFailure(ex, out var hresultHex);
+                string message;
+                string title;
+
+                if (isCrypto)
+                {
+                    title = "Недоступны ключи Windows DPAPI";
+                    var codeSuffix = string.IsNullOrWhiteSpace(hresultHex) ? "" : $" ({hresultHex})";
+                    message =
+                        $"Windows не удалось расшифровать данные конфигурации через DPAPI{codeSuffix}.\n\n" +
+                        "Ключи шифрования могут быть временно недоступны. Это часто происходит после недавней смены пароля Windows или при перезагрузке компьютера, пока операционная система обновляет ключи безопасности или ожидает подключения к корпоративной сети / домену (включая VPN).\n\n" +
+                        "Рекомендации:\n" +
+                        "• Подождите немного (1–2 минуты) или проверьте подключение к корпоративной сети / VPN, затем нажмите «Повторить попытку».\n" +
+                        "• Если повторные попытки не помогают, может потребоваться выйти из учётной записи Windows и войти снова (Sign out / Sign in).\n\n" +
+                        "ВНИМАНИЕ: Не удаляйте и не заменяйте файл config.json.\n" +
+                        "Менеджер не изменяет и не перезаписывает существующий файл при ошибке расшифровки.";
+                }
+                else
+                {
+                    title = "Ошибка конфигурации";
+                    message =
+                        $"{ex.Message}\n\n" +
+                        "ВНИМАНИЕ: Исходный файл config.json не был изменён.\n" +
+                        "Вы можете повторить попытку чтения или закрыть менеджер.";
+                }
+
+                var choice = ThemedMessageDialog.ShowChoice(
+                    null,
+                    message,
+                    title,
+                    "Повторить попытку",
+                    "Выйти",
+                    MessageBoxImage.Error,
+                    cancelChoice: ThemedDialogChoice.Secondary);
+
+                if (choice != ThemedDialogChoice.Primary)
+                {
+                    isAvailable = false;
+                    return new ManagerConfig();
+                }
+            }
+        }
+    }
+
     private void SaveAndRefresh() { SaveConfig(); var group = selectedGroup; RefreshAll(); selectedGroup = group; RefreshSessions(); }
     private void SaveConfig()
     {

@@ -19,10 +19,21 @@ public static class ConfigStore
     /// <summary>Base directory for resolving relative paths (the manager's exe folder).</summary>
     public static string BaseDirectory => AppContext.BaseDirectory;
 
-    public static ManagerConfig Load(string path, bool migratePlaintextSecrets = false)
+    public static bool TryGetCryptographicFailure(Exception exception, out string? hresultHex) =>
+        ConfigSecrets.TryGetCryptographicFailure(exception, out hresultHex);
+
+    public static ManagerConfig Load(string path, bool migratePlaintextSecrets = false, bool requireExisting = false)
     {
-        if (!File.Exists(path)) return new ManagerConfig();
-        var json = File.ReadAllText(path);
+        if (!requireExisting && !File.Exists(path)) return new ManagerConfig();
+        string json;
+        try
+        {
+            json = File.ReadAllText(path);
+        }
+        catch (FileNotFoundException) when (!requireExisting)
+        {
+            return new ManagerConfig();
+        }
         var config = JsonSerializer.Deserialize<ManagerConfig>(json, Options)
             ?? throw new InvalidDataException("Пустой или повреждённый файл конфигурации.");
         using (var document = JsonDocument.Parse(json))
