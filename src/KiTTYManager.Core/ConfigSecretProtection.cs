@@ -40,11 +40,17 @@ internal sealed class DpapiConfigSecretProtector : IConfigSecretProtector
             return Encoding.UTF8.GetString(ProtectedData.Unprotect(
                 bytes, Entropy, DataProtectionScope.CurrentUser));
         }
-        catch (Exception exception) when (
-            exception is CryptographicException or FormatException)
+        catch (FormatException exception)
         {
             throw new InvalidDataException(
-                "Не удалось расшифровать секрет из config.json. " +
+                "Не удалось прочитать защищённые данные из config.json: повреждён формат Base64.",
+                exception);
+        }
+        catch (CryptographicException exception)
+        {
+            var hex = $"0x{exception.HResult:X8}";
+            throw new InvalidDataException(
+                $"Не удалось расшифровать секрет из config.json через Windows DPAPI ({hex}). " +
                 "Файл должен открываться той же учётной записью Windows, которая его сохранила.",
                 exception);
         }
@@ -72,6 +78,20 @@ internal static class ConfigSecrets
             return value;
         });
         return found;
+    }
+
+    public static bool TryGetCryptographicFailure(Exception exception, out string? hresultHex)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is CryptographicException cryptoEx)
+            {
+                hresultHex = $"0x{cryptoEx.HResult:X8}";
+                return true;
+            }
+        }
+        hresultHex = null;
+        return false;
     }
 
     private static void Transform(ManagerConfig config, Func<string, string> transform) =>

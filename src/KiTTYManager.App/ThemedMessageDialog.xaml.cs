@@ -38,12 +38,14 @@ public partial class ThemedMessageDialog : Window
     }
 
     public static ThemedDialogChoice ShowChoice(Window? owner, string message, string title,
-        string primaryText, string secondaryText, MessageBoxImage image = MessageBoxImage.Question)
+        string primaryText, string secondaryText, MessageBoxImage image = MessageBoxImage.Question,
+        ThemedDialogChoice cancelChoice = ThemedDialogChoice.Primary)
     {
         var dialog = new ThemedMessageDialog(message, title, MessageBoxButton.OK, image);
         dialog.ButtonsPanel.Children.Clear();
-        dialog.AddButton(secondaryText, MessageBoxResult.No, false, false);
-        dialog.AddButton(primaryText, MessageBoxResult.Yes, true, true);
+        var cancelSecondary = cancelChoice == ThemedDialogChoice.Secondary;
+        dialog.AddButton(secondaryText, MessageBoxResult.No, false, cancelSecondary);
+        dialog.AddButton(primaryText, MessageBoxResult.Yes, true, !cancelSecondary);
         owner ??= WpfApplication.Current?.MainWindow;
         if (owner is { IsLoaded: true } && !ReferenceEquals(owner, dialog)) dialog.Owner = owner;
         _ = dialog.ShowDialog();

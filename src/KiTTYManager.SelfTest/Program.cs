@@ -185,6 +185,9 @@ internal sealed partial class SelfTestRunner
         Test("config.json шифрует все секреты и восстанавливает их", JsonRoundTrip);
         Test("Старый открытый config.json мигрирует в зашифрованный", PlaintextConfigMigration);
         Test("Явный JSON-экспорт остаётся переносимым", PortableExportRemainsPlaintext);
+        Test("DPAPI диагностика: различие криптографических ошибок и повреждений формата", DpapiDiagnosticFailureDifferentiation);
+        Test("Загрузка конфига с requireExisting отклоняет отсутствующий файл", ConfigRequireExistingRejectsMissingFile);
+        Test("Сбой расшифровки не повреждает и не перезаписывает config.json, а повтор восстанавливает данные", DecryptionFailurePreservesFileAndAllowsRetry);
         Test("Игнорирование KiTTY относится только к конкретной паре значений", KittyIgnoreSpecificChange);
         Test("Firefox копирует рабочие данные в отдельные временные профили", FirefoxTemporaryProfiles);
         Test("Firefox profiles.ini определяет профиль по умолчанию", FirefoxProfileDiscovery);
@@ -1520,6 +1523,110 @@ internal sealed partial class SelfTestRunner
             Equal("portable-password", ConfigStore.Import(path).AllServers().Single().Password);
         }
         finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    private static void DpapiDiagnosticFailureDifferentiation()
+    {
+        var cryptoEx = new CryptographicException(unchecked((int)0x8009000B));
+        var wrappedCrypto = new InvalidDataException("Wrapped", cryptoEx);
+        Equal(true, ConfigStore.TryGetCryptographicFailure(cryptoEx, out var hex1));
+        Equal("0x8009000B", hex1);
+        Equal(true, ConfigStore.TryGetCryptographicFailure(wrappedCrypto, out var hex2));
+        Equal("0x8009000B", hex2);
+
+        var formatEx = new FormatException("Corrupted base64");
+        var wrappedFormat = new InvalidDataException("Wrapped format", formatEx);
+        Equal(false, ConfigStore.TryGetCryptographicFailure(formatEx, out var hex3));
+        Equal(null, hex3);
+        Equal(false, ConfigStore.TryGetCryptographicFailure(wrappedFormat, out var hex4));
+        Equal(null, hex4);
+    }
+
+    private static void ConfigRequireExistingRejectsMissingFile()
+    {
+        var missingPath = Path.Combine(Path.GetTempPath(), "missing-config-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            var empty = ConfigStore.Load(missingPath, requireExisting: false);
+            Equal(0, empty.UngroupedServers.Count);
+            Equal(0, empty.Groups.Count);
+
+            var threw = false;
+            try
+            {
+                ConfigStore.Load(missingPath, requireExisting: true);
+            }
+            catch (FileNotFoundException)
+            {
+                threw = true;
+            }
+            Equal(true, threw);
+        }
+        finally
+        {
+            try { File.Delete(missingPath); } catch { }
+        }
+    }
+
+    private static void DecryptionFailurePreservesFileAndAllowsRetry()
+    {
+        var path = TempFile();
+        var oldProtector = ConfigStore.SecretProtector;
+        try
+        {
+            var config = new ManagerConfig
+            {
+                UngroupedServers =
+                [
+                    new ManagedServer { Name = "srv1", Host = "10.0.0.1", Password = "secret-pass" }
+                ]
+            };
+            ConfigStore.Save(path, config);
+            var originalBytes = File.ReadAllBytes(path);
+
+            var failingProtector = new FailingTestSecretProtector(new CryptographicException(unchecked((int)0x8009000B)));
+            ConfigStore.SecretProtector = failingProtector;
+
+            var failed = false;
+            try
+            {
+                ConfigStore.Load(path, migratePlaintextSecrets: true, requireExisting: true);
+            }
+            catch (Exception ex)
+            {
+                failed = true;
+                Equal(true, ConfigStore.TryGetCryptographicFailure(ex, out var hex));
+                Equal("0x8009000B", hex);
+            }
+            Equal(true, failed);
+
+            var currentBytes = File.ReadAllBytes(path);
+            Equal(originalBytes.Length, currentBytes.Length);
+            for (var i = 0; i < originalBytes.Length; i++)
+                Equal(originalBytes[i], currentBytes[i]);
+
+            File.Delete(path);
+            var missingThrew = false;
+            try
+            {
+                ConfigStore.Load(path, migratePlaintextSecrets: true, requireExisting: true);
+            }
+            catch (FileNotFoundException)
+            {
+                missingThrew = true;
+            }
+            Equal(true, missingThrew);
+
+            File.WriteAllBytes(path, originalBytes);
+            ConfigStore.SecretProtector = oldProtector;
+            var retried = ConfigStore.Load(path, migratePlaintextSecrets: true, requireExisting: true);
+            Equal("secret-pass", retried.UngroupedServers.Single().Password);
+        }
+        finally
+        {
+            ConfigStore.SecretProtector = oldProtector;
+            try { File.Delete(path); File.Delete(path + ".tmp"); } catch { }
+        }
     }
 
     private static void KittyIgnoreSpecificChange()
@@ -7922,5 +8029,23 @@ internal sealed class TestConfigSecretProtector : IConfigSecretProtector
             return protectedValue;
         return Encoding.UTF8.GetString(Convert.FromBase64String(
             protectedValue[DpapiConfigSecretProtector.Prefix.Length..]));
+    }
+}
+
+internal sealed class FailingTestSecretProtector : IConfigSecretProtector
+{
+    private readonly Exception exceptionToThrow;
+
+    public FailingTestSecretProtector(Exception exceptionToThrow) =>
+        this.exceptionToThrow = exceptionToThrow;
+
+    public string Protect(string plaintext) =>
+        plaintext.Length == 0 ? "" : DpapiConfigSecretProtector.Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes(plaintext));
+
+    public string Unprotect(string protectedValue)
+    {
+        if (protectedValue.Length == 0 || !protectedValue.StartsWith(DpapiConfigSecretProtector.Prefix, StringComparison.Ordinal))
+            return protectedValue;
+        throw exceptionToThrow;
     }
 }
