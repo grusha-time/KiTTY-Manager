@@ -1,10 +1,10 @@
-# KiTTY Manager 2.0
+# KiTTY Manager 2.1
 
 KiTTY Manager — приложение Windows для SSH-сессий. Оно хранит серверы в группах, находит путь через точки входа и промежуточные серверы, открывает терминал KiTTY, SFTP в WinSCP и веб-панели в Firefox. Для повторяющихся операций есть конструктор массовых задач и встроенный Ansible.
 
 ## С чего начать
 
-1. Скачайте **`KiTTYManager-2.0.0-windows-x64.zip`** из [Releases](https://github.com/grusha-time/KiTTY-Manager/releases), распакуйте в доступную для записи папку, например `C:\Tools\KiTTYManager`.
+1. Скачайте **`KiTTYManager-2.1.0-windows-x64.zip`** из [Releases](https://github.com/grusha-time/KiTTY-Manager/releases), распакуйте в доступную для записи папку, например `C:\Tools\KiTTYManager`.
 2. Запустите `KiTTYManager.exe`. Устанавливать .NET отдельно для готового ZIP не нужно.
 3. Создайте сессию или импортируйте папку portable-сессий KiTTY. Укажите адрес, SSH-порт, логин и пароль/ключ, сохраните карточку.
 4. Если сервер доступен с ПК, включите **«Сначала подключаться напрямую, без JH»**. Если нужен вход через другую сеть, настройте [точку входа](wiki/Jumphost.md).

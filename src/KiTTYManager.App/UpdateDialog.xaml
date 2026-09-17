@@ -33,7 +33,7 @@
         </Grid.ColumnDefinitions>
         <StackPanel Grid.Column="0">
           <TextBlock Text="Установленная версия:" Foreground="{StaticResource MutedTextBrush}" FontSize="12"/>
-          <TextBlock x:Name="CurrentVersionText" Text="2.0.0" FontWeight="SemiBold" Margin="0,2,0,0"/>
+          <TextBlock x:Name="CurrentVersionText" Text="2.1.0" FontWeight="SemiBold" Margin="0,2,0,0"/>
         </StackPanel>
         <StackPanel Grid.Column="1">
           <TextBlock Text="Доступный релиз:" Foreground="{StaticResource MutedTextBrush}" FontSize="12"/>
