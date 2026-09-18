@@ -5,12 +5,12 @@ internal sealed partial class SelfTestRunner
 {
     private static void RouteAttemptLimitDefaultsAndRoundTrip()
     {
-        Equal(10, new ManagerConfig().MaxRouteAttempts);
-        Equal(1, new ManagerConfig().MaxGroupServersInRouteAttempts);
+        Equal(20, new ManagerConfig().MaxRouteAttempts);
+        Equal(2, new ManagerConfig().MaxGroupServersInRouteAttempts);
 
         // NormalizeLimit checks
-        Equal(10, RouteAttemptBudget.NormalizeLimit(0));
-        Equal(10, RouteAttemptBudget.NormalizeLimit(-5));
+        Equal(20, RouteAttemptBudget.NormalizeLimit(0));
+        Equal(20, RouteAttemptBudget.NormalizeLimit(-5));
         Equal(100, RouteAttemptBudget.NormalizeLimit(101));
         Equal(1, RouteAttemptBudget.NormalizeLimit(1));
         Equal(100, RouteAttemptBudget.NormalizeLimit(100));
@@ -35,7 +35,7 @@ internal sealed partial class SelfTestRunner
                 MaxGroupServersInRouteAttempts = 0
             });
             loaded = ConfigStore.Load(path);
-            Equal(10, loaded.MaxRouteAttempts);
+            Equal(20, loaded.MaxRouteAttempts);
             Equal(0, loaded.MaxGroupServersInRouteAttempts);
 
             ConfigStore.Save(path, new ManagerConfig
@@ -54,9 +54,9 @@ internal sealed partial class SelfTestRunner
             });
             Equal(0, ConfigStore.Load(path).MaxGroupServersInRouteAttempts);
 
-            // Missing JSON property preserves default (1)
+            // Missing JSON property preserves default (2)
             File.WriteAllText(path, "{}");
-            Equal(1, ConfigStore.Load(path).MaxGroupServersInRouteAttempts);
+            Equal(2, ConfigStore.Load(path).MaxGroupServersInRouteAttempts);
         }
         finally { File.Delete(path); File.Delete(path + ".tmp"); }
     }

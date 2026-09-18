@@ -23,8 +23,8 @@ public sealed class ManagerConfig
     public string FirefoxTemplateProfile { get; set; } = "";
     public int ConnectionTimeoutSeconds { get; set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; set; } = 4;
-    public int MaxRouteAttempts { get; set; } = 10;
-    public int MaxGroupServersInRouteAttempts { get; set; } = 1;
+    public int MaxRouteAttempts { get; set; } = 20;
+    public int MaxGroupServersInRouteAttempts { get; set; } = 2;
     public int TaskConnectionRecoveryMinutes { get; set; } = 1;
     public bool AutoConfirmHostKeys { get; set; } = true;
     public bool SuppressKittyChangeNotifications { get; set; } = true;

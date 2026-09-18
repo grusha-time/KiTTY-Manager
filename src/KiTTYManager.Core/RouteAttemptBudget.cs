@@ -28,7 +28,7 @@ public sealed class RouteAttemptBudget
         remaining = Limit;
     }
 
-    public static int NormalizeLimit(int value) => Math.Clamp(value <= 0 ? 10 : value, 1, 100);
+    public static int NormalizeLimit(int value) => Math.Clamp(value <= 0 ? 20 : value, 1, 100);
 
     public bool TryAcquire()
     {

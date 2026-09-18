@@ -27,8 +27,8 @@ public partial class TextSettingsDialog : Window
     public bool FirefoxAcceptInsecureCerts => FirefoxAcceptInsecureCertsBox.IsChecked == true;
     public int ConnectionTimeoutSeconds { get; private set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; private set; } = 4;
-    public int MaxRouteAttempts { get; private set; } = 10;
-    public int MaxGroupServersInRouteAttempts { get; private set; } = 1;
+    public int MaxRouteAttempts { get; private set; } = 20;
+    public int MaxGroupServersInRouteAttempts { get; private set; } = 2;
     public int TaskConnectionRecoveryMinutes { get; private set; } = 1;
     public TextSettingsDialog(string kittyPath, string firefoxPath, bool closeToTray,
         bool enableLogging = false, int connectionTimeoutSeconds = 10, int endpointProbeTimeoutSeconds = 4,
@@ -46,8 +46,8 @@ public partial class TextSettingsDialog : Window
         bool firefoxCleanRemovedServerContainers = true,
         bool firefoxAcceptInsecureCerts = true,
         bool maximizeKittyWindows = true,
-        int maxRouteAttempts = 10,
-        int maxGroupServersInRouteAttempts = 1)
+        int maxRouteAttempts = 20,
+        int maxGroupServersInRouteAttempts = 2)
     {
         InitializeComponent();
         Width = Math.Min(760, Math.Max(MinWidth, SystemParameters.WorkArea.Width - 48));
