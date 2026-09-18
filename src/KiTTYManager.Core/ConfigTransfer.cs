@@ -119,13 +119,13 @@ public static class ConfigTransfer
         config.EnableLogging = false;
         config.WriteChangesImmediatelyToKitty = false;
         config.MaximizeKittyWindows = true;
-        config.CloseWebTunnelWithFirefox = false;
+        config.CloseWebTunnelWithFirefox = true;
         config.AutoDiscoverFirefoxProfile = true;
         config.FirefoxTemplateProfile = "";
         config.ConnectionTimeoutSeconds = 10;
         config.TaskConnectionRecoveryMinutes = 1;
         config.EndpointProbeTimeoutSeconds = 4;
-        config.RaceBestEntryPoints = false;
+        config.RaceBestEntryPoints = true;
         config.SkipExistingLinksInMapCheck = true;
         config.OfferStartMissingJumphosts = true;
         config.FirefoxOptimizeRamCache = true;

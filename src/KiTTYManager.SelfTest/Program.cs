@@ -468,6 +468,7 @@ internal sealed partial class SelfTestRunner
         Test("Keepalive и автопереподключение KiTTY: генерация routed и minimal сессий", KittyKeepaliveAndReconnectRoutedAndMinimalSessions);
         Test("Keepalive и автопереподключение KiTTY: миграция существующих сессий при обновлении", KittyKeepaliveAndReconnectUpgradeMigration);
         Test("Keepalive и автопереподключение KiTTY: мастер импорта конфигурации", KittyKeepaliveAndReconnectImportWizard);
+        Test("Значения по умолчанию ManagerConfig и допустимость для настроек", SettingsDefaultsAndValidationBounds);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {
@@ -2380,7 +2381,8 @@ internal sealed partial class SelfTestRunner
             EnableLogging = true,
             ConnectionTimeoutSeconds = 120,
             EndpointProbeTimeoutSeconds = 12,
-            RaceBestEntryPoints = true,
+            RaceBestEntryPoints = false,
+            CloseWebTunnelWithFirefox = false,
             SkipExistingLinksInMapCheck = false,
             AutoDiscoverFirefoxProfile = false
         };
@@ -2393,7 +2395,8 @@ internal sealed partial class SelfTestRunner
         Equal(false, exported.EnableLogging);
         Equal(10, exported.ConnectionTimeoutSeconds);
         Equal(4, exported.EndpointProbeTimeoutSeconds);
-        Equal(false, exported.RaceBestEntryPoints);
+        Equal(true, exported.RaceBestEntryPoints);
+        Equal(true, exported.CloseWebTunnelWithFirefox);
         Equal(true, exported.SkipExistingLinksInMapCheck);
         Equal(true, exported.AutoDiscoverFirefoxProfile);
         Equal("", exported.BaseProxies[0].TotpSecret);
@@ -3649,12 +3652,12 @@ internal sealed partial class SelfTestRunner
 
     private static void EntryPointRaceSettingRoundTrip()
     {
-        Equal(false, new ManagerConfig().RaceBestEntryPoints);
+        Equal(true, new ManagerConfig().RaceBestEntryPoints);
         var path = Path.Combine(Path.GetTempPath(), $"kitty-manager-race-{Guid.NewGuid():N}.json");
         try
         {
-            ConfigStore.Save(path, new ManagerConfig { RaceBestEntryPoints = true });
-            Equal(true, ConfigStore.Load(path).RaceBestEntryPoints);
+            ConfigStore.Save(path, new ManagerConfig { RaceBestEntryPoints = false });
+            Equal(false, ConfigStore.Load(path).RaceBestEntryPoints);
         }
         finally { try { File.Delete(path); } catch { } }
     }
@@ -8027,6 +8030,50 @@ internal sealed partial class SelfTestRunner
         Equal(false, mergedServer.EnableTcpKeepalives);
         Equal(false, mergedServer.ReconnectOnConnectionFailure);
         Equal(false, mergedServer.ReconnectOnSystemWakeup);
+    }
+
+    private static void SettingsDefaultsAndValidationBounds()
+    {
+        var config = new ManagerConfig();
+
+        // Числовые параметры и их допустимые диапазоны
+        Equal(10, config.ConnectionTimeoutSeconds);
+        Equal(true, config.ConnectionTimeoutSeconds is >= 3 and <= 600);
+
+        Equal(4, config.EndpointProbeTimeoutSeconds);
+        Equal(true, config.EndpointProbeTimeoutSeconds is >= 1 and <= 30);
+
+        Equal(20, config.MaxRouteAttempts);
+        Equal(true, config.MaxRouteAttempts is >= 1 and <= 100);
+
+        Equal(2, config.MaxGroupServersInRouteAttempts);
+        Equal(true, config.MaxGroupServersInRouteAttempts is >= 0 and <= 100);
+
+        Equal(1, config.TaskConnectionRecoveryMinutes);
+        Equal(true, config.TaskConnectionRecoveryMinutes is >= 0 and <= 99999);
+
+        // Флажки Firefox и веб-панелей
+        Equal(true, config.AutoDiscoverFirefoxProfile);
+        Equal(true, config.CloseWebTunnelWithFirefox);
+        Equal(true, config.FirefoxOptimizeRamCache);
+        Equal(true, config.FirefoxDisableSafeBrowsing);
+        Equal(true, config.FirefoxDisableHistoryAndIcons);
+        Equal(true, config.FirefoxClearCacheOnShutdown);
+        Equal(true, config.FirefoxCleanRemovedServerContainers);
+        Equal(true, config.FirefoxAcceptInsecureCerts);
+
+        // Флажки сети и подключения
+        Equal(true, config.RaceBestEntryPoints);
+        Equal(true, config.OfferStartMissingJumphosts);
+        Equal(true, config.AutoConfirmHostKeys);
+
+        // Флажки поведения приложения и KiTTY
+        Equal(false, config.CloseToTray);
+        Equal(false, config.EnableLogging);
+        Equal(false, config.WriteChangesImmediatelyToKitty);
+        Equal(true, config.SuppressKittyChangeNotifications);
+        Equal(true, config.SkipExistingLinksInMapCheck);
+        Equal(true, config.MaximizeKittyWindows);
     }
 }
 

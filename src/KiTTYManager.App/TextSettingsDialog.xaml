@@ -36,7 +36,7 @@
                        Text="Автопоиск читает %APPDATA%\Mozilla\Firefox\profiles.ini. Исходный профиль копируется только при первом открытии. Далее используется Data/FirefoxContainers/profile. Новые пароли и контейнеры сохраняются там. Смена источника не пересоздаёт существующую копию."/>
             <CheckBox x:Name="CloseWebTunnelBox" Margin="0,16,0,0" Content="Закрывать консоль веб-туннеля после закрытия Firefox"/>
             <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                       Text="По умолчанию выключено: служебная консоль KiTTY остаётся запущенной на панели задач. При включении закрытие последней вкладки контейнера в Firefox автоматически закрывает консоль и освобождает туннель."/>
+                       Text="По умолчанию включено: закрытие последней вкладки контейнера в Firefox автоматически закрывает консоль и освобождает туннель. При выключении служебная консоль KiTTY остаётся запущенной на панели задач."/>
             <CheckBox x:Name="FirefoxOptimizeRamCacheBox" Margin="0,16,0,0" Content="Перенос кэша в оперативную память (отключение дискового кэша)"/>
             <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
                        Text="Отключает запись кэша на диск и держит его в RAM (browser.cache.disk.enable = false, browser.cache.memory.enable = true, browser.cache.memory.capacity = 51200). Экономит 80–90% размера профиля, ускоряет работу веб-консолей за счёт быстрого RAM-кэша. Авторизации, куки и сохранённые пароли не затрагиваются."/>
@@ -80,7 +80,7 @@
                      ToolTip="От 0 до 99999 минут. Массовая задача или Ansible повторяет подключение каждые 10 секунд и не переходит к следующему действию. После таймаута можно продлить ожидание или остановить задачу."/>
             <CheckBox x:Name="RaceBestEntryPointsBox" Margin="0,16,0,0" Content="Параллельно проверять две лучшие точки входа"/>
             <TextBlock Margin="24,6,0,0" Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap"
-                       Text="По умолчанию выключено. Если две лучшие JH уже запущены, менеджер одновременно проверит оба маршрута и возьмёт первый успешный. Это ускоряет отказ недоступной JH, но создаёт два одновременных SSH-подключения."/>
+                       Text="По умолчанию включено. Если две лучшие JH уже запущены, менеджер одновременно проверит оба маршрута и возьмёт первый успешный. Это ускоряет отказ недоступной JH, но создаёт два одновременных SSH-подключения."/>
             <CheckBox x:Name="OfferStartMissingJumphostsBox" Margin="0,16,0,0"
                       Content="При запуске предлагать включить незапущенные точки входа"/>
             <CheckBox x:Name="AutoConfirmHostKeysBox" Margin="0,16,0,0" Content="Автоматически доверять новым и изменённым SSH host key"/>
@@ -118,6 +118,7 @@
       </StackPanel>
     </ScrollViewer>
     <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+      <Button Click="ResetDefaults_Click" Margin="0,0,8,0">По умолчанию</Button>
       <Button IsCancel="True" Margin="0,0,8,0">Отмена</Button>
       <Button Click="Save_Click" IsDefault="True" Style="{StaticResource PrimaryButton}">Сохранить настройки</Button>
     </StackPanel>

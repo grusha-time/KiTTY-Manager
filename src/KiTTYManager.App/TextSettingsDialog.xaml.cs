@@ -1,4 +1,5 @@
 using System.Windows;
+using KiTTYManager.Core;
 
 namespace KiTTYManager.App;
 
@@ -33,9 +34,9 @@ public partial class TextSettingsDialog : Window
     public TextSettingsDialog(string kittyPath, string firefoxPath, bool closeToTray,
         bool enableLogging = false, int connectionTimeoutSeconds = 10, int endpointProbeTimeoutSeconds = 4,
         bool writeChangesImmediatelyToKitty = false,
-        bool closeWebTunnelWithFirefox = false, bool autoDiscoverFirefoxProfile = true,
+        bool closeWebTunnelWithFirefox = true, bool autoDiscoverFirefoxProfile = true,
         string templateProfile = "", bool autoConfirmHostKeys = true,
-        bool suppressKittyChangeNotifications = true, bool raceBestEntryPoints = false,
+        bool suppressKittyChangeNotifications = true, bool raceBestEntryPoints = true,
         bool skipExistingLinksInMapCheck = true,
         string winScpPath = "", bool offerStartMissingJumphosts = true,
         int taskConnectionRecoveryMinutes = 1,
@@ -141,5 +142,50 @@ public partial class TextSettingsDialog : Window
         }
         TaskConnectionRecoveryMinutes = recoveryMinutes;
         DialogResult = true;
+    }
+
+    private void ResetDefaults_Click(object sender, RoutedEventArgs e)
+    {
+        var result = ThemedMessageDialog.Show(this,
+            "Вернуть числовые параметры и переключатели к значениям по умолчанию? Пути к KiTTY, Firefox и WinSCP сохранятся. Изменения вступят в силу после нажатия «Сохранить настройки».",
+            "Сброс настроек",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        if (result != MessageBoxResult.Yes) return;
+        ResetDefaults();
+    }
+
+    private void ResetDefaults()
+    {
+        var defaults = new ManagerConfig();
+
+        // 5 числовых параметров
+        ConnectionTimeoutBox.Text = defaults.ConnectionTimeoutSeconds.ToString();
+        EndpointProbeTimeoutBox.Text = defaults.EndpointProbeTimeoutSeconds.ToString();
+        MaxRouteAttemptsBox.Text = defaults.MaxRouteAttempts.ToString();
+        MaxGroupServersInRouteAttemptsBox.Text = defaults.MaxGroupServersInRouteAttempts.ToString();
+        TaskConnectionRecoveryBox.Text = defaults.TaskConnectionRecoveryMinutes.ToString();
+
+        // 17 флажков
+        AutoDiscoverFirefoxProfileBox.IsChecked = defaults.AutoDiscoverFirefoxProfile;
+        UpdateTemplateControls();
+        CloseWebTunnelBox.IsChecked = defaults.CloseWebTunnelWithFirefox;
+        FirefoxOptimizeRamCacheBox.IsChecked = defaults.FirefoxOptimizeRamCache;
+        FirefoxDisableSafeBrowsingBox.IsChecked = defaults.FirefoxDisableSafeBrowsing;
+        FirefoxDisableHistoryAndIconsBox.IsChecked = defaults.FirefoxDisableHistoryAndIcons;
+        FirefoxClearCacheOnShutdownBox.IsChecked = defaults.FirefoxClearCacheOnShutdown;
+        FirefoxCleanRemovedServerContainersBox.IsChecked = defaults.FirefoxCleanRemovedServerContainers;
+        FirefoxAcceptInsecureCertsBox.IsChecked = defaults.FirefoxAcceptInsecureCerts;
+
+        RaceBestEntryPointsBox.IsChecked = defaults.RaceBestEntryPoints;
+        OfferStartMissingJumphostsBox.IsChecked = defaults.OfferStartMissingJumphosts;
+        AutoConfirmHostKeysBox.IsChecked = defaults.AutoConfirmHostKeys;
+
+        CloseToTrayBox.IsChecked = defaults.CloseToTray;
+        EnableLoggingBox.IsChecked = defaults.EnableLogging;
+        WriteToKittyBox.IsChecked = defaults.WriteChangesImmediatelyToKitty;
+        SuppressKittyChangesBox.IsChecked = defaults.SuppressKittyChangeNotifications;
+        SkipExistingLinksInMapCheckBox.IsChecked = defaults.SkipExistingLinksInMapCheck;
+        MaximizeKittyWindowsBox.IsChecked = defaults.MaximizeKittyWindows;
     }
 }

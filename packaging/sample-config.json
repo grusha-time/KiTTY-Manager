@@ -9,7 +9,7 @@
   "WinScpPath": "",
   "AutoDiscoverFirefoxProfile": true,
   "FirefoxTemplateProfile": "",
-  "CloseWebTunnelWithFirefox": false,
+  "CloseWebTunnelWithFirefox": true,
   "ConnectionTimeoutSeconds": 10,
   "TaskConnectionRecoveryMinutes": 1,
   "OfferStartMissingJumphosts": true,
