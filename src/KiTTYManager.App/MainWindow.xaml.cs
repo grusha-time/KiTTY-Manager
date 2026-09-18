@@ -3509,7 +3509,8 @@ public partial class MainWindow : Window
             config.FirefoxCleanRemovedServerContainers,
             config.FirefoxAcceptInsecureCerts,
             config.MaximizeKittyWindows,
-            config.MaxRouteAttempts) { Owner = this };
+            config.MaxRouteAttempts,
+            config.MaxGroupServersInRouteAttempts) { Owner = this };
         if (dialog.ShowDialog() != true) return;
         config.KittyPath = dialog.KittyPath; config.FirefoxPath = dialog.FirefoxPath;
         config.WinScpPath = dialog.WinScpPath;
@@ -3519,6 +3520,7 @@ public partial class MainWindow : Window
         config.EnableLogging = dialog.EnableLogging; config.ConnectionTimeoutSeconds = dialog.ConnectionTimeoutSeconds;
         config.EndpointProbeTimeoutSeconds = dialog.EndpointProbeTimeoutSeconds;
         config.MaxRouteAttempts = dialog.MaxRouteAttempts;
+        config.MaxGroupServersInRouteAttempts = dialog.MaxGroupServersInRouteAttempts;
         config.TaskConnectionRecoveryMinutes = dialog.TaskConnectionRecoveryMinutes;
         config.WriteChangesImmediatelyToKitty = dialog.WriteChangesImmediatelyToKitty;
         config.MaximizeKittyWindows = dialog.MaximizeKittyWindows;
