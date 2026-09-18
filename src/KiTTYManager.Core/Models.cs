@@ -18,7 +18,7 @@ public sealed class ManagerConfig
     public bool EnableLogging { get; set; }
     public bool WriteChangesImmediatelyToKitty { get; set; }
     public bool MaximizeKittyWindows { get; set; } = true;
-    public bool CloseWebTunnelWithFirefox { get; set; }
+    public bool CloseWebTunnelWithFirefox { get; set; } = true;
     public bool AutoDiscoverFirefoxProfile { get; set; } = true;
     public string FirefoxTemplateProfile { get; set; } = "";
     public int ConnectionTimeoutSeconds { get; set; } = 10;
@@ -28,7 +28,7 @@ public sealed class ManagerConfig
     public int TaskConnectionRecoveryMinutes { get; set; } = 1;
     public bool AutoConfirmHostKeys { get; set; } = true;
     public bool SuppressKittyChangeNotifications { get; set; } = true;
-    public bool RaceBestEntryPoints { get; set; }
+    public bool RaceBestEntryPoints { get; set; } = true;
     public bool SkipExistingLinksInMapCheck { get; set; } = true;
     public bool OfferStartMissingJumphosts { get; set; } = true;
     public bool FirefoxOptimizeRamCache { get; set; } = true;
