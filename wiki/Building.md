@@ -61,7 +61,7 @@ bash packaging/build-package.sh
 Скрипт проверяет runtime до и после копирования, публикует приложение, собирает:
 
 ```text
-dist/KiTTYManager-2.0.0-windows-x64.zip
+dist/KiTTYManager-2.1.1-windows-x64.zip
   KiTTYManager.exe
   KiTTY/kitty.exe, kitty.ini, LICENCE.TXT
   Runtime/Ansible/...
@@ -74,8 +74,8 @@ dist/KiTTYManager-2.0.0-windows-x64.zip
 Проверка результата:
 
 ```sh
-python3 -m zipfile -t dist/KiTTYManager-2.0.0-windows-x64.zip
-sha256sum dist/KiTTYManager-2.0.0-windows-x64.zip
+python3 -m zipfile -t dist/KiTTYManager-2.1.1-windows-x64.zip
+sha256sum dist/KiTTYManager-2.1.1-windows-x64.zip
 ```
 
 Дополнительно проверьте содержимое архива и работу на Windows: открытие справки/поиск, сохранение карточки, SSH, используемые Firefox/WinSCP/Ansible-сценарии. Локальный commit не публикует ни GitHub release, ни ZIP; публикация выполняется отдельным действием.

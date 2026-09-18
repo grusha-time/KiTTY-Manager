@@ -7,7 +7,7 @@ internal sealed partial class SelfTestRunner
 {
     private static void Version2Metadata()
     {
-        Equal("2.1.0", ProductInfo.Version);
+        Equal("2.1.1", ProductInfo.Version);
         Equal(9, new ManagerConfig().SchemaVersion);
         Equal(1, new ManagerConfig().TaskConnectionRecoveryMinutes);
     }

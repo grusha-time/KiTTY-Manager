@@ -30,9 +30,9 @@ python3 "$ROOT/packaging/verify-ansible-runtime.py" "$ROOT/build/package/Runtime
 ZIP_NAME="${1:-}"
 if [ -z "$ZIP_NAME" ]; then
   if [ "$BRANCH_SAFE" = "master" ] || [ "$BRANCH_SAFE" = "main" ]; then
-    ZIP_NAME="KiTTYManager-2.1.0-windows-x64.zip"
+    ZIP_NAME="KiTTYManager-2.1.1-windows-x64.zip"
   else
-    ZIP_NAME="KiTTYManager-2.1.0-${BRANCH_SAFE}-windows-x64.zip"
+    ZIP_NAME="KiTTYManager-2.1.1-${BRANCH_SAFE}-windows-x64.zip"
   fi
 fi
 

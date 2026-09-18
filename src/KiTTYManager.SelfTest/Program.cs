@@ -97,7 +97,7 @@ internal sealed partial class SelfTestRunner
         Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);
         Test("Миграция schema 9 сохраняет данные и сбрасывает только старые InternalOnly", Schema9MigrationPreservesUserData);
         Test("Выбор только независимых серверов группы при построении связей", ConnectivityGroupSelectionStateTests);
-        Test("Версия продукта 2.1.0 и схема 9", Version2Metadata);
+        Test("Версия продукта 2.1.1 и схема 9", Version2Metadata);
         Test("Миграция схемы 7 в 8 сохраняет старые данные", Version2SchemaMigration);
         Test("Таймаут подключения допускает минимум 3 секунды", Version2ConnectionTimeoutMinimum);
         Test("WinSCP использует локальный маршрут и передаёт пароль напрямую", WinScpRouteArguments);
