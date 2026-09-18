@@ -7,13 +7,13 @@
 
 ## Учебные задачи
 
-Файлы лежат в [`examples/batch-tasks/`](../examples/batch-tasks/). Примеры доступны в репозитории и не входят в релизный ZIP. Заранее скачайте исходники репозитория либо весь каталог примеров. Копируйте папку Ansible целиком: ей нужны соседние материалы.
+Файлы лежат в [`examples/batch-tasks/`](https://github.com/grusha-time/KiTTY-Manager/tree/master/examples/batch-tasks). Примеры доступны в репозитории и не входят в релизный ZIP. Заранее скачайте исходники репозитория либо весь каталог примеров. Копируйте папку Ansible целиком: ей нужны соседние материалы.
 
 | Режим | Что открыть | Что понадобится |
 |---|---|---|
-| Конструктор | [`task-safe-smoke.kmtask`](../examples/batch-tasks/task-safe-smoke.kmtask) | Linux, SSH/SFTP, `sh`, обычные Unix-утилиты, Python 3, `tar`, `gzip` |
-| Конструктор (туннели) | [`task-tunnel-smoke.kmtask`](../examples/batch-tasks/task-tunnel-smoke.kmtask) | SSH-сервер с разрешённым пробросом портов, Python 3 на сервере |
-| Ansible | [`ansible/ansible-safe-smoke.yml`](../examples/batch-tasks/ansible/ansible-safe-smoke.yml) | Linux с Python 3 и `tar`, настроенные SSH-сессии, готовый встроенный Ansible runtime |
+| Конструктор | [`task-safe-smoke.kmtask`](https://github.com/grusha-time/KiTTY-Manager/blob/master/examples/batch-tasks/task-safe-smoke.kmtask) | Linux, SSH/SFTP, `sh`, обычные Unix-утилиты, Python 3, `tar`, `gzip` |
+| Конструктор (туннели) | [`task-tunnel-smoke.kmtask`](https://github.com/grusha-time/KiTTY-Manager/blob/master/examples/batch-tasks/task-tunnel-smoke.kmtask) | SSH-сервер с разрешённым пробросом портов, Python 3 на сервере |
+| Ansible | [`ansible/ansible-safe-smoke.yml`](https://github.com/grusha-time/KiTTY-Manager/blob/master/examples/batch-tasks/ansible/ansible-safe-smoke.yml) | Linux с Python 3 и `tar`, настроенные SSH-сессии, готовый встроенный Ansible runtime |
 
 Обычный запуск не требует root, Интернета, внешнего HTTP-сервера или Vault-пароля. Задачи не устанавливают пакеты и не меняют службы. Начните с одного тестового сервера, затем выберите несколько **разных** серверов. Не выбирайте две сессии одного физического сервера для конструктора: у него один фиксированный рабочий путь.
 
@@ -108,7 +108,7 @@
 
 Для проверки повышения прав добавьте **перед очисткой** отдельный `Check`: команда `id -u`, ожидаемый текст `0`, включённое повышение прав. Запускайте под обычной SSH-учёткой с настроенным в сессии `sudo`/`su`. Поля «Выполнить под учётной записью» поддерживаются для Command, Check, MakeDirectory, Delete, WaitForText и InteractiveWaitAndSend. Для Upload, Download, Template, ReplaceText и InteractiveSend такое сочетание отклоняется до запуска; используйте отдельную команду или Ansible. Не включайте повышенные права на всю учебную задачу: обычный SFTP продолжает использовать SSH-учётку.
 
-Исходник пакета — [`constructor/task.yaml`](../examples/batch-tasks/constructor/task.yaml) и соседняя папка `files/`. Несмотря на расширение `.yaml`, конструктор читает **JSON**, являющийся подмножеством YAML 1.2. Произвольный YAML для этого режима не подходит. `.kmtask` — ZIP с `task.yaml` в корне. После правки исходника пересоздайте пакет через экспорт интерфейса либо ZIP содержимого `constructor/`, без внешней папки `constructor`.
+Исходник пакета — [`constructor/task.yaml`](https://github.com/grusha-time/KiTTY-Manager/blob/master/examples/batch-tasks/constructor/task.yaml) и соседняя папка `files/`. Несмотря на расширение `.yaml`, конструктор читает **JSON**, являющийся подмножеством YAML 1.2. Произвольный YAML для этого режима не подходит. `.kmtask` — ZIP с `task.yaml` в корне. После правки исходника пересоздайте пакет через экспорт интерфейса либо ZIP содержимого `constructor/`, без внешней папки `constructor`.
 
 ## Ansible: запустить пример
 

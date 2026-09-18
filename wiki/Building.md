@@ -1,6 +1,6 @@
 # Сборка, тесты и Windows ZIP
 
-Раздел для разработчиков. Пользователю готового дистрибутива достаточно [инструкции установки](Installation.md).
+Раздел для разработчиков. Пользователю готового дистрибутива достаточно [инструкции установки](Installation).
 
 ## Зависимости
 
@@ -26,7 +26,7 @@ scripts/project-source.sh check
 dotnet run --project src/KiTTYManager.SelfTest -- --filter HelpSearch
 ```
 
-Если системного `dotnet` нет, используйте `.dotnet/dotnet`. Пакет SDK из некоторых Linux-дистрибутивов может не содержать WindowsDesktop targets (ошибка MSB4019); для WPF используйте полноценный локальный SDK в `.dotnet`, как штатный упаковщик. Упаковщик сейчас обращается именно к `.dotnet/dotnet`: перед упаковкой этот путь должен существовать. [Мутации и ограничения тестов](Test-Audit.md).
+Если системного `dotnet` нет, используйте `.dotnet/dotnet`. Пакет SDK из некоторых Linux-дистрибутивов может не содержать WindowsDesktop targets (ошибка MSB4019); для WPF используйте полноценный локальный SDK в `.dotnet`, как штатный упаковщик. Упаковщик сейчас обращается именно к `.dotnet/dotnet`: перед упаковкой этот путь должен существовать. [Мутации и ограничения тестов](Test-Audit).
 
 Для установки полноценного SDK в ожидаемую упаковщиком папку (требуется сеть):
 
@@ -39,7 +39,7 @@ scripts/project-source.sh install
 
 ## Ansible runtime
  
-Он не возникает от обычного `dotnet build` и не хранится в git из-за размера (образ Linux ~384 МБ). Подробности в [packaging/ansible-runtime/README.md](../packaging/ansible-runtime/README.md).
+Он не возникает от обычного `dotnet build` и не хранится в git из-за размера (образ Linux ~384 МБ). Подробности в [packaging/ansible-runtime/README.md](https://github.com/grusha-time/KiTTY-Manager/blob/master/packaging/ansible-runtime/README.md).
  
 ```sh
 # Проверить уже подготовленный комплект:
