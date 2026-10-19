@@ -49,6 +49,7 @@ public partial class MainWindow : Window
     private LinkMapWindow? linkMapWindow;
     private BatchTaskWindow? batchTaskWindow;
     private ActiveTunnelsWindow? activeTunnelsWindow;
+    private SmartDiscoveryWindow? smartDiscoveryWindow;
     private readonly TunnelService tunnelService;
     private readonly Dictionary<Guid, QuickDuplicateDialog> quickDuplicateWindows = [];
     private bool batchExitPending;
@@ -3685,6 +3686,7 @@ public partial class MainWindow : Window
     private void More_Click(object sender, RoutedEventArgs e)
     {
         var menu = new ContextMenu();
+        var smartDiscovery = new MenuItem { Header = "Массовое добавление сессий…" }; smartDiscovery.Click += ShowSmartDiscovery_Click;
         var export = new MenuItem { Header = "Экспорт JSON…" }; export.Click += Export_Click;
         var import = new MenuItem { Header = "Импорт JSON…" }; import.Click += ImportConfig_Click;
         var rollbackImport = new MenuItem { Header = "Откатить последний импорт" };
@@ -3701,7 +3703,7 @@ public partial class MainWindow : Window
         var update = new MenuItem { Header = "Обновление KiTTY Manager" }; update.Click += (_, _) => ShowUpdateDialog();
         var about = new MenuItem { Header = "О программе…" }; about.Click += (_, _) => ShowAbout();
         var exit = new MenuItem { Header = "Выйти" }; exit.Click += (_, _) => ExitApplication();
-        menu.Items.Add(activeTunnels); menu.Items.Add(jumphosts); menu.Items.Add(settings); menu.Items.Add(new Separator());
+        menu.Items.Add(smartDiscovery); menu.Items.Add(activeTunnels); menu.Items.Add(jumphosts); menu.Items.Add(settings); menu.Items.Add(new Separator());
         menu.Items.Add(changes); menu.Items.Add(resetIgnored); menu.Items.Add(new Separator()); menu.Items.Add(export); menu.Items.Add(import); menu.Items.Add(rollbackImport);
         menu.Items.Add(logs); menu.Items.Add(help); menu.Items.Add(update); menu.Items.Add(about); menu.Items.Add(exit); menu.PlacementTarget = sender as UIElement; menu.IsOpen = true;
     }
@@ -3746,6 +3748,31 @@ public partial class MainWindow : Window
     }
     private void ShowBatchTasks_Click(object sender, RoutedEventArgs e) => ShowBatchTasks();
     private void ShowLinkMap_Click(object sender, RoutedEventArgs e) => ShowLinkMap();
+
+    private void ShowSmartDiscovery()
+    {
+        if (smartDiscoveryWindow is not null)
+        {
+            if (smartDiscoveryWindow.WindowState == WindowState.Minimized)
+                smartDiscoveryWindow.WindowState = WindowState.Normal;
+            smartDiscoveryWindow.Activate();
+            return;
+        }
+        smartDiscoveryWindow = new SmartDiscoveryWindow(
+            () => config,
+            async (proxy, token) => await EnsureManagedJumphostAsync(token, true, proxyId: proxy.Id, isManualLaunch: true).ConfigureAwait(true),
+            () =>
+            {
+                SaveAndRefresh();
+            },
+            ConfirmHostKey)
+        {
+            Owner = this
+        };
+        smartDiscoveryWindow.Closed += (_, _) => smartDiscoveryWindow = null;
+        smartDiscoveryWindow.Show();
+    }
+    private void ShowSmartDiscovery_Click(object sender, RoutedEventArgs e) => ShowSmartDiscovery();
 
     private void ShowActiveTunnels()
     {

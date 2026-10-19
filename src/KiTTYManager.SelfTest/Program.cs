@@ -469,6 +469,14 @@ internal sealed partial class SelfTestRunner
         Test("Keepalive и автопереподключение KiTTY: миграция существующих сессий при обновлении", KittyKeepaliveAndReconnectUpgradeMigration);
         Test("Keepalive и автопереподключение KiTTY: мастер импорта конфигурации", KittyKeepaliveAndReconnectImportWizard);
         Test("Значения по умолчанию ManagerConfig и допустимость для настроек", SettingsDefaultsAndValidationBounds);
+        Test("Умное массовое добавление: парсинг хостов, логинов и паролей", SmartDiscoveryInputParserTests);
+        Test("Умное массовое добавление: генератор имён сессий и сопоставление токенов", SmartSessionNameGeneratorTests);
+        Test("Умное массовое добавление: приоритизация учётных данных и лимиты попыток", CredentialPrioritizationAndLimitsTests);
+        Test("Умное массовое добавление: порядок проверки повышения привилегий su/sudo", PrivilegeEscalationOrderingTests);
+        Test("Умное массовое добавление: многошаговое обнаружение и защита от циклов", MultiHopDiscoveryAndCyclePreventionTests);
+        Test("Умное массовое добавление: сохранение найденного при отмене сканирования", CancellationPreservesDiscoveredCandidatesTests);
+        Test("Умное массовое добавление: повтор проверок для проблемных хостов", StageSpecificRetryTests);
+        Test("Умное массовое добавление: создание сессий, группы, связи и валидация", SessionCreationAndLinkRegistrationTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {
