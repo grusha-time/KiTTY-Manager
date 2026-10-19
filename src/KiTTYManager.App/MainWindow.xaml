@@ -97,7 +97,6 @@
                 <MenuItem Header="Копировать строку" Command="ApplicationCommands.Copy"/>
                 <Separator/>
                 <MenuItem Header="Создать новую сессию" Click="CreateSession_Click"/>
-                <MenuItem Header="Умное массовое добавление сессий…" Click="ShowSmartDiscovery_Click"/>
                 <MenuItem Header="Дублировать сессию" Click="DuplicateSession_Click"/>
                 <MenuItem Header="Быстрый дубль" Click="QuickDuplicateSession_Click"/>
                 <Separator/>

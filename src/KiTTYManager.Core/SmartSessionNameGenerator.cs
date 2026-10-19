@@ -158,22 +158,33 @@ public static class SmartSessionNameGenerator
             }
         }
 
-        // 4. Derive Region
-        // 4a. Target group / subgroup if provided
+        // 4. Derive Region and Site from target group, IP subnet (/24) and hostname tokens
+        // 4a. Target group: a nested path contributes region and site, a top-level group is the
+        // region unless a matching /24 server proves a different region (then it becomes the site).
+        string? groupSiteCandidate = null;
+        string? topLevelGroupName = null;
         if (targetGroupId.HasValue)
         {
             var group = config.FindGroup(targetGroupId.Value);
             if (group != null && !IsGenericGroupName(group.Name))
-                region = group.Name;
-        }
-
-        if (region == null && !string.IsNullOrWhiteSpace(targetSubgroupName) && !IsGenericGroupName(targetSubgroupName))
-        {
-            region = targetSubgroupName;
+            {
+                var pathParts = config.GroupPath(group.Id)
+                    .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                if (pathParts.Length > 1)
+                {
+                    region = pathParts[0];
+                    groupSiteCandidate = pathParts[^1];
+                }
+                else
+                {
+                    topLevelGroupName = group.Name;
+                }
+            }
         }
 
         // 4b. Match region from IP subnet (/24) among existing servers
-        if (region == null && IPAddress.TryParse(ip, out var parsedIp) && parsedIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        string? subnetRegion = null;
+        if (IPAddress.TryParse(ip, out var parsedIp) && parsedIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
         {
             var lastDot = ip.LastIndexOf('.');
             if (lastDot > 0)
@@ -182,10 +193,26 @@ public static class SmartSessionNameGenerator
                 var matchingSubnetServer = config.AllServers().FirstOrDefault(s => s.Host.StartsWith(subnetPrefix, StringComparison.Ordinal));
                 if (matchingSubnetServer != null)
                 {
-                    region = ExtractRegionFromExistingServer(matchingSubnetServer, config);
+                    subnetRegion = ExtractRegionFromExistingServer(matchingSubnetServer, config);
                 }
             }
         }
+
+        if (region == null && topLevelGroupName != null)
+        {
+            if (subnetRegion != null && !string.Equals(subnetRegion, topLevelGroupName, StringComparison.OrdinalIgnoreCase))
+            {
+                region = subnetRegion;
+                groupSiteCandidate = topLevelGroupName;
+            }
+            else
+            {
+                region = topLevelGroupName;
+            }
+        }
+
+        if (region == null)
+            region = subnetRegion;
 
         // 4c. Region from hostname tokens (e.g. "ny" -> "New York", or token matching group name)
         if (region == null)
@@ -209,35 +236,49 @@ public static class SmartSessionNameGenerator
             }
         }
 
-        // 5. Role and remaining tokens
-        var roleOrToken = role ?? (remainingTokens.Count > 0 ? Capitalize(remainingTokens[0]) : null);
-        if (role == null && remainingTokens.Count > 0)
+        // 4d. An explicit subgroup name is the most specific site when it differs from the region
+        if (!string.IsNullOrWhiteSpace(targetSubgroupName) && !IsGenericGroupName(targetSubgroupName) &&
+            !string.Equals(targetSubgroupName, region, StringComparison.OrdinalIgnoreCase))
+        {
+            groupSiteCandidate = targetSubgroupName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(groupSiteCandidate))
+            site = groupSiteCandidate;
+
+        // Remove hostname tokens already represented by the resolved region or site
+        for (var i = remainingTokens.Count - 1; i >= 0; i--)
+        {
+            var token = remainingTokens[i];
+            if (region != null && string.Equals(token, region, StringComparison.OrdinalIgnoreCase) ||
+                site != null && string.Equals(token, site, StringComparison.OrdinalIgnoreCase))
+            {
+                remainingTokens.RemoveAt(i);
+            }
+        }
+
+        // 5. Role and remaining tokens; a leftover token is not promoted to role when a site exists
+        var roleOrToken = role ?? (site == null && remainingTokens.Count > 0 ? Capitalize(remainingTokens[0]) : null);
+        if (role == null && site == null && remainingTokens.Count > 0)
         {
             remainingTokens.RemoveAt(0);
         }
 
         // 6. Build proposed name components:
-        // When role is present: [Region] [Role] [Site] [Identifier] (e.g. "Group Main S1", "Chicago App Prod S2")
+        // When role is present: [Region] [Role] [Identifier] [Site] (e.g. "Group S1 Main", "Chicago App S2 Prod")
         // When role is absent: [Region] [Identifier] [Site] (e.g. "Chicago S5 Reserve")
         var parts = new List<string>();
         if (!string.IsNullOrWhiteSpace(region))
             parts.Add(region);
 
         if (roleOrToken != null)
-        {
             parts.Add(roleOrToken);
-            if (!string.IsNullOrWhiteSpace(site))
-                parts.Add(site);
-            if (!string.IsNullOrWhiteSpace(identifier))
-                parts.Add(identifier);
-        }
-        else
-        {
-            if (!string.IsNullOrWhiteSpace(identifier))
-                parts.Add(identifier);
-            if (!string.IsNullOrWhiteSpace(site))
-                parts.Add(site);
-        }
+
+        if (!string.IsNullOrWhiteSpace(identifier))
+            parts.Add(identifier);
+
+        if (!string.IsNullOrWhiteSpace(site))
+            parts.Add(site);
 
         string baseName;
         if (parts.Count > 0)
@@ -309,7 +350,13 @@ public static class SmartSessionNameGenerator
     {
         var group = config.FindServerGroup(server.Id);
         if (group != null && !IsGenericGroupName(group.Name))
+        {
+            var pathParts = config.GroupPath(group.Id)
+                .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (pathParts.Length > 0 && !IsGenericGroupName(pathParts[0]))
+                return pathParts[0];
             return group.Name;
+        }
 
         // Otherwise check first word of server name
         var words = server.Name.Split(new[] { ' ', '-' }, StringSplitOptions.RemoveEmptyEntries);

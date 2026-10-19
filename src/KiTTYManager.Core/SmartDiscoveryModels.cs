@@ -12,6 +12,7 @@ public sealed class SmartDiscoveryOptions
     public Guid? TargetGroupId { get; set; }
     public string? TargetSubgroupName { get; set; }
     public BaseProxy? JumpHost { get; set; }
+    public bool AutoSelectJumpHost { get; set; }
     public int MaxParallelConnections { get; set; } = 4;
     public int MaxAttemptsPerHost { get; set; } = 5;
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(10);

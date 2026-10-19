@@ -478,6 +478,10 @@ public sealed class SmartDiscoveryEngine
     private readonly IProgress<SmartDiscoveryProgress>? progress;
     private readonly IReadOnlyList<DiscoveredServerCandidate>? initialGateways;
     private readonly Func<ManagedServer, string, bool>? hostKeyVerifier;
+    private readonly Action<string>? log;
+    private readonly Func<BaseProxy, CancellationToken, Task<bool>>? ensureEntryPoint;
+    private readonly object entryPointReadinessLock = new();
+    private readonly Dictionary<Guid, Task<bool>> entryPointReadiness = [];
 
     public SmartDiscoveryEngine(
         ManagerConfig config,
@@ -485,7 +489,9 @@ public sealed class SmartDiscoveryEngine
         ISmartDiscoveryProbe? probe = null,
         IProgress<SmartDiscoveryProgress>? progress = null,
         IReadOnlyList<DiscoveredServerCandidate>? initialGateways = null,
-        Func<ManagedServer, string, bool>? hostKeyVerifier = null)
+        Func<ManagedServer, string, bool>? hostKeyVerifier = null,
+        Action<string>? log = null,
+        Func<BaseProxy, CancellationToken, Task<bool>>? ensureEntryPoint = null)
     {
         this.config = config;
         this.options = options;
@@ -493,6 +499,8 @@ public sealed class SmartDiscoveryEngine
         this.probe = probe ?? new DefaultSmartDiscoveryProbe(config.AutoConfirmHostKeys, hostKeyVerifier);
         this.progress = progress;
         this.initialGateways = initialGateways;
+        this.log = log;
+        this.ensureEntryPoint = ensureEntryPoint;
     }
 
     public async Task<SmartDiscoveryResult> DiscoverAsync(CancellationToken cancellationToken = default)
@@ -528,23 +536,39 @@ public sealed class SmartDiscoveryEngine
 
         var maxParallel = Math.Max(1, options.MaxParallelConnections);
         var semaphore = new SemaphoreSlim(maxParallel, maxParallel);
+        var entryPoints = ResolveEntryPoints();
+
+        LogScanStart(totalCount, entryPoints);
 
         try
         {
-            // Phase 1: Probe reachability directly or via selected JumpHost
+            // Phase 1: Probe reachability directly or via an entry point
             ReportProgress(SmartDiscoveryProgressKind.ReachabilityProbing, "", "Фаза 1: Проверка сетевой доступности портов 22...", discovered.Count, problematic.Count, totalCount, 5);
+            Log("Фаза 1: проверка сетевой доступности порта 22.");
 
-            var reachabilityResults = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var reachableVia = new Dictionary<string, BaseProxy?>(StringComparer.OrdinalIgnoreCase);
             var reachabilityTasks = targetHosts.Select(async host =>
             {
                 await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
-                    var isReachable = await probe.ProbeReachabilityAsync(
-                        options.JumpHost, host, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
-                    lock (syncLock)
+                    foreach (var entryPoint in entryPoints)
                     {
-                        reachabilityResults[host] = isReachable;
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
+                            continue;
+
+                        var isReachable = await probe.ProbeReachabilityAsync(
+                            entryPoint, host, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                        Log($"Хост {host}: доступность через {DescribeEntryPoint(entryPoint)} — {(isReachable ? "успех" : "неудача")}.");
+                        if (isReachable)
+                        {
+                            lock (syncLock)
+                            {
+                                reachableVia[host] = entryPoint;
+                            }
+                            return;
+                        }
                     }
                 }
                 finally
@@ -555,19 +579,21 @@ public sealed class SmartDiscoveryEngine
 
             await Task.WhenAll(reachabilityTasks).ConfigureAwait(false);
 
-            var directlyReachable = targetHosts.Where(h => reachabilityResults.TryGetValue(h, out var ok) && ok).ToList();
-            var unreachableHosts = targetHosts.Where(h => !reachabilityResults.TryGetValue(h, out var ok) || !ok).ToList();
+            var directlyReachable = targetHosts.Where(reachableVia.ContainsKey).ToList();
+            var unreachableHosts = targetHosts.Where(h => !reachableVia.ContainsKey(h)).ToList();
 
             // Phase 2: Credential verification on directly reachable hosts
             ReportProgress(SmartDiscoveryProgressKind.AuthenticationProbing, "", $"Фаза 2: Проверка учётных данных ({directlyReachable.Count} доступных узлов)...", discovered.Count, problematic.Count, totalCount, 25);
+            Log($"Фаза 2: проверка учётных данных для {directlyReachable.Count} доступных хостов.");
 
             var authTasks = directlyReachable.Select(async host =>
             {
                 await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
+                    reachableVia.TryGetValue(host, out var winningEntryPoint);
                     var (candidate, problem) = await AuthenticateHostAsync(
-                        host, intermediateGateways: [], hopHops: [], cancellationToken).ConfigureAwait(false);
+                        host, winningEntryPoint, intermediateGateways: [], hopHops: [], cancellationToken).ConfigureAwait(false);
 
                     lock (syncLock)
                     {
@@ -579,11 +605,13 @@ public sealed class SmartDiscoveryEngine
                             confirmedCredentials.RemoveAll(c => c.User == candidate.Username && c.Pass == candidate.Password);
                             confirmedCredentials.Insert(0, (candidate.Username, candidate.Password));
                             ReportProgress(SmartDiscoveryProgressKind.HostSucceeded, host, $"Сессия найдена: {candidate.ProposedName}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
+                            Log($"Хост {host}: сессия \"{candidate.ProposedName}\" найдена через {DescribeVerifiedEntryPoint(candidate.VerifiedProxyId)}.");
                         }
                         else if (problem != null)
                         {
                             problematic.Add(problem);
                             ReportProgress(SmartDiscoveryProgressKind.HostFailed, host, $"Ошибка: {problem.Reason}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
+                            Log($"Хост {host}: ошибка на этапе \"{problem.Stage}\".");
                         }
                     }
                 }
@@ -600,6 +628,7 @@ public sealed class SmartDiscoveryEngine
             if (unreachableHosts.Count > 0 && allKnownGateways.Count > 0)
             {
                 ReportProgress(SmartDiscoveryProgressKind.MultiHopProbing, "", $"Фаза 3: Поиск multi-hop маршрутов ({unreachableHosts.Count} недоступных хостов)...", discovered.Count, problematic.Count, totalCount, 60);
+                Log($"Фаза 3: поиск multi-hop маршрутов для {unreachableHosts.Count} недоступных хостов.");
 
                 var availableGateways = allKnownGateways.ToList();
                 const int maxHops = 3;
@@ -630,13 +659,19 @@ public sealed class SmartDiscoveryEngine
                             if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
                                 continue;
 
-                            var canHop = await probe.ProbeHopReachabilityAsync(
-                                options.JumpHost, gatewayChain, targetHost, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
-
-                            if (canHop)
+                            foreach (var entryPoint in entryPoints)
                             {
+                                if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
+                                    continue;
+
+                                var canHop = await probe.ProbeHopReachabilityAsync(
+                                    entryPoint, gatewayChain, targetHost, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                                Log($"Фаза 3: хост {targetHost} через шлюз {gateway.ProposedName} и {DescribeEntryPoint(entryPoint)} — {(canHop ? "доступен" : "недоступен")}.");
+
+                                if (!canHop) continue;
+
                                 var (candidate, hopProblem) = await AuthenticateHostAsync(
-                                    targetHost, gatewayChain, gateway.RouteHops, cancellationToken, previousServerId: gateway.Id).ConfigureAwait(false);
+                                    targetHost, entryPoint, gatewayChain, gateway.RouteHops, cancellationToken, previousServerId: gateway.Id).ConfigureAwait(false);
 
                                 if (candidate != null)
                                 {
@@ -657,13 +692,26 @@ public sealed class SmartDiscoveryEngine
 
                                         ReportProgress(SmartDiscoveryProgressKind.HostSucceeded, targetHost, $"Сессия найдена через {gateway.ProposedName}: {candidate.ProposedName}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
                                     }
+                                    Log($"Хост {targetHost}: сессия \"{candidate.ProposedName}\" найдена через шлюз {gateway.ProposedName} и {DescribeVerifiedEntryPoint(candidate.VerifiedProxyId)}.");
+                                    break;
                                 }
-                                else if (hopProblem != null)
+
+                                if (hopProblem != null)
                                 {
                                     lock (syncLock)
                                     {
                                         lastHostProblems[targetHost] = hopProblem;
                                     }
+                                }
+
+                                // An authentication or host-key problem will not change through another entry point.
+                                if (hopProblem?.Stage != "Доступность")
+                                    break;
+
+                                lock (syncLock)
+                                {
+                                    if (hostAttempts.TryGetValue(targetHost, out var used) && used >= options.MaxAttemptsPerHost)
+                                        break;
                                 }
                             }
                         }
@@ -699,16 +747,34 @@ public sealed class SmartDiscoveryEngine
             }
 
             ReportProgress(SmartDiscoveryProgressKind.Completed, "", $"Сканирование завершено: найдено {discovered.Count}, проблемных {problematic.Count}.", discovered.Count, problematic.Count, totalCount, 100);
+            Log($"Сканирование завершено: найдено {discovered.Count}, проблемных {problematic.Count}.");
             return new SmartDiscoveryResult(discovered, problematic);
         }
         catch (OperationCanceledException)
         {
             ReportProgress(SmartDiscoveryProgressKind.Cancelled, "", $"Сканирование остановлено пользователем. Найдено {discovered.Count} сессий.", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
+            Log($"Сканирование отменено: найдено {discovered.Count}, проблемных {problematic.Count}.");
             return new SmartDiscoveryResult(discovered, problematic);
+        }
+
+        IReadOnlyList<BaseProxy?> ResolveAttemptEntryPoints(BaseProxy? winningEntryPoint)
+        {
+            if (!options.AutoSelectJumpHost || entryPoints.Count <= 1)
+                return [winningEntryPoint];
+
+            var ordered = new List<BaseProxy?>(entryPoints.Count);
+            if (winningEntryPoint != null) ordered.Add(winningEntryPoint);
+            foreach (var point in entryPoints)
+            {
+                if (point?.Id == winningEntryPoint?.Id) continue;
+                ordered.Add(point);
+            }
+            return ordered;
         }
 
         async Task<(DiscoveredServerCandidate? Candidate, ProblematicServerCandidate? Problem)> AuthenticateHostAsync(
             string host,
+            BaseProxy? entryPoint,
             IReadOnlyList<ManagedServer> intermediateGateways,
             IReadOnlyList<RouteHop> hopHops,
             CancellationToken ct,
@@ -727,88 +793,117 @@ public sealed class SmartDiscoveryEngine
             foreach (var (u, p) in orderedCredentials)
             {
                 ct.ThrowIfCancellationRequested();
+                var stopAll = false;
 
-                int currentAttempts;
-                lock (syncLock)
+                foreach (var attemptEntryPoint in ResolveAttemptEntryPoints(entryPoint))
                 {
-                    hostAttempts.TryGetValue(host, out currentAttempts);
-                    if (currentAttempts >= maxAttempts)
-                    {
-                        lastReason = $"Превышен лимит попыток подбора ({maxAttempts}) для узла {host}";
-                        break;
-                    }
-                    hostAttempts[host] = ++currentAttempts;
-                }
+                    if (attemptEntryPoint != null && !await EnsureEntryPointReadyAsync(attemptEntryPoint, ct).ConfigureAwait(false))
+                        continue;
 
-                var targetServer = new ManagedServer
-                {
-                    Host = host,
-                    Port = 22,
-                    Username = u,
-                    Password = p,
-                    UseKeyboardInteractive = true
-                };
-
-                var result = await probe.AuthenticateAndProbeAsync(
-                    options.JumpHost, intermediateGateways, targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false);
-
-                if (result.Success)
-                {
-                    string proposedName;
+                    int currentAttempts;
                     lock (syncLock)
                     {
-                        proposedName = SmartSessionNameGenerator.ProposeName(
-                            result.Hostname, host, config, options.TargetGroupId, options.TargetSubgroupName, reservedNames);
-                        reservedNames.Add(proposedName);
+                        hostAttempts.TryGetValue(host, out currentAttempts);
+                        if (currentAttempts >= maxAttempts)
+                        {
+                            lastReason = $"Превышен лимит попыток подбора ({maxAttempts}) для узла {host}";
+                            stopAll = true;
+                            break;
+                        }
+                        hostAttempts[host] = ++currentAttempts;
                     }
 
-                    var hops = new List<RouteHop>(hopHops)
-                    {
-                        new RouteHop(Guid.NewGuid(), proposedName, host, 22)
-                    };
-
-                    var candidate = new DiscoveredServerCandidate
+                    var targetServer = new ManagedServer
                     {
                         Host = host,
                         Port = 22,
-                        Hostname = result.Hostname,
-                        ProposedName = proposedName,
-                        GroupId = options.TargetGroupId,
-                        GroupName = config.FindGroup(options.TargetGroupId ?? Guid.Empty)?.Name,
-                        SubgroupName = options.TargetSubgroupName,
                         Username = u,
                         Password = p,
-                        PrivilegeEscalation = result.Escalation ?? new(),
-                        RouteHops = hops,
-                        DiscoveredLinksFrom = previousServerId.HasValue ? [previousServerId.Value] : [],
-                        RequiredPreviousServerId = previousServerId,
-                        VerifiedProxyId = options.JumpHost?.Id,
-                        HostKeyFingerprint = result.HostKeyFingerprint,
-                        HostKeyAlgorithm = result.HostKeyAlgorithm,
-                        HostKeyBits = result.HostKeyBits,
-                        StatusMessage = intermediateGateways.Count > 0 ? "Обнаружен через шлюз" : "Готов к созданию",
-                        IsSelected = true
+                        UseKeyboardInteractive = true
                     };
 
-                    return (candidate, null);
+                    var result = await probe.AuthenticateAndProbeAsync(
+                        attemptEntryPoint, intermediateGateways, targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false);
+
+                    if (result.Success)
+                    {
+                        var candidateId = Guid.NewGuid();
+                        string proposedName;
+                        lock (syncLock)
+                        {
+                            proposedName = SmartSessionNameGenerator.ProposeName(
+                                result.Hostname, host, config, options.TargetGroupId, options.TargetSubgroupName, reservedNames);
+                            reservedNames.Add(proposedName);
+                        }
+
+                        var hops = new List<RouteHop>(hopHops)
+                        {
+                            new RouteHop(Guid.NewGuid(), proposedName, host, 22)
+                        };
+
+                        var discoveredLinksFrom = new List<Guid>();
+                        if (previousServerId.HasValue)
+                        {
+                            discoveredLinksFrom.Add(previousServerId.Value);
+                        }
+                        else if (attemptEntryPoint?.StartupServerId is Guid startupId &&
+                                 startupId != candidateId && config.FindServer(startupId) is not null)
+                        {
+                            discoveredLinksFrom.Add(startupId);
+                        }
+
+                        var candidate = new DiscoveredServerCandidate
+                        {
+                            Id = candidateId,
+                            Host = host,
+                            Port = 22,
+                            Hostname = result.Hostname,
+                            ProposedName = proposedName,
+                            GroupId = options.TargetGroupId,
+                            GroupName = config.FindGroup(options.TargetGroupId ?? Guid.Empty)?.Name,
+                            SubgroupName = options.TargetSubgroupName,
+                            Username = u,
+                            Password = p,
+                            PrivilegeEscalation = result.Escalation ?? new(),
+                            RouteHops = hops,
+                            DiscoveredLinksFrom = discoveredLinksFrom,
+                            RequiredPreviousServerId = previousServerId,
+                            VerifiedProxyId = attemptEntryPoint?.Id,
+                            HostKeyFingerprint = result.HostKeyFingerprint,
+                            HostKeyAlgorithm = result.HostKeyAlgorithm,
+                            HostKeyBits = result.HostKeyBits,
+                            StatusMessage = intermediateGateways.Count > 0 ? "Обнаружен через шлюз" : "Готов к созданию",
+                            IsSelected = true
+                        };
+
+                        Log($"Хост {host}: вход выполнен (пользователь {u}) через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}; повышение прав: {result.Escalation?.StatusDescription ?? "не подтверждено"}.");
+                        return (candidate, null);
+                    }
+
+                    if (result.IsHostKeyRejected)
+                    {
+                        Log($"Хост {host}: host key отклонён через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
+                        currentStage = "HostKey";
+                        lastReason = result.ErrorMessage;
+                        stopAll = true;
+                        break;
+                    }
+                    else if (result.IsAuthFailure)
+                    {
+                        Log($"Хост {host}: вход (пользователь {u}) не удался через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)} (аутентификация).");
+                        currentStage = "Аутентификация";
+                        lastReason = $"Неверный логин или пароль: {result.ErrorMessage}";
+                        break;
+                    }
+                    else if (result.IsUnreachable)
+                    {
+                        Log($"Хост {host}: соединение (пользователь {u}) недоступно через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
+                        currentStage = "Доступность";
+                        lastReason = $"Сбой соединения: {result.ErrorMessage}";
+                    }
                 }
 
-                if (result.IsHostKeyRejected)
-                {
-                    currentStage = "HostKey";
-                    lastReason = result.ErrorMessage;
-                    break;
-                }
-                else if (result.IsAuthFailure)
-                {
-                    currentStage = "Аутентификация";
-                    lastReason = $"Неверный логин или пароль: {result.ErrorMessage}";
-                }
-                else if (result.IsUnreachable)
-                {
-                    currentStage = "Доступность";
-                    lastReason = $"Сбой соединения: {result.ErrorMessage}";
-                }
+                if (stopAll) break;
             }
 
             var problem = new ProblematicServerCandidate
@@ -846,14 +941,144 @@ public sealed class SmartDiscoveryEngine
             TargetGroupId = updatedOptions.TargetGroupId,
             TargetSubgroupName = updatedOptions.TargetSubgroupName,
             JumpHost = updatedOptions.JumpHost,
+            AutoSelectJumpHost = updatedOptions.AutoSelectJumpHost,
             MaxParallelConnections = updatedOptions.MaxParallelConnections,
             MaxAttemptsPerHost = updatedOptions.MaxAttemptsPerHost,
             Timeout = updatedOptions.Timeout,
             EndpointProbeTimeout = updatedOptions.EndpointProbeTimeout
         };
 
-        var retryEngine = new SmartDiscoveryEngine(config, retryOptions, probe, progress, existingGateways, hostKeyVerifier);
-        return await retryEngine.DiscoverAsync(cancellationToken).ConfigureAwait(false);
+        var retryEngine = new SmartDiscoveryEngine(
+            config, retryOptions, probe, progress, existingGateways, hostKeyVerifier, log, ensureEntryPoint);
+        Log($"Повтор проверки: {retryHosts.Count} хостов.");
+        var result = await retryEngine.DiscoverAsync(cancellationToken).ConfigureAwait(false);
+        Log($"Повтор проверки завершён: найдено {result.Discovered.Count}, проблемных {result.Problematic.Count}.");
+        return result;
+    }
+
+    private IReadOnlyList<BaseProxy?> ResolveEntryPoints()
+    {
+        if (!options.AutoSelectJumpHost)
+            return [options.JumpHost];
+
+        var enabled = config.BaseProxies
+            .Where(proxy => proxy.Enabled)
+            .DistinctBy(proxy => proxy.Id)
+            .ToList();
+        if (enabled.Count == 0) return [null];
+
+        IEnumerable<ManagedServer> scopedServers;
+        if (options.TargetGroupId.HasValue)
+        {
+            var group = config.FindGroup(options.TargetGroupId.Value);
+            scopedServers = group != null ? ServersInGroup(group) : Enumerable.Empty<ManagedServer>();
+        }
+        else
+        {
+            scopedServers = config.AllServers();
+        }
+
+        var usage = enabled.ToDictionary(proxy => proxy.Id, _ => 0);
+        foreach (var server in scopedServers)
+        {
+            var preferred = server.PreferredProxyId ?? server.PreferredRoute?.ProxyId;
+            if (preferred.HasValue && usage.ContainsKey(preferred.Value))
+                usage[preferred.Value]++;
+        }
+
+        var plannerOrder = RoutePlanner.OrderedProxies(config)
+            .Select((proxy, index) => (proxy.Id, Index: index))
+            .ToDictionary(item => item.Id, item => item.Index);
+        return enabled
+            .OrderByDescending(proxy => usage[proxy.Id])
+            .ThenBy(proxy => proxy.Id == config.PreferredProxyId ? 0 : 1)
+            .ThenBy(proxy => plannerOrder.TryGetValue(proxy.Id, out var index) ? index : int.MaxValue)
+            .ThenBy(proxy => proxy.Name, StringComparer.CurrentCultureIgnoreCase)
+            .Select(proxy => (BaseProxy?)proxy)
+            .ToArray();
+    }
+
+    private async Task<bool> EnsureEntryPointReadyAsync(BaseProxy proxy, CancellationToken cancellationToken)
+    {
+        if (ensureEntryPoint == null || proxy.StartupServerId is null)
+            return true;
+
+        bool ready;
+        try
+        {
+            ready = await GetEntryPointReadinessTask(proxy, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            Log($"Точка входа {proxy.Name}: не удалось подтвердить готовность.");
+            return false;
+        }
+
+        if (!ready)
+            Log($"Точка входа {proxy.Name} не готова.");
+        return ready;
+    }
+
+    private Task<bool> GetEntryPointReadinessTask(BaseProxy proxy, CancellationToken cancellationToken)
+    {
+        lock (entryPointReadinessLock)
+        {
+            if (entryPointReadiness.TryGetValue(proxy.Id, out var task)) return task;
+            try
+            {
+                task = ensureEntryPoint!(proxy, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                task = Task.FromException<bool>(ex);
+            }
+            entryPointReadiness[proxy.Id] = task;
+            return task;
+        }
+    }
+
+    private void LogScanStart(int hostCount, IReadOnlyList<BaseProxy?> entryPoints)
+    {
+        var groupName = options.TargetGroupId.HasValue
+            ? config.FindGroup(options.TargetGroupId.Value)?.Name ?? "неизвестная группа"
+            : "без группы";
+        var mode = options.AutoSelectJumpHost ? "автовыбор точки входа" : "точка входа задана вручную";
+        var points = string.Join(", ", entryPoints.Select(DescribeEntryPoint));
+        Log($"Сканирование: хостов {hostCount}, группа {groupName}, режим: {mode}, точки входа: {points}.");
+    }
+
+    private static string DescribeEntryPoint(BaseProxy? proxy) =>
+        proxy is null ? "прямое подключение" : $"точка входа {proxy.Name}";
+
+    private string DescribeVerifiedEntryPoint(Guid? proxyId) =>
+        proxyId is null
+            ? "прямое подключение"
+            : config.BaseProxies.FirstOrDefault(p => p.Id == proxyId.Value) is { } proxy
+                ? $"точка входа {proxy.Name}"
+                : "неизвестная точка входа";
+
+    private static IEnumerable<ManagedServer> ServersInGroup(ServerGroup group)
+    {
+        foreach (var server in group.Servers) yield return server;
+        foreach (var child in group.Groups)
+            foreach (var server in ServersInGroup(child))
+                yield return server;
+    }
+
+    private void Log(string message)
+    {
+        if (log is null) return;
+        try
+        {
+            log(message);
+        }
+        catch
+        {
+        }
     }
 
     private static List<(string User, string Pass)> GetPrioritizedCredentials(

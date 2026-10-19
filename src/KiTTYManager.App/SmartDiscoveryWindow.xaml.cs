@@ -1,7 +1,12 @@
 using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
 using KiTTYManager.Core;
+using KeyEventArgs = System.Windows.Input.KeyEventArgs;
+using ButtonBase = System.Windows.Controls.Primitives.ButtonBase;
+using TextBoxBase = System.Windows.Controls.Primitives.TextBoxBase;
 
 namespace KiTTYManager.App;
 
@@ -11,6 +16,8 @@ public partial class SmartDiscoveryWindow : Window
     private readonly Func<BaseProxy, CancellationToken, Task<bool>>? ensureJumphost;
     private readonly Action onSessionsCreated;
     private readonly Func<ManagedServer, string, bool>? hostKeyVerifier;
+    private readonly Action<string>? log;
+    private readonly Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate;
 
     private ManagerConfig LiveConfig => getConfig();
 
@@ -21,17 +28,23 @@ public partial class SmartDiscoveryWindow : Window
     private bool isScanning;
     private bool passwordsMasked;
     private string rawPasswords = "";
+    private Guid? targetGroupId;
+    private IReadOnlyList<string> currentPasswords = [];
 
     public SmartDiscoveryWindow(
         Func<ManagerConfig> getConfig,
         Func<BaseProxy, CancellationToken, Task<bool>>? ensureJumphost = null,
         Action? onSessionsCreated = null,
-        Func<ManagedServer, string, bool>? hostKeyVerifier = null)
+        Func<ManagedServer, string, bool>? hostKeyVerifier = null,
+        Action<string>? log = null,
+        Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate = null)
     {
         this.getConfig = getConfig;
         this.ensureJumphost = ensureJumphost;
         this.onSessionsCreated = onSessionsCreated ?? (() => { });
         this.hostKeyVerifier = hostKeyVerifier;
+        this.log = log;
+        this.previewCandidate = previewCandidate;
 
         Closing += (_, _) =>
         {
@@ -45,7 +58,7 @@ public partial class SmartDiscoveryWindow : Window
         ProblemsGrid.ItemsSource = problematicCandidates;
 
         PopulateJumpHosts();
-        PopulateGroups();
+        SetTargetGroup(null);
         UpdateCounts();
     }
 
@@ -53,17 +66,22 @@ public partial class SmartDiscoveryWindow : Window
         ManagerConfig liveConfig,
         Func<BaseProxy, CancellationToken, Task<bool>>? ensureJumphost = null,
         Action? onSessionsCreated = null,
-        Func<ManagedServer, string, bool>? hostKeyVerifier = null)
-        : this(() => liveConfig, ensureJumphost, onSessionsCreated, hostKeyVerifier)
+        Func<ManagedServer, string, bool>? hostKeyVerifier = null,
+        Action<string>? log = null,
+        Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate = null)
+        : this(() => liveConfig, ensureJumphost, onSessionsCreated, hostKeyVerifier, log, previewCandidate)
     {
     }
 
     private void PopulateJumpHosts()
     {
         JumpHostComboBox.Items.Clear();
-        var directItem = new ComboBoxItem { Content = "[Без JumpHost — прямое подключение]", Tag = null };
+        var autoItem = new ComboBoxItem { Content = "Автоматически (подобрать рабочую точку входа)", Tag = "auto" };
+        JumpHostComboBox.Items.Add(autoItem);
+        JumpHostComboBox.SelectedItem = autoItem;
+
+        var directItem = new ComboBoxItem { Content = "[Без JumpHost — прямое подключение]", Tag = "direct" };
         JumpHostComboBox.Items.Add(directItem);
-        JumpHostComboBox.SelectedItem = directItem;
 
         foreach (var proxy in LiveConfig.BaseProxies.Where(p => p.Enabled))
         {
@@ -73,31 +91,124 @@ public partial class SmartDiscoveryWindow : Window
                 Tag = proxy
             };
             JumpHostComboBox.Items.Add(item);
-            if (LiveConfig.PreferredProxyId.HasValue && proxy.Id == LiveConfig.PreferredProxyId.Value)
-            {
-                JumpHostComboBox.SelectedItem = item;
-            }
         }
     }
 
-    private void PopulateGroups()
-    {
-        TargetGroupComboBox.Items.Clear();
-        var rootItem = new ComboBoxItem { Content = "[Без группы — верхний уровень]", Tag = null };
-        TargetGroupComboBox.Items.Add(rootItem);
-        TargetGroupComboBox.SelectedItem = rootItem;
-
-        foreach (var group in LiveConfig.AllGroups())
+    private (BaseProxy? Proxy, bool Auto) GetEntryPointSelection() =>
+        (JumpHostComboBox.SelectedItem as ComboBoxItem)?.Tag switch
         {
-            var path = LiveConfig.GroupPath(group.Id);
-            var item = new ComboBoxItem
-            {
-                Content = string.IsNullOrEmpty(path) ? group.Name : path,
-                Tag = group.Id
-            };
-            TargetGroupComboBox.Items.Add(item);
+            BaseProxy proxy => (proxy, false),
+            "auto" => (null, true),
+            _ => (null, false)
+        };
+
+    private void SetTargetGroup(Guid? id)
+    {
+        targetGroupId = id;
+        if (!id.HasValue)
+        {
+            TargetGroupBox.Text = "[Без группы — верхний уровень]";
+            return;
+        }
+        var path = LiveConfig.GroupPath(id.Value);
+        TargetGroupBox.Text = string.IsNullOrEmpty(path)
+            ? LiveConfig.FindGroup(id.Value)?.Name ?? ""
+            : path;
+    }
+
+    private void OpenGroupPicker()
+    {
+        GroupSearchBox.Text = "";
+        RefreshGroupChoices();
+        GroupPickerPopup.IsOpen = true;
+        Dispatcher.BeginInvoke(() => GroupSearchBox.Focus(),
+            System.Windows.Threading.DispatcherPriority.Input);
+    }
+
+    private void ChooseGroupButton_Click(object sender, RoutedEventArgs e) => OpenGroupPicker();
+
+    private void TargetGroupBox_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        OpenGroupPicker();
+        e.Handled = true;
+    }
+
+    private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e) => RefreshGroupChoices();
+
+    private void GroupSearchBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            GroupPickerPopup.IsOpen = false;
+            e.Handled = true;
+            return;
+        }
+        if (e.Key == Key.Enter)
+        {
+            PickGroup(GroupChoicesList.SelectedItem as GroupChoice
+                      ?? GroupChoicesList.Items.OfType<GroupChoice>().FirstOrDefault(c => c.Id is not null));
+            e.Handled = true;
         }
     }
+
+    private void GroupChoicesList_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            PickGroup(GroupChoicesList.SelectedItem as GroupChoice);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape)
+        {
+            GroupPickerPopup.IsOpen = false;
+            e.Handled = true;
+        }
+    }
+
+    private void GroupChoicesList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject) is { DataContext: GroupChoice choice })
+        {
+            PickGroup(choice);
+            e.Handled = true;
+        }
+    }
+
+    private void PickGroup(GroupChoice? choice)
+    {
+        if (choice is null) return;
+        SetTargetGroup(choice.Id);
+        GroupPickerPopup.IsOpen = false;
+    }
+
+    private void RefreshGroupChoices()
+    {
+        var choices = new List<GroupChoice>
+        {
+            new(null, "[Без группы — верхний уровень]", "Верхний уровень", new Thickness(0))
+        };
+        choices.AddRange(GroupSelectionPolicy.Build(LiveConfig, null, GroupSearchBox?.Text)
+            .Select(row => new GroupChoice(row.GroupId, row.Name,
+                $"{row.Path} · сессий: {row.ServerCount}", new Thickness(row.Depth * 14, 0, 0, 0))));
+
+        GroupChoicesList.ItemsSource = choices;
+        GroupChoicesList.SelectedItem = choices.FirstOrDefault(c => c.Id is not null) ?? choices.FirstOrDefault();
+        NoGroupChoicesText.Visibility = choices.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? current) where T : DependencyObject
+    {
+        while (current is not null)
+        {
+            if (current is T match) return match;
+            current = current is Visual or System.Windows.Media.Media3D.Visual3D
+                ? VisualTreeHelper.GetParent(current)
+                : LogicalTreeHelper.GetParent(current);
+        }
+        return null;
+    }
+
+    private sealed record GroupChoice(Guid? Id, string Name, string Details, Thickness Indent);
 
     private void TogglePasswordsMask_Click(object sender, RoutedEventArgs e)
     {
@@ -123,6 +234,17 @@ public partial class SmartDiscoveryWindow : Window
     private string GetEffectivePasswordsText() =>
         passwordsMasked ? rawPasswords : PasswordsInputBox.Text;
 
+    private void ReportLog(string message)
+    {
+        var sanitized = message;
+        foreach (var password in currentPasswords)
+        {
+            if (password.Length >= 3)
+                sanitized = sanitized.Replace(password, "***", StringComparison.Ordinal);
+        }
+        log?.Invoke(sanitized);
+    }
+
     private async void StartScan_Click(object sender, RoutedEventArgs e)
     {
         if (isScanning) return;
@@ -137,9 +259,9 @@ public partial class SmartDiscoveryWindow : Window
 
         var logins = SmartDiscoveryInputParser.ParseList(LoginsInputBox.Text);
         var passwords = SmartDiscoveryInputParser.ParsePasswords(GetEffectivePasswordsText());
+        currentPasswords = passwords;
 
-        var selectedProxy = (JumpHostComboBox.SelectedItem as ComboBoxItem)?.Tag as BaseProxy;
-        var selectedGroupId = (TargetGroupComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?;
+        var selection = GetEntryPointSelection();
         var targetSubgroup = TargetSubgroupBox.Text.Trim();
         var parallelism = int.TryParse((ParallelismComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var p) ? p : 4;
 
@@ -151,26 +273,14 @@ public partial class SmartDiscoveryWindow : Window
 
         try
         {
-            if (selectedProxy != null && ensureJumphost != null)
-            {
-                StatusTextBlock.Text = $"Запуск и проверка точки входа {selectedProxy.Name}...";
-                var ready = await ensureJumphost(selectedProxy, scanCts.Token).ConfigureAwait(true);
-                if (!ready)
-                {
-                    ThemedMessageDialog.Show(this, $"Не удалось запустить точку входа {selectedProxy.Name}.",
-                        "Ошибка точки входа", MessageBoxButton.OK, MessageBoxImage.Error);
-                    SetScanningState(false);
-                    return;
-                }
-            }
-
             var options = new SmartDiscoveryOptions
             {
                 TargetHosts = hosts,
                 Usernames = logins,
                 Passwords = passwords,
-                JumpHost = selectedProxy,
-                TargetGroupId = selectedGroupId,
+                JumpHost = selection.Proxy,
+                AutoSelectJumpHost = selection.Auto,
+                TargetGroupId = targetGroupId,
                 TargetSubgroupName = targetSubgroup,
                 MaxParallelConnections = parallelism,
                 Timeout = TimeSpan.FromSeconds(LiveConfig.ConnectionTimeoutSeconds),
@@ -178,7 +288,9 @@ public partial class SmartDiscoveryWindow : Window
             };
 
             var progress = new Progress<SmartDiscoveryProgress>(UpdateProgressUi);
-            var engine = new SmartDiscoveryEngine(LiveConfig, options, progress: progress, hostKeyVerifier: hostKeyVerifier);
+            var engine = new SmartDiscoveryEngine(
+                LiveConfig, options, progress: progress, hostKeyVerifier: hostKeyVerifier,
+                log: ReportLog, ensureEntryPoint: ensureJumphost);
 
             var result = await engine.DiscoverAsync(scanCts.Token).ConfigureAwait(true);
 
@@ -230,8 +342,8 @@ public partial class SmartDiscoveryWindow : Window
 
         var logins = SmartDiscoveryInputParser.ParseList(LoginsInputBox.Text);
         var passwords = SmartDiscoveryInputParser.ParsePasswords(GetEffectivePasswordsText());
-        var selectedProxy = (JumpHostComboBox.SelectedItem as ComboBoxItem)?.Tag as BaseProxy;
-        var selectedGroupId = (TargetGroupComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?;
+        currentPasswords = passwords;
+        var selection = GetEntryPointSelection();
         var targetSubgroup = TargetSubgroupBox.Text.Trim();
         var parallelism = int.TryParse((ParallelismComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var p) ? p : 4;
 
@@ -244,8 +356,9 @@ public partial class SmartDiscoveryWindow : Window
             {
                 Usernames = logins,
                 Passwords = passwords,
-                JumpHost = selectedProxy,
-                TargetGroupId = selectedGroupId,
+                JumpHost = selection.Proxy,
+                AutoSelectJumpHost = selection.Auto,
+                TargetGroupId = targetGroupId,
                 TargetSubgroupName = targetSubgroup,
                 MaxParallelConnections = parallelism,
                 Timeout = TimeSpan.FromSeconds(LiveConfig.ConnectionTimeoutSeconds),
@@ -254,7 +367,8 @@ public partial class SmartDiscoveryWindow : Window
 
             var progress = new Progress<SmartDiscoveryProgress>(UpdateProgressUi);
             var engine = new SmartDiscoveryEngine(
-                LiveConfig, options, progress: progress, initialGateways: discoveredCandidates.ToList(), hostKeyVerifier: hostKeyVerifier);
+                LiveConfig, options, progress: progress, initialGateways: discoveredCandidates.ToList(),
+                hostKeyVerifier: hostKeyVerifier, log: ReportLog, ensureEntryPoint: ensureJumphost);
 
             var retryResult = await engine.RetryProblematicAsync(
                 selectedProblems, options, existingGateways: discoveredCandidates.ToList(), scanCts.Token).ConfigureAwait(true);
@@ -315,6 +429,8 @@ public partial class SmartDiscoveryWindow : Window
         HostsInputBox.IsEnabled = !scanning;
         LoginsInputBox.IsEnabled = !scanning;
         JumpHostComboBox.IsEnabled = !scanning;
+        TargetGroupBox.IsEnabled = !scanning;
+        ChooseGroupButton.IsEnabled = !scanning;
     }
 
     private void UpdateCounts()
@@ -356,7 +472,6 @@ public partial class SmartDiscoveryWindow : Window
             return;
         }
 
-        var targetGroupId = (TargetGroupComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?;
         var groupName = targetGroupId.HasValue ? LiveConfig.FindGroup(targetGroupId.Value)?.Name : "";
         var subgroupName = TargetSubgroupBox.Text.Trim();
 
@@ -445,6 +560,28 @@ public partial class SmartDiscoveryWindow : Window
             .ToList();
     }
 
+    private async void CandidatesGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (isScanning || previewCandidate is null) return;
+        var source = e.OriginalSource as DependencyObject;
+        if (FindAncestor<ButtonBase>(source) is not null || FindAncestor<TextBoxBase>(source) is not null) return;
+        var row = FindAncestor<DataGridRow>(source);
+        if (row?.DataContext is not DiscoveredServerCandidate candidate) return;
+
+        CandidatesGrid.CommitEdit(DataGridEditingUnit.Row, true);
+
+        try
+        {
+            await previewCandidate(candidate, discoveredCandidates.ToList());
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            ThemedMessageDialog.Show(this, $"Не удалось открыть сессию без сохранения: {ex.Message}",
+                "Предпросмотр", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
     private void CreateSessions_Click(object sender, RoutedEventArgs e)
     {
         CandidatesGrid.CommitEdit(DataGridEditingUnit.Row, true);
@@ -459,13 +596,16 @@ public partial class SmartDiscoveryWindow : Window
 
         try
         {
-            var selectedProxy = (JumpHostComboBox.SelectedItem as ComboBoxItem)?.Tag as BaseProxy;
+            var selection = GetEntryPointSelection();
             var options = new SmartDiscoveryOptions
             {
-                JumpHost = selectedProxy
+                JumpHost = selection.Proxy,
+                AutoSelectJumpHost = selection.Auto
             };
 
             var created = SmartDiscoverySessionCreator.CreateSessions(LiveConfig, discoveredCandidates, options);
+
+            ReportLog($"Создание сессий: выбрано {selected.Count}, создано {created.Count}.");
 
             onSessionsCreated();
 

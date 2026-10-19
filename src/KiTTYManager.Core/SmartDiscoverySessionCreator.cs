@@ -122,28 +122,8 @@ public static class SmartDiscoverySessionCreator
                 targetGroup = sub;
             }
 
-            var server = new ManagedServer
-            {
-                Id = c.Id,
-                Name = name,
-                Host = c.Host,
-                Port = c.Port > 0 ? c.Port : 22,
-                Username = c.Username,
-                Password = c.Password,
-                RootLogin = c.PrivilegeEscalation.Success ? c.PrivilegeEscalation.RootCommand : "",
-                RootPassword = c.PrivilegeEscalation.Success ? c.PrivilegeEscalation.RootPassword : "",
-                RequiredPreviousServerId = c.RequiredPreviousServerId,
-                PreferredProxyId = c.VerifiedProxyId,
-                HostKeyFingerprint = c.HostKeyFingerprint,
-                HostKeyAlgorithm = c.HostKeyAlgorithm,
-                HostKeyBits = c.HostKeyBits,
-                KeepaliveIntervalSeconds = 15,
-                EnableTcpKeepalives = true,
-                ReconnectOnConnectionFailure = true,
-                ReconnectOnSystemWakeup = true,
-                ShellPrompt = "$",
-                UseKeyboardInteractive = true
-            };
+            var server = CreateDraftServer(c);
+            server.Name = name;
 
             if (targetGroup is not null)
                 targetGroup.Servers.Add(server);
@@ -178,5 +158,84 @@ public static class SmartDiscoverySessionCreator
         }
 
         return created;
+    }
+
+    public static ManagedServer CreateDraftServer(DiscoveredServerCandidate c) =>
+        new()
+        {
+            Id = c.Id,
+            Name = string.IsNullOrWhiteSpace(c.ProposedName) ? c.Host : c.ProposedName,
+            Host = c.Host,
+            Port = c.Port > 0 ? c.Port : 22,
+            Username = c.Username,
+            Password = c.Password,
+            RootLogin = c.PrivilegeEscalation.Success ? c.PrivilegeEscalation.RootCommand : "",
+            RootPassword = c.PrivilegeEscalation.Success ? c.PrivilegeEscalation.RootPassword : "",
+            RequiredPreviousServerId = c.RequiredPreviousServerId,
+            PreferredProxyId = c.VerifiedProxyId,
+            TryDirectWithoutJumphost = c.VerifiedProxyId is null && c.RequiredPreviousServerId is null,
+            HostKeyFingerprint = c.HostKeyFingerprint,
+            HostKeyAlgorithm = c.HostKeyAlgorithm,
+            HostKeyBits = c.HostKeyBits,
+            KeepaliveIntervalSeconds = 15,
+            EnableTcpKeepalives = true,
+            ReconnectOnConnectionFailure = true,
+            ReconnectOnSystemWakeup = true,
+            ShellPrompt = "$",
+            UseKeyboardInteractive = true
+        };
+
+    public static IReadOnlyList<RouteCandidate> CreatePreviewCandidates(
+        ManagerConfig previewConfig, DiscoveredServerCandidate target)
+    {
+        if (target.VerifiedProxyId is not null || target.RequiredPreviousServerId is null)
+            return [];
+
+        var chain = new List<ManagedServer>();
+        Guid? currentId = target.Id;
+        while (currentId.HasValue && chain.Count < 16)
+        {
+            var server = previewConfig.FindServer(currentId.Value);
+            if (server is null) break;
+            chain.Insert(0, server);
+            currentId = server.RequiredPreviousServerId;
+        }
+
+        if (chain.Count <= 1) return [];
+        var candidate = new RouteCandidate(RoutePlanner.DirectConnectionProxy, chain, true);
+        return RoutePlanner.SatisfiesRouteConstraints(previewConfig, candidate) ? [candidate] : [];
+    }
+
+    public static ManagerConfig CreatePreviewConfig(
+        ManagerConfig source, IReadOnlyList<DiscoveredServerCandidate> candidates)
+    {
+        var snapshot = ConfigTransfer.CloneSnapshot(source);
+        var knownIds = snapshot.AllServers().Select(s => s.Id).ToHashSet();
+        foreach (var c in candidates)
+        {
+            if (knownIds.Add(c.Id))
+                snapshot.UngroupedServers.Add(CreateDraftServer(c));
+        }
+
+        foreach (var c in candidates)
+        {
+            foreach (var fromId in c.DiscoveredLinksFrom)
+            {
+                if (fromId == c.Id || !knownIds.Contains(fromId)) continue;
+                if (snapshot.Links.Any(l => l.FromServerId == fromId && l.ToServerId == c.Id)) continue;
+
+                snapshot.Links.Add(new ServerLink
+                {
+                    FromServerId = fromId,
+                    ToServerId = c.Id,
+                    Discovered = true,
+                    LastSuccessUtc = DateTimeOffset.UtcNow,
+                    LastStrategy = "DirectTcpIp",
+                    LastSuccessfulProxyId = c.VerifiedProxyId
+                });
+            }
+        }
+
+        return snapshot;
     }
 }

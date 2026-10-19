@@ -7,6 +7,43 @@
         Width="1050" Height="740" MinWidth="850" MinHeight="580"
         WindowStartupLocation="CenterOwner"
         Background="{DynamicResource WindowBrush}" Foreground="{DynamicResource TextBrush}">
+  <Window.Resources>
+    <Style x:Key="DiscoveryCheckBoxStyle" TargetType="CheckBox"
+           BasedOn="{StaticResource {x:Type CheckBox}}">
+      <Setter Property="HorizontalAlignment" Value="Stretch"/>
+      <Setter Property="VerticalAlignment" Value="Stretch"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <Border Background="Transparent" SnapsToDevicePixels="True">
+              <Grid>
+                <Border x:Name="Box" Width="15" Height="15" Background="#1B1B1B" BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="1" CornerRadius="3" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                <Path x:Name="Check" Data="M 3,7 L 6,10 L 12,3" Stroke="White" StrokeThickness="2"
+                      Width="10" Height="8" Stretch="Fill" HorizontalAlignment="Center" VerticalAlignment="Center"
+                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" Visibility="Collapsed"/>
+                <Border x:Name="Indeterminate" Width="8" Height="2" Background="White"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed"/>
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True"><Setter TargetName="Box" Property="Background" Value="{StaticResource AccentBrush}"/><Setter TargetName="Box" Property="BorderBrush" Value="{StaticResource AccentBrush}"/><Setter TargetName="Check" Property="Visibility" Value="Visible"/></Trigger>
+              <Trigger Property="IsChecked" Value="{x:Null}"><Setter TargetName="Box" Property="Background" Value="{StaticResource AccentBrush}"/><Setter TargetName="Indeterminate" Property="Visibility" Value="Visible"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Box" Property="BorderBrush" Value="{StaticResource AccentHoverBrush}"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="DiscoveryCheckBoxCellStyle" TargetType="DataGridCell"
+           BasedOn="{StaticResource {x:Type DataGridCell}}">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="VerticalContentAlignment" Value="Stretch"/>
+      <Setter Property="Padding" Value="0"/>
+    </Style>
+  </Window.Resources>
   <Grid Margin="18">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
@@ -72,7 +109,57 @@
           <ComboBox x:Name="JumpHostComboBox" Grid.Column="1" Margin="0,0,12,0"/>
 
           <TextBlock Grid.Column="2" Text="Целевая группа:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <ComboBox x:Name="TargetGroupComboBox" Grid.Column="3" Margin="0,0,12,0"/>
+          <Grid Grid.Column="3" Margin="0,0,12,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="TargetGroupBox" IsReadOnly="True" Cursor="Hand"
+                     PreviewMouseLeftButtonDown="TargetGroupBox_PreviewMouseLeftButtonDown"
+                     ToolTip="Целевая группа для создаваемых сессий"/>
+            <Button x:Name="ChooseGroupButton" Grid.Column="1" Content="…" Click="ChooseGroupButton_Click"
+                    Margin="6,0,0,0" MinWidth="36" Padding="10,0" ToolTip="Выбрать группу"/>
+            <Popup x:Name="GroupPickerPopup" PlacementTarget="{Binding ElementName=TargetGroupBox}"
+                   Placement="Bottom" StaysOpen="False" AllowsTransparency="True" PopupAnimation="Fade">
+              <Border Width="380" MaxHeight="470" Margin="0,6,0,0" Padding="12"
+                      Background="#1C1C1C" BorderBrush="{StaticResource BorderBrush}"
+                      BorderThickness="1" CornerRadius="8">
+                <Grid>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                  </Grid.RowDefinitions>
+                  <TextBox x:Name="GroupSearchBox" TextChanged="GroupSearchBox_TextChanged"
+                           PreviewKeyDown="GroupSearchBox_PreviewKeyDown"
+                           ToolTip="Поиск по названию или пути группы"/>
+                  <Grid Grid.Row="1" Margin="0,8,0,0">
+                    <ListBox x:Name="GroupChoicesList" MinHeight="140" MaxHeight="320"
+                             PreviewMouseLeftButtonDown="GroupChoicesList_PreviewMouseLeftButtonDown"
+                             PreviewKeyDown="GroupChoicesList_PreviewKeyDown"
+                             local:ScrollWheelForwarding.Enabled="True">
+                      <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                          <Setter Property="Padding" Value="4,2"/>
+                        </Style>
+                      </ListBox.ItemContainerStyle>
+                      <ListBox.ItemTemplate>
+                        <DataTemplate>
+                          <StackPanel Margin="{Binding Indent}">
+                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                            <TextBlock Text="{Binding Details}" Margin="0,2,0,0" FontSize="12"
+                                       Foreground="{StaticResource MutedTextBrush}" TextTrimming="CharacterEllipsis"/>
+                          </StackPanel>
+                        </DataTemplate>
+                      </ListBox.ItemTemplate>
+                    </ListBox>
+                    <TextBlock x:Name="NoGroupChoicesText" Text="Ничего не найдено"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                               Foreground="{StaticResource MutedTextBrush}" Visibility="Collapsed"/>
+                  </Grid>
+                </Grid>
+              </Border>
+            </Popup>
+          </Grid>
 
           <TextBlock Grid.Column="4" Text="Подгруппа:" VerticalAlignment="Center" Margin="0,0,8,0"/>
           <TextBox x:Name="TargetSubgroupBox" Grid.Column="5" Margin="0,0,12,0" ToolTip="Название подгруппы (необязательно)"/>
@@ -124,15 +211,23 @@
 
           <!-- Candidates DataGrid -->
           <DataGrid x:Name="CandidatesGrid" Grid.Row="1" AutoGenerateColumns="False" CanUserAddRows="False"
-                    CanUserDeleteRows="False" SelectionMode="Single">
+                    CanUserDeleteRows="False" SelectionMode="Single"
+                    MouseDoubleClick="CandidatesGrid_MouseDoubleClick">
             <DataGrid.Columns>
-              <DataGridCheckBoxColumn Header="Создать" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="65"/>
+              <DataGridCheckBoxColumn Header="Создать" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="65"
+                                      ElementStyle="{StaticResource DiscoveryCheckBoxStyle}"
+                                      EditingElementStyle="{StaticResource DiscoveryCheckBoxStyle}"
+                                      CellStyle="{StaticResource DiscoveryCheckBoxCellStyle}"/>
               <DataGridTextColumn Header="IP / Хост" Binding="{Binding Host}" IsReadOnly="True" Width="120"/>
               <DataGridTextColumn Header="Hostname" Binding="{Binding Hostname}" IsReadOnly="True" Width="120"/>
-              <DataGridTextColumn Header="Название сессии" Binding="{Binding ProposedName, UpdateSourceTrigger=PropertyChanged}" Width="160"/>
-              <DataGridTextColumn Header="Группа" Binding="{Binding GroupName, UpdateSourceTrigger=PropertyChanged}" Width="120"/>
-              <DataGridTextColumn Header="Подгруппа" Binding="{Binding SubgroupName, UpdateSourceTrigger=PropertyChanged}" Width="120"/>
-              <DataGridTextColumn Header="Логин" Binding="{Binding Username, UpdateSourceTrigger=PropertyChanged}" Width="90"/>
+              <DataGridTextColumn Header="Название сессии" Binding="{Binding ProposedName, UpdateSourceTrigger=PropertyChanged}" Width="160"
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+              <DataGridTextColumn Header="Группа" Binding="{Binding GroupName, UpdateSourceTrigger=PropertyChanged}" Width="120"
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+              <DataGridTextColumn Header="Подгруппа" Binding="{Binding SubgroupName, UpdateSourceTrigger=PropertyChanged}" Width="120"
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+              <DataGridTextColumn Header="Логин" Binding="{Binding Username, UpdateSourceTrigger=PropertyChanged}" Width="90"
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
 
               <!-- Masked / Clear Password with Toggle & Copy -->
               <DataGridTemplateColumn Header="Пароль" Width="150">
@@ -181,7 +276,10 @@
           <DataGrid x:Name="ProblemsGrid" Grid.Row="1" AutoGenerateColumns="False" CanUserAddRows="False"
                     CanUserDeleteRows="False" SelectionMode="Single">
             <DataGrid.Columns>
-              <DataGridCheckBoxColumn Header="Выбрать" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="70"/>
+              <DataGridCheckBoxColumn Header="Выбрать" Binding="{Binding IsSelected, UpdateSourceTrigger=PropertyChanged}" Width="70"
+                                      ElementStyle="{StaticResource DiscoveryCheckBoxStyle}"
+                                      EditingElementStyle="{StaticResource DiscoveryCheckBoxStyle}"
+                                      CellStyle="{StaticResource DiscoveryCheckBoxCellStyle}"/>
               <DataGridTextColumn Header="IP / Хост" Binding="{Binding Host}" IsReadOnly="True" Width="150"/>
               <DataGridTextColumn Header="Этап проверки" Binding="{Binding Stage}" IsReadOnly="True" Width="150"/>
               <DataGridTextColumn Header="Причина ошибки" Binding="{Binding Reason}" IsReadOnly="True" Width="*"/>

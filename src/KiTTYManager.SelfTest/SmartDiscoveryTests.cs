@@ -10,14 +10,21 @@ internal sealed partial class SelfTestRunner
         public Dictionary<string, string> Hostnames { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, PrivilegeEscalationResult> Escalations { get; } = new(StringComparer.OrdinalIgnoreCase);
         public HashSet<(string gateway, string target)> HopReachability { get; } = [];
+        public HashSet<(Guid proxy, string host)> ProxyAuthUnreachable { get; } = [];
         public HashSet<string> HostKeyRejectedHosts { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<Guid, HashSet<string>> ProxyReachable { get; } = [];
         public Action<string>? OnHostProbed { get; set; }
+        public string AuthErrorMessage { get; set; } = "Неверные учетные данные";
 
         public List<(string host, string user, string pass)> AttemptedLogins { get; } = [];
+        public List<(string host, Guid? proxyId)> ReachabilityAttempts { get; } = [];
 
         public Task<bool> ProbeReachabilityAsync(
             BaseProxy? jumpHost, string host, int port, TimeSpan timeout, CancellationToken cancellationToken)
         {
+            ReachabilityAttempts.Add((host, jumpHost?.Id));
+            if (jumpHost != null && ProxyReachable.TryGetValue(jumpHost.Id, out var reachableHosts))
+                return Task.FromResult(reachableHosts.Contains(host));
             return Task.FromResult(DirectlyReachable.Contains(host));
         }
 
@@ -43,6 +50,9 @@ internal sealed partial class SelfTestRunner
             {
                 return Task.FromResult(SmartDiscoveryAuthResult.FailedHostKey($"SSH host key для {target.Host} отклонён"));
             }
+
+            if (jumpHost != null && ProxyAuthUnreachable.Contains((jumpHost.Id, target.Host)))
+                return Task.FromResult(SmartDiscoveryAuthResult.FailedReachability("Сбой соединения через точку входа"));
 
             if (ValidCredentials.TryGetValue(target.Host, out var validList))
             {
@@ -70,7 +80,7 @@ internal sealed partial class SelfTestRunner
                 }
             }
 
-            return Task.FromResult(SmartDiscoveryAuthResult.FailedAuth("Неверные учетные данные"));
+            return Task.FromResult(SmartDiscoveryAuthResult.FailedAuth(AuthErrorMessage));
         }
     }
 
@@ -116,7 +126,8 @@ internal sealed partial class SelfTestRunner
         var nyGroup = new ServerGroup { Name = "New York" };
         var chiGroup = new ServerGroup { Name = "Chicago" };
         var dalGroup = new ServerGroup { Name = "Dallas" };
-        config.Groups.AddRange([nyGroup, chiGroup, dalGroup]);
+        var mainSiteGroup = new ServerGroup { Name = "Main Site" };
+        config.Groups.AddRange([nyGroup, chiGroup, dalGroup, mainSiteGroup]);
 
         // Existing server for subnet detection
         var existingServer = new ManagedServer
@@ -127,25 +138,25 @@ internal sealed partial class SelfTestRunner
         };
         chiGroup.Servers.Add(existingServer);
 
-        // Example 0: s1-group-main without region -> "Group Main S1"
+        // Example 0: s1-group-main without region -> "Group S1 Main"
         var name0 = SmartSessionNameGenerator.ProposeName("s1-group-main", "192.168.1.9", config);
-        Equal("Group Main S1", name0);
+        Equal("Group S1 Main", name0);
 
-        // Example 1: s1-group-main with target group "New York" -> "New York Group Main S1"
+        // Example 1: s1-group-main with target group "New York" -> "New York Group S1 Main"
         var name1 = SmartSessionNameGenerator.ProposeName("s1-group-main", "192.168.1.10", config, targetGroupId: nyGroup.Id);
-        Equal("New York Group Main S1", name1);
+        Equal("New York Group S1 Main", name1);
 
         // Example 2: s5-reserve with target group "Chicago" -> "Chicago S5 Reserve"
         var name2 = SmartSessionNameGenerator.ProposeName("s5-reserve", "192.168.1.11", config, targetGroupId: chiGroup.Id);
         Equal("Chicago S5 Reserve", name2);
 
-        // Example 3: s5-map-reserve with target group "Dallas" -> "Dallas MapServer Reserve S5"
+        // Example 3: s5-map-reserve with target group "Dallas" -> "Dallas MapServer S5 Reserve"
         var name3 = SmartSessionNameGenerator.ProposeName("s5-map-reserve", "192.168.1.12", config, targetGroupId: dalGroup.Id);
-        Equal("Dallas MapServer Reserve S5", name3);
+        Equal("Dallas MapServer S5 Reserve", name3);
 
         // Region inferred from IP subnet matching existing server in Chicago
         var name4 = SmartSessionNameGenerator.ProposeName("s2-app-prod", "10.20.30.55", config);
-        Equal("Chicago App Prod S2", name4);
+        Equal("Chicago App S2 Prod", name4);
 
         // Missing region/site fallback without inventing unverified facts
         var name5 = SmartSessionNameGenerator.ProposeName("web-main", "192.168.1.20", config);
@@ -153,7 +164,38 @@ internal sealed partial class SelfTestRunner
 
         // Uniqueness enforcement
         var name6 = SmartSessionNameGenerator.ProposeName("s1-group-main", "192.168.1.30", config, targetGroupId: nyGroup.Id, existingNamesInBatch: [name1]);
-        Equal("New York Group Main S1 2", name6);
+        Equal("New York Group S1 Main 2", name6);
+
+        // Nested target group "Chicago / Main": region from the first path component, site from the leaf
+        var nestedConfig = new ManagerConfig();
+        var nestedChiGroup = new ServerGroup { Name = "Chicago" };
+        var nestedMainGroup = new ServerGroup { Name = "Main" };
+        nestedChiGroup.Groups.Add(nestedMainGroup);
+        nestedConfig.Groups.Add(nestedChiGroup);
+        var name7 = SmartSessionNameGenerator.ProposeName("chi-main-s1", "192.168.1.40", nestedConfig, targetGroupId: nestedMainGroup.Id);
+        Equal("Chicago S1 Main", name7);
+
+        // /24 region takes precedence over a top-level site-like group
+        var name8 = SmartSessionNameGenerator.ProposeName("s3-app-prod", "10.20.30.77", config, targetGroupId: mainSiteGroup.Id);
+        Equal(true, name8.StartsWith("Chicago ", StringComparison.Ordinal));
+        Equal(true, name8.EndsWith(" Main Site", StringComparison.Ordinal));
+        Equal("Chicago App S3 Main Site", name8);
+
+        // Unknown leftover token is not promoted to role when a site exists
+        var name9 = SmartSessionNameGenerator.ProposeName("legacy-main", "192.168.1.41", config, targetGroupId: nyGroup.Id);
+        Equal("New York Main", name9);
+
+        // /24 region resolves from the ancestry of the existing server's group, not its leaf name
+        var ancestryConfig = new ManagerConfig();
+        var ancestryChicago = new ServerGroup { Name = "Chicago" };
+        var ancestryMain = new ServerGroup { Name = "Main" };
+        ancestryChicago.Groups.Add(ancestryMain);
+        ancestryConfig.Groups.Add(ancestryChicago);
+        ancestryMain.Servers.Add(new ManagedServer { Name = "Chicago S1 Main", Host = "10.20.30.5", Port = 22 });
+        var name10 = SmartSessionNameGenerator.ProposeName(
+            "s2-app-prod", "10.20.30.55", ancestryConfig, targetGroupId: ancestryChicago.Id);
+        Equal("Chicago App S2 Prod", name10);
+        Equal(false, name10.Contains("Main", StringComparison.Ordinal));
     }
 
     private static void CredentialPrioritizationAndLimitsTests()
@@ -674,5 +716,413 @@ internal sealed partial class SelfTestRunner
         Equal(null, createdDirect.PreferredProxyId);
         var directLink = config.Links.Single(l => l.FromServerId == candGateway.Id && l.ToServerId == candDirect.Id);
         Equal(null, directLink.LastSuccessfulProxyId);
+    }
+
+    private static void AutoEntryPointSelectionTests()
+    {
+        var config = new ManagerConfig();
+        var group = new ServerGroup { Name = "Target" };
+        config.Groups.Add(group);
+
+        var preferredProxy = new BaseProxy { Name = "Preferred", Host = "127.0.0.1", Port = 1081 };
+        var otherProxy = new BaseProxy { Name = "Other", Host = "127.0.0.1", Port = 1082 };
+        config.BaseProxies.AddRange([otherProxy, preferredProxy]);
+        group.Servers.Add(new ManagedServer { Name = "Group Server", Host = "10.1.0.1", PreferredProxyId = preferredProxy.Id });
+
+        // 1. A proxy preferred by a server in the target group is tried first
+        var probe = new TestSmartDiscoveryProbe();
+        probe.ProxyReachable[preferredProxy.Id] = ["10.9.0.1"];
+        probe.ValidCredentials["10.9.0.1"] = [("root", "pw")];
+
+        var options = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.0.1"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            TargetGroupId = group.Id,
+            AutoSelectJumpHost = true,
+            MaxParallelConnections = 1
+        };
+
+        var engine = new SmartDiscoveryEngine(config, options, probe);
+        var result = engine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result.Discovered.Count);
+        Equal(preferredProxy.Id, result.Discovered[0].VerifiedProxyId);
+        Equal(1, probe.ReachabilityAttempts.Count);
+        Equal(preferredProxy.Id, probe.ReachabilityAttempts[0].proxyId);
+
+        // 2. Failover: the first preferred proxy is unreachable, the second works
+        probe.ReachabilityAttempts.Clear();
+        probe.ProxyReachable.Clear();
+        probe.ProxyReachable[otherProxy.Id] = ["10.9.0.2"];
+        probe.ValidCredentials["10.9.0.2"] = [("root", "pw")];
+
+        var failoverOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.0.2"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            TargetGroupId = group.Id,
+            AutoSelectJumpHost = true,
+            MaxParallelConnections = 1
+        };
+
+        var failoverLines = new List<string>();
+        var failoverEngine = new SmartDiscoveryEngine(config, failoverOptions, probe, log: failoverLines.Add);
+        var failoverResult = failoverEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, failoverResult.Discovered.Count);
+        Equal(otherProxy.Id, failoverResult.Discovered[0].VerifiedProxyId);
+        Equal(2, probe.ReachabilityAttempts.Count);
+        Equal(preferredProxy.Id, probe.ReachabilityAttempts[0].proxyId);
+        Equal(otherProxy.Id, probe.ReachabilityAttempts[1].proxyId);
+        Equal(true, failoverLines.Any(l => l.Contains(otherProxy.Name, StringComparison.Ordinal)));
+
+        // 3. ensureEntryPoint is invoked once per proxy even with parallel hosts
+        var managedConfig = new ManagerConfig();
+        var startupServer = new ManagedServer { Name = "Startup", Host = "10.0.0.50" };
+        managedConfig.UngroupedServers.Add(startupServer);
+        var managedA = new BaseProxy { Name = "Managed A", Host = "127.0.0.1", Port = 1083, StartupServerId = startupServer.Id };
+        var managedB = new BaseProxy { Name = "Managed B", Host = "127.0.0.1", Port = 1084, StartupServerId = startupServer.Id };
+        managedConfig.BaseProxies.AddRange([managedA, managedB]);
+
+        var managedProbe = new TestSmartDiscoveryProbe();
+        managedProbe.ProxyReachable[managedA.Id] = ["10.9.1.1"];
+        managedProbe.ProxyReachable[managedB.Id] = ["10.9.1.2", "10.9.1.3"];
+        foreach (var host in new[] { "10.9.1.1", "10.9.1.2", "10.9.1.3" })
+            managedProbe.ValidCredentials[host] = [("root", "pw")];
+
+        var ensureCounts = new Dictionary<Guid, int>();
+        Func<BaseProxy, CancellationToken, Task<bool>> ensureEntryPoint = (proxy, _) =>
+        {
+            lock (ensureCounts)
+            {
+                ensureCounts[proxy.Id] = ensureCounts.GetValueOrDefault(proxy.Id) + 1;
+            }
+            return Task.FromResult(true);
+        };
+
+        var managedOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.1.1", "10.9.1.2", "10.9.1.3"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = true,
+            MaxParallelConnections = 3
+        };
+
+        var managedEngine = new SmartDiscoveryEngine(
+            managedConfig, managedOptions, managedProbe, ensureEntryPoint: ensureEntryPoint);
+        var managedResult = managedEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(3, managedResult.Discovered.Count);
+        Equal(1, ensureCounts[managedA.Id]);
+        Equal(1, ensureCounts[managedB.Id]);
+
+        // 4. No enabled proxies -> direct connection
+        var directConfig = new ManagerConfig();
+        directConfig.BaseProxies.Add(new BaseProxy { Name = "Disabled", Enabled = false });
+        var directProbe = new TestSmartDiscoveryProbe();
+        directProbe.DirectlyReachable.Add("10.9.2.1");
+        directProbe.ValidCredentials["10.9.2.1"] = [("root", "pw")];
+
+        var directOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.2.1"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = true
+        };
+
+        var directEngine = new SmartDiscoveryEngine(directConfig, directOptions, directProbe);
+        var directResult = directEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, directResult.Discovered.Count);
+        Equal(null, directResult.Discovered[0].VerifiedProxyId);
+
+        // 5. Auth failover: an external proxy is TCP-reachable but cannot authenticate,
+        // so the managed proxy is started and wins
+        var authFailoverConfig = new ManagerConfig();
+        var authStartupServer = new ManagedServer { Name = "Bravo Startup", Host = "10.0.0.60" };
+        authFailoverConfig.UngroupedServers.Add(authStartupServer);
+        var alphaProxy = new BaseProxy { Name = "Alpha", Host = "127.0.0.1", Port = 1087 };
+        var bravoProxy = new BaseProxy
+        {
+            Name = "Bravo", Host = "127.0.0.1", Port = 1088, StartupServerId = authStartupServer.Id
+        };
+        authFailoverConfig.BaseProxies.AddRange([alphaProxy, bravoProxy]);
+
+        var authFailoverProbe = new TestSmartDiscoveryProbe();
+        authFailoverProbe.ProxyReachable[alphaProxy.Id] = ["10.9.5.1"];
+        authFailoverProbe.ProxyAuthUnreachable.Add((alphaProxy.Id, "10.9.5.1"));
+        authFailoverProbe.ValidCredentials["10.9.5.1"] = [("root", "pw")];
+
+        var authFailoverCounts = new Dictionary<Guid, int>();
+        Func<BaseProxy, CancellationToken, Task<bool>> authFailoverEnsure = (proxy, _) =>
+        {
+            lock (authFailoverCounts)
+            {
+                authFailoverCounts[proxy.Id] = authFailoverCounts.GetValueOrDefault(proxy.Id) + 1;
+            }
+            return Task.FromResult(true);
+        };
+
+        var authFailoverOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.5.1"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = true,
+            MaxParallelConnections = 1
+        };
+
+        var authFailoverEngine = new SmartDiscoveryEngine(
+            authFailoverConfig, authFailoverOptions, authFailoverProbe, ensureEntryPoint: authFailoverEnsure);
+        var authFailoverResult = authFailoverEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, authFailoverResult.Discovered.Count);
+        Equal(bravoProxy.Id, authFailoverResult.Discovered[0].VerifiedProxyId);
+        Equal(1, authFailoverCounts[bravoProxy.Id]);
+    }
+
+    private static void ManagedEntryPointLinkTests()
+    {
+        var config = new ManagerConfig();
+        var startupServer = new ManagedServer { Name = "Startup GW", Host = "10.0.0.1" };
+        config.UngroupedServers.Add(startupServer);
+
+        var managedProxy = new BaseProxy
+        {
+            Name = "Managed Proxy", Host = "127.0.0.1", Port = 1085, StartupServerId = startupServer.Id
+        };
+        config.BaseProxies.Add(managedProxy);
+
+        var probe = new TestSmartDiscoveryProbe();
+        probe.ProxyReachable[managedProxy.Id] = ["10.9.3.1"];
+        probe.ValidCredentials["10.9.3.1"] = [("root", "pw")];
+
+        var options = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.3.1"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = true
+        };
+
+        var engine = new SmartDiscoveryEngine(config, options, probe);
+        var result = engine.DiscoverAsync().GetAwaiter().GetResult();
+
+        var candidate = result.Discovered.Single();
+        Equal(managedProxy.Id, candidate.VerifiedProxyId);
+        Equal(null, candidate.RequiredPreviousServerId);
+        Equal(startupServer.Id, candidate.DiscoveredLinksFrom.Single());
+
+        var created = SmartDiscoverySessionCreator.CreateSessions(config, [candidate]);
+        Equal(1, created.Count);
+        var link = config.Links.Single(l => l.FromServerId == startupServer.Id && l.ToServerId == candidate.Id);
+        Equal(true, link.Discovered);
+        Equal(managedProxy.Id, link.LastSuccessfulProxyId);
+
+        // An external proxy has no startup server, so no directed link is fabricated
+        var externalProxy = new BaseProxy { Name = "External Proxy", Host = "127.0.0.1", Port = 1086 };
+        config.BaseProxies.Clear();
+        config.BaseProxies.Add(externalProxy);
+        probe.ProxyReachable[externalProxy.Id] = ["10.9.3.2"];
+        probe.ValidCredentials["10.9.3.2"] = [("root", "pw")];
+
+        var externalOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.3.2"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = true
+        };
+
+        var externalEngine = new SmartDiscoveryEngine(config, externalOptions, probe);
+        var externalResult = externalEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        var externalCandidate = externalResult.Discovered.Single();
+        Equal(externalProxy.Id, externalCandidate.VerifiedProxyId);
+        Equal(0, externalCandidate.DiscoveredLinksFrom.Count);
+    }
+
+    private static void DiscoveryLoggingRedactionTests()
+    {
+        var config = new ManagerConfig();
+        var probe = new TestSmartDiscoveryProbe();
+        probe.DirectlyReachable.Add("10.9.4.1");
+        probe.DirectlyReachable.Add("10.9.4.2");
+        probe.ValidCredentials["10.9.4.1"] = [("root", "SENTINEL_LOGIN_PW")];
+        probe.Escalations["10.9.4.1"] = new PrivilegeEscalationResult
+        {
+            Method = "sudo",
+            RootCommand = "sudo -i",
+            RootPassword = "SENTINEL_ROOT_PW",
+            StatusDescription = "Root доступ подтверждён",
+            Success = true
+        };
+        probe.AuthErrorMessage = "Неверные учетные данные: SENTINEL_LOGIN_PW";
+
+        var lines = new List<string>();
+        var options = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.4.1", "10.9.4.2"],
+            Usernames = ["root"],
+            Passwords = ["SENTINEL_LOGIN_PW"],
+            MaxParallelConnections = 1
+        };
+
+        var engine = new SmartDiscoveryEngine(config, options, probe, log: lines.Add);
+        var result = engine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result.Discovered.Count);
+        Equal(1, result.Problematic.Count);
+        Equal(true, lines.Count > 0);
+        Equal(true, lines.Any(l => l.Contains("Сканирование", StringComparison.Ordinal)));
+        Equal(true, lines.Any(l => l.Contains("Фаза 1", StringComparison.Ordinal)));
+        Equal(true, lines.Any(l => l.Contains("вход", StringComparison.Ordinal)));
+        Equal(true, lines.Any(l => l.Contains("повышение прав", StringComparison.Ordinal)));
+        Equal(false, lines.Any(l => l.Contains("SENTINEL_LOGIN_PW", StringComparison.Ordinal)));
+        Equal(false, lines.Any(l => l.Contains("SENTINEL_ROOT_PW", StringComparison.Ordinal)));
+    }
+
+    private static void SmartDiscoveryPreviewConfigTests()
+    {
+        var source = new ManagerConfig();
+        var sourceServer = new ManagedServer { Name = "Existing Server", Host = "10.0.0.1" };
+        source.UngroupedServers.Add(sourceServer);
+
+        var proxyId = Guid.NewGuid();
+        var dependency = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.10",
+            Port = 22,
+            Username = "root",
+            Password = "pw1",
+            ProposedName = "Dependency",
+            IsSelected = false
+        };
+        var dependent = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.11",
+            Port = 22,
+            Username = "admin",
+            Password = "pw2",
+            ProposedName = "Dependent",
+            RequiredPreviousServerId = dependency.Id,
+            DiscoveredLinksFrom = [dependency.Id],
+            VerifiedProxyId = proxyId,
+            PrivilegeEscalation = new PrivilegeEscalationResult
+            {
+                Method = "sudo",
+                RootCommand = "sudo -i",
+                RootPassword = "rootpw",
+                Success = true
+            },
+            HostKeyFingerprint = "SHA256:abc",
+            HostKeyAlgorithm = "ssh-rsa",
+            HostKeyBits = 2048,
+            IsSelected = true
+        };
+
+        var preview = SmartDiscoverySessionCreator.CreatePreviewConfig(source, [dependency, dependent]);
+
+        // The source config is not mutated
+        Equal(1, source.AllServers().Count());
+        Equal(0, source.Links.Count);
+
+        // All candidates become draft servers, including unselected dependencies
+        Equal(3, preview.AllServers().Count());
+        var draftDependency = preview.FindServer(dependency.Id);
+        var draftDependent = preview.FindServer(dependent.Id);
+        Equal(true, draftDependency != null);
+        Equal(true, draftDependent != null);
+
+        Equal("sudo -i", draftDependent!.RootLogin);
+        Equal("rootpw", draftDependent.RootPassword);
+        Equal("SHA256:abc", draftDependent.HostKeyFingerprint);
+        Equal("ssh-rsa", draftDependent.HostKeyAlgorithm);
+        Equal(2048, draftDependent.HostKeyBits);
+        Equal(proxyId, draftDependent.PreferredProxyId);
+        Equal(dependency.Id, draftDependent.RequiredPreviousServerId);
+
+        var link = preview.Links.Single(l => l.FromServerId == dependency.Id && l.ToServerId == dependent.Id);
+        Equal(true, link.Discovered);
+        Equal("DirectTcpIp", link.LastStrategy);
+        Equal(proxyId, link.LastSuccessfulProxyId);
+        Equal(true, link.LastSuccessUtc != null);
+
+        // Mutating the snapshot does not change the source config
+        var previewSource = preview.FindServer(sourceServer.Id);
+        Equal(true, previewSource != null);
+        previewSource!.Name = "Mutated";
+        preview.Links.Clear();
+        Equal("Existing Server", source.UngroupedServers[0].Name);
+
+        // CreateDraftServer preserves the persisted fields
+        var draft = SmartDiscoverySessionCreator.CreateDraftServer(dependent);
+        Equal(dependent.Id, draft.Id);
+        Equal("Dependent", draft.Name);
+        Equal("sudo -i", draft.RootLogin);
+        Equal("rootpw", draft.RootPassword);
+        Equal("SHA256:abc", draft.HostKeyFingerprint);
+        Equal("ssh-rsa", draft.HostKeyAlgorithm);
+        Equal(2048, draft.HostKeyBits);
+        Equal(proxyId, draft.PreferredProxyId);
+        Equal(dependency.Id, draft.RequiredPreviousServerId);
+        Equal(15, draft.KeepaliveIntervalSeconds);
+        Equal(true, draft.UseKeyboardInteractive);
+
+        // A directly discovered candidate drafts as "try direct without jumphost"
+        var directCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.12",
+            Port = 22,
+            Username = "root",
+            Password = "pw3",
+            ProposedName = "Direct",
+            IsSelected = true
+        };
+        var directDraft = SmartDiscoverySessionCreator.CreateDraftServer(directCandidate);
+        Equal(true, directDraft.TryDirectWithoutJumphost);
+        preview.UngroupedServers.Add(directDraft);
+        var directCandidates = RoutePlanner.Candidates(preview, directDraft.Id);
+        Equal(1, directCandidates.Count);
+        Equal(true, directCandidates[0].WithoutProxy);
+        Equal(1, directCandidates[0].Servers.Count);
+
+        // A proxy-free multi-hop chain is previewed as an explicit candidate
+        var gatewayCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.13",
+            Port = 22,
+            Username = "root",
+            Password = "pw4",
+            ProposedName = "Gateway",
+            IsSelected = true
+        };
+        var multiHopCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.14",
+            Port = 22,
+            Username = "root",
+            Password = "pw5",
+            ProposedName = "MultiHop",
+            RequiredPreviousServerId = gatewayCandidate.Id,
+            DiscoveredLinksFrom = [gatewayCandidate.Id],
+            IsSelected = true
+        };
+        var multiHopPreview = SmartDiscoverySessionCreator.CreatePreviewConfig(
+            source, [gatewayCandidate, multiHopCandidate]);
+        var multiHopResult = SmartDiscoverySessionCreator.CreatePreviewCandidates(multiHopPreview, multiHopCandidate);
+        Equal(1, multiHopResult.Count);
+        Equal(true, multiHopResult[0].WithoutProxy);
+        Equal(2, multiHopResult[0].Servers.Count);
+        Equal(gatewayCandidate.Id, multiHopResult[0].Servers[0].Id);
+        Equal(multiHopCandidate.Id, multiHopResult[0].Servers[1].Id);
+
+        // Proxied candidates never use the proxy-free preview chain
+        Equal(0, SmartDiscoverySessionCreator.CreatePreviewCandidates(preview, dependent).Count);
     }
 }

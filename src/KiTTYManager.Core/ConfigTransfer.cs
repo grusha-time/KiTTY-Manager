@@ -428,6 +428,8 @@ public static class ConfigTransfer
         }
     }
 
+    public static ManagerConfig CloneSnapshot(ManagerConfig source) => Clone(source);
+
     private static T Clone<T>(T value) =>
         JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(value, JsonOptions), JsonOptions)!;
 }
