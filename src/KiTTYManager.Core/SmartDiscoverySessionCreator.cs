@@ -291,6 +291,36 @@ public static class SmartDiscoverySessionCreator
         return created;
     }
 
+    public static IReadOnlyList<ConnectivityPairChoice> PlanLinksToExistingGroupServers(
+        ManagerConfig config,
+        IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> existingIndependentByGroup,
+        IEnumerable<Guid> createdServerIds)
+    {
+        var createdIds = createdServerIds.ToHashSet();
+        var result = new List<ConnectivityPairChoice>();
+        var seen = new HashSet<(Guid SourceId, Guid TargetId)>();
+
+        foreach (var createdId in createdIds)
+        {
+            var created = config.FindServer(createdId);
+            if (created is null) continue;
+
+            var scopeId = config.FindServerGroup(createdId)?.Id ?? Guid.Empty;
+            if (!existingIndependentByGroup.TryGetValue(scopeId, out var sources)) continue;
+
+            foreach (var sourceId in sources.Distinct())
+            {
+                if (createdIds.Contains(sourceId)) continue;
+                var source = config.FindServer(sourceId);
+                if (source is null || sourceId == createdId) continue;
+                if (!seen.Add((sourceId, createdId))) continue;
+                result.Add(new ConnectivityPairChoice(source.Id, created.Id, source.Name, created.Name));
+            }
+        }
+
+        return result;
+    }
+
     public static (string? RootGroupName, string? SubgroupPath) ResolveGroupAssignment(
         ManagerConfig config, Guid? targetGroupId, string? typedSubgroupName)
     {

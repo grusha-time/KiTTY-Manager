@@ -3,6 +3,9 @@ using KiTTYManager.App;
 
 internal sealed partial class SelfTestRunner
 {
+    private sealed record DiscoveryHopAttempt(
+        IReadOnlyList<ManagedServer> Gateways, Guid? ProxyId);
+
     private sealed class TestSmartDiscoveryProbe : ISmartDiscoveryProbe
     {
         public HashSet<string> DirectlyReachable { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -19,6 +22,7 @@ internal sealed partial class SelfTestRunner
         public List<(string host, string user, string pass)> AttemptedLogins { get; } = [];
         public List<(string host, Guid? proxyId)> ReachabilityAttempts { get; } = [];
         public List<List<(string Host, string Password)>> HopChains { get; } = [];
+        public List<DiscoveryHopAttempt> HopAttempts { get; } = [];
 
         public Task<bool> ProbeReachabilityAsync(
             BaseProxy? jumpHost, string host, int port, TimeSpan timeout, CancellationToken cancellationToken)
@@ -37,6 +41,20 @@ internal sealed partial class SelfTestRunner
                 return ProbeReachabilityAsync(jumpHost, targetHost, targetPort, timeout, cancellationToken);
 
             HopChains.Add(intermediateGateways.Select(g => (g.Host, g.Password)).ToList());
+            HopAttempts.Add(new DiscoveryHopAttempt(
+                intermediateGateways.Select(g => new ManagedServer
+                {
+                    Id = g.Id,
+                    Name = g.Name,
+                    Host = g.Host,
+                    Port = g.Port,
+                    Username = g.Username,
+                    Password = g.Password,
+                    PrivateKeyPath = g.PrivateKeyPath,
+                    PrivateKeyPassphrase = g.PrivateKeyPassphrase,
+                    UseKeyboardInteractive = g.UseKeyboardInteractive
+                }).ToArray(),
+                jumpHost?.Id));
 
             var lastGateway = intermediateGateways[^1].Host;
             return Task.FromResult(HopReachability.Contains((lastGateway, targetHost)));
@@ -463,6 +481,186 @@ internal sealed partial class SelfTestRunner
         Equal(1, candA.RouteHops.Count);
         Equal(2, candB.RouteHops.Count);
         Equal(3, candC.RouteHops.Count);
+
+        var savedGatewayConfig = new ManagerConfig();
+        var savedGatewayGroup = new ServerGroup { Name = "Saved Gateway Group" };
+        var savedGateway = new ManagedServer
+        {
+            Name = "Saved Group Gateway",
+            Host = "10.20.0.2",
+            Port = 22,
+            Username = "saved",
+            Password = "SAVED_PW",
+            PrivateKeyPath = "C:\\keys\\saved.ppk"
+        };
+        savedGatewayGroup.Servers.Add(savedGateway);
+        savedGatewayConfig.Groups.Add(savedGatewayGroup);
+        var outsideEntry = new ManagedServer
+        {
+            Name = "Outside Entry",
+            Host = "10.20.0.1",
+            Port = 22,
+            Username = "jump",
+            Password = "OUTSIDE_PW"
+        };
+        var outsideHop = new ManagedServer
+        {
+            Name = "Outside Hop",
+            Host = "10.20.0.3",
+            Port = 22,
+            Username = "hop",
+            Password = "HOP_PW"
+        };
+        savedGatewayConfig.UngroupedServers.AddRange([outsideEntry, outsideHop]);
+        var savedRouteProxy = new BaseProxy { Name = "Saved Route Proxy", Host = "127.0.0.1", Port = 1101 };
+        var otherSavedProxy = new BaseProxy { Name = "Other Saved Proxy", Host = "127.0.0.1", Port = 1102 };
+        savedGatewayConfig.BaseProxies.AddRange([otherSavedProxy, savedRouteProxy]);
+        outsideEntry.PreferredRoute = new CachedRoute
+        {
+            ProxyId = savedRouteProxy.Id,
+            ServerIds = [outsideEntry.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        savedGateway.PreferredRoute = new CachedRoute
+        {
+            ProxyId = savedRouteProxy.Id,
+            ServerIds = [outsideEntry.Id, outsideHop.Id, savedGateway.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        savedGatewayConfig.Links.AddRange(
+        [
+            new ServerLink
+            {
+                FromServerId = outsideEntry.Id,
+                ToServerId = outsideHop.Id,
+                LastSuccessUtc = DateTimeOffset.UtcNow,
+                LastSuccessfulProxyId = savedRouteProxy.Id,
+                LastStrategy = "DirectTcpIp"
+            },
+            new ServerLink
+            {
+                FromServerId = outsideHop.Id,
+                ToServerId = savedGateway.Id,
+                LastSuccessUtc = DateTimeOffset.UtcNow,
+                LastSuccessfulProxyId = savedRouteProxy.Id,
+                LastStrategy = "DirectTcpIp"
+            }
+        ]);
+
+        var savedGatewayProbe = new TestSmartDiscoveryProbe();
+        const string savedTargetHost = "10.20.5.5";
+        savedGatewayProbe.HopReachability.Add((savedGateway.Host, savedTargetHost));
+        savedGatewayProbe.ValidCredentials[savedTargetHost] = [("root", "TARGET_PW")];
+
+        var savedGatewayOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [savedTargetHost],
+            Usernames = ["root"],
+            Passwords = ["TARGET_PW"],
+            TargetGroupId = savedGatewayGroup.Id,
+            MaxParallelConnections = 1,
+            AutoSelectJumpHost = true
+        };
+
+        var savedGatewayEngine = new SmartDiscoveryEngine(
+            savedGatewayConfig, savedGatewayOptions, savedGatewayProbe);
+        var savedGatewayResult = savedGatewayEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(false, savedGatewayResult.Discovered.Any(c => c.Id == savedGateway.Id));
+        var savedTarget = savedGatewayResult.Discovered.Single();
+        Equal(savedGateway.Id, savedTarget.RequiredPreviousServerId);
+        Equal(savedGateway.Id, savedTarget.DiscoveredLinksFrom.Single());
+        Equal(savedRouteProxy.Id, savedTarget.VerifiedProxyId);
+        Equal(
+            string.Join('/', outsideEntry.Host, outsideHop.Host, savedGateway.Host, savedTargetHost),
+            string.Join('/', savedTarget.RouteHops.Select(hop => hop.Host)));
+
+        var savedGatewayAttempt = savedGatewayProbe.HopAttempts.Last();
+        Equal(savedRouteProxy.Id, savedGatewayAttempt.ProxyId);
+        Equal(3, savedGatewayAttempt.Gateways.Count);
+        Equal(outsideEntry.Host, savedGatewayAttempt.Gateways[0].Host);
+        Equal(outsideHop.Host, savedGatewayAttempt.Gateways[1].Host);
+        Equal(savedGateway.Id, savedGatewayAttempt.Gateways[2].Id);
+        Equal("SAVED_PW", savedGatewayAttempt.Gateways[2].Password);
+        Equal("C:\\keys\\saved.ppk", savedGatewayAttempt.Gateways[2].PrivateKeyPath);
+
+        var savedCreated = SmartDiscoverySessionCreator.CreateSessions(
+            savedGatewayConfig, savedGatewayResult.Discovered);
+        Equal(1, savedCreated.Count);
+        Equal(savedGateway.Id, savedCreated[0].RequiredPreviousServerId);
+        Equal(true, savedGatewayConfig.Links.Any(
+            link => link.FromServerId == savedGateway.Id && link.ToServerId == savedTarget.Id));
+        Equal("SAVED_PW", savedGateway.Password);
+        Equal("C:\\keys\\saved.ppk", savedGateway.PrivateKeyPath);
+
+        var directSavedConfig = new ManagerConfig();
+        var directSavedGroup = new ServerGroup { Name = "Direct Saved Group" };
+        var directSavedGateway = new ManagedServer
+        {
+            Name = "Saved Direct Root",
+            Host = "10.30.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "ROOT_PW",
+            TryDirectWithoutJumphost = true
+        };
+        directSavedGateway.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [directSavedGateway.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        directSavedGroup.Servers.Add(directSavedGateway);
+        directSavedConfig.Groups.Add(directSavedGroup);
+        directSavedConfig.BaseProxies.AddRange([
+            new BaseProxy { Name = "Direct Auto Proxy 1", Host = "127.0.0.1", Port = 1201 },
+            new BaseProxy { Name = "Direct Auto Proxy 2", Host = "127.0.0.1", Port = 1202 }
+        ]);
+
+        var directSavedProbe = new TestSmartDiscoveryProbe();
+        const string directWaveGatewayHost = "10.30.0.9";
+        const string directWaveTargetHost = "10.30.0.10";
+        directSavedProbe.HopReachability.Add((directSavedGateway.Host, directWaveGatewayHost));
+        directSavedProbe.HopReachability.Add((directWaveGatewayHost, directWaveTargetHost));
+        directSavedProbe.ValidCredentials[directWaveGatewayHost] = [("root", "WAVE_PW")];
+        directSavedProbe.ValidCredentials[directWaveTargetHost] = [("root", "WAVE_PW")];
+
+        var directSavedOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [directWaveGatewayHost, directWaveTargetHost],
+            Usernames = ["root"],
+            Passwords = ["WAVE_PW"],
+            TargetGroupId = directSavedGroup.Id,
+            MaxParallelConnections = 1,
+            AutoSelectJumpHost = true
+        };
+
+        var directSavedEngine = new SmartDiscoveryEngine(
+            directSavedConfig, directSavedOptions, directSavedProbe);
+        var directSavedResult = directSavedEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        var directWaveGateway = directSavedResult.Discovered.Single(c => c.Host == directWaveGatewayHost);
+        var directWaveTarget = directSavedResult.Discovered.Single(c => c.Host == directWaveTargetHost);
+        Equal(directSavedGateway.Id, directWaveGateway.RequiredPreviousServerId);
+        Equal(directWaveGateway.Id, directWaveTarget.RequiredPreviousServerId);
+        Equal(
+            string.Join('/', directSavedGateway.Host, directWaveGatewayHost, directWaveTargetHost),
+            string.Join('/', directWaveTarget.RouteHops.Select(hop => hop.Host)));
+        Equal(null, directSavedProbe.HopAttempts.Last().ProxyId);
+        Equal(
+            string.Join('/', directSavedGateway.Host, directWaveGatewayHost),
+            string.Join('/', directSavedProbe.HopAttempts.Last().Gateways.Select(server => server.Host)));
+        Equal(null, directWaveGateway.VerifiedProxyId);
+
+        var directSavedCreated = SmartDiscoverySessionCreator.CreateSessions(
+            directSavedConfig, directSavedResult.Discovered);
+        Equal(2, directSavedCreated.Count);
+        Equal(directSavedGateway.Id,
+            directSavedCreated.Single(s => s.Host == directWaveGatewayHost).RequiredPreviousServerId);
+        Equal(directWaveGateway.Id,
+            directSavedCreated.Single(s => s.Host == directWaveTargetHost).RequiredPreviousServerId);
+        Equal(true, directSavedConfig.Links.Any(
+            link => link.FromServerId == directSavedGateway.Id && link.ToServerId == directWaveGateway.Id));
     }
 
     private static void CancellationPreservesDiscoveredCandidatesTests()
@@ -878,6 +1076,77 @@ internal sealed partial class SelfTestRunner
         Equal(1, brokenChainConfig.AllServers().Count());
         Equal(0, brokenChainConfig.Links.Count);
         Equal(0, brokenChainConfig.Groups.Count);
+
+        var planConfig = new ManagerConfig();
+        var planRoot = new ServerGroup { Name = "Plan Root" };
+        var planNested = new ServerGroup { Name = "Plan Nested" };
+        planRoot.Groups.Add(planNested);
+        planConfig.Groups.Add(planRoot);
+        var planRootServer = new ManagedServer { Name = "Plan Root Server", Host = "10.40.0.1", Port = 22 };
+        var planNestedServer = new ManagedServer { Name = "Plan Nested Server", Host = "10.40.0.2", Port = 22 };
+        var planUngroupedServer = new ManagedServer { Name = "Plan Ungrouped Server", Host = "10.40.0.3", Port = 22 };
+        planRoot.Servers.Add(planRootServer);
+        planNested.Servers.Add(planNestedServer);
+        planConfig.UngroupedServers.Add(planUngroupedServer);
+
+        var editedDestinationCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.40.0.10",
+            Port = 22,
+            Username = "root",
+            Password = "pw",
+            ProposedName = "Edited Nested Destination",
+            GroupId = planRoot.Id,
+            GroupName = "Plan Root",
+            SubgroupName = "Plan Nested",
+            IsSelected = true
+        };
+        var editedDestination = SmartDiscoverySessionCreator.CreateSessions(
+            planConfig, [editedDestinationCandidate]).Single();
+        Equal(planNested.Id, planConfig.FindServerGroup(editedDestination.Id)?.Id);
+
+        var ungroupedDestinationCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.40.0.11",
+            Port = 22,
+            Username = "root",
+            Password = "pw",
+            ProposedName = "New Ungrouped Destination",
+            GroupId = planRoot.Id,
+            GroupName = "   ",
+            IsSelected = true
+        };
+        var ungroupedDestination = SmartDiscoverySessionCreator.CreateSessions(
+            planConfig, [ungroupedDestinationCandidate]).Single();
+        Equal(null, planConfig.FindServerGroup(ungroupedDestination.Id));
+
+        var newlyCreatedSource = new ManagedServer { Name = "New Source", Host = "10.40.0.12", Port = 22 };
+        planNested.Servers.Add(newlyCreatedSource);
+
+        var independentByGroup = new Dictionary<Guid, IReadOnlyList<Guid>>
+        {
+            [planRoot.Id] = [planRootServer.Id],
+            [planNested.Id] =
+                [planNestedServer.Id, newlyCreatedSource.Id, editedDestination.Id],
+            [Guid.Empty] = [planUngroupedServer.Id, ungroupedDestination.Id]
+        };
+        var createdIds = new[]
+        {
+            editedDestination.Id, ungroupedDestination.Id, newlyCreatedSource.Id
+        };
+        var plannedLinks = SmartDiscoverySessionCreator.PlanLinksToExistingGroupServers(
+            planConfig, independentByGroup, createdIds);
+
+        Equal(3, plannedLinks.Count);
+        Equal(false, plannedLinks.Any(pair => createdIds.Contains(pair.SourceId)));
+        Equal(false, plannedLinks.Any(pair => pair.SourceId == planRootServer.Id));
+        Equal(true, plannedLinks.Any(pair =>
+            pair.SourceId == planNestedServer.Id && pair.TargetId == editedDestination.Id &&
+            pair.SourceName == planNestedServer.Name && pair.TargetName == editedDestination.Name));
+        Equal(true, plannedLinks.Any(pair =>
+            pair.SourceId == planNestedServer.Id && pair.TargetId == newlyCreatedSource.Id));
+        Equal(true, plannedLinks.Any(pair =>
+            pair.SourceId == planUngroupedServer.Id && pair.TargetId == ungroupedDestination.Id));
     }
 
     private static void AutoEntryPointSelectionTests()
@@ -1115,6 +1384,7 @@ internal sealed partial class SelfTestRunner
         var link = config.Links.Single(l => l.FromServerId == startupServer.Id && l.ToServerId == candidate.Id);
         Equal(true, link.Discovered);
         Equal(managedProxy.Id, link.LastSuccessfulProxyId);
+        Equal(true, ServerLinkPairPolicy.IsEntryPointLink(config, link));
 
         // An external proxy has no startup server, so no directed link is fabricated
         var externalProxy = new BaseProxy { Name = "External Proxy", Host = "127.0.0.1", Port = 1086 };
@@ -1137,6 +1407,83 @@ internal sealed partial class SelfTestRunner
         var externalCandidate = externalResult.Discovered.Single();
         Equal(externalProxy.Id, externalCandidate.VerifiedProxyId);
         Equal(0, externalCandidate.DiscoveredLinksFrom.Count);
+
+        var mapConfig = new ManagerConfig();
+        var mapStartup = new ManagedServer { Name = "Map Startup", Host = "10.9.7.1" };
+        var mapTarget = new ManagedServer { Name = "Map Target", Host = "10.9.7.2" };
+        mapConfig.UngroupedServers.AddRange([mapStartup, mapTarget]);
+        var mapProxy = new BaseProxy
+        {
+            Name = "Map Managed Proxy", Host = "127.0.0.1", Port = 1089, StartupServerId = mapStartup.Id
+        };
+        var mapExternalProxy = new BaseProxy { Name = "Map External Proxy", Host = "127.0.0.1", Port = 1090 };
+        mapConfig.BaseProxies.AddRange([mapProxy, mapExternalProxy]);
+
+        var mapEntryLink = new ServerLink
+        {
+            FromServerId = mapStartup.Id,
+            ToServerId = mapTarget.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow,
+            LastSuccessfulProxyId = mapProxy.Id
+        };
+        var mapNormalLink = new ServerLink
+        {
+            FromServerId = mapTarget.Id,
+            ToServerId = mapStartup.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        var mapExternalLink = new ServerLink
+        {
+            FromServerId = mapStartup.Id,
+            ToServerId = mapTarget.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow,
+            LastSuccessfulProxyId = mapExternalProxy.Id
+        };
+        Equal(true, ServerLinkPairPolicy.IsEntryPointLink(mapConfig, mapEntryLink));
+        Equal(false, ServerLinkPairPolicy.IsEntryPointLink(mapConfig, mapNormalLink));
+        Equal(false, ServerLinkPairPolicy.IsEntryPointLink(mapConfig, mapExternalLink));
+
+        mapConfig.Links.Add(mapEntryLink);
+        var filteredWithoutReverse = mapConfig.Links
+            .Where(link => !ServerLinkPairPolicy.IsEntryPointLink(mapConfig, link))
+            .ToArray();
+        Equal(0, LinkMapLayout.Build(mapConfig, filteredWithoutReverse).Edges.Count);
+
+        mapConfig.Links.Add(mapNormalLink);
+        var refreshedLinks = ServerLinkPairPolicy.ExcludeEntryPointLinks(mapConfig, mapConfig.Links);
+        Equal(1, refreshedLinks.Count);
+        Equal(mapNormalLink, refreshedLinks[0]);
+        var filteredWithReverse = mapConfig.Links
+            .Where(link => !ServerLinkPairPolicy.IsEntryPointLink(mapConfig, link))
+            .ToArray();
+        var filteredMap = LinkMapLayout.Build(mapConfig, filteredWithReverse);
+        Equal(1, filteredMap.Edges.Count);
+        Equal(true, filteredMap.Edges[0].IsDirected);
+        Equal(true, filteredMap.Edges[0].AtoBAvailable ^ filteredMap.Edges[0].BtoAAvailable);
+
+        // Re-checking the reverse direction through its startup proxy makes it an
+        // entry-point link too; the filtered refresh result becomes empty.
+        var mapTargetProxy = new BaseProxy
+        {
+            Name = "Map Target Proxy", Host = "127.0.0.1", Port = 1091, StartupServerId = mapTarget.Id
+        };
+        mapConfig.BaseProxies.Add(mapTargetProxy);
+        mapNormalLink.LastSuccessfulProxyId = mapTargetProxy.Id;
+        Equal(true, ServerLinkPairPolicy.IsEntryPointLink(mapConfig, mapNormalLink));
+        Equal(0, ServerLinkPairPolicy.ExcludeEntryPointLinks(mapConfig, mapConfig.Links).Count);
+
+        // The reverse check can later add an ordinary visible link; the refresh
+        // result transitions from empty back to non-empty.
+        var mapLateReverseLink = new ServerLink
+        {
+            FromServerId = mapTarget.Id,
+            ToServerId = mapStartup.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        mapConfig.Links.Add(mapLateReverseLink);
+        var refreshedAfterReverse = ServerLinkPairPolicy.ExcludeEntryPointLinks(mapConfig, mapConfig.Links);
+        Equal(1, refreshedAfterReverse.Count);
+        Equal(mapLateReverseLink, refreshedAfterReverse[0]);
     }
 
     private static void DiscoveryLoggingRedactionTests()

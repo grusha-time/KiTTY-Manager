@@ -624,7 +624,15 @@ public sealed class SmartDiscoveryEngine
             await Task.WhenAll(authTasks).ConfigureAwait(false);
 
             // Phase 3: Multi-hop discovery for remaining unreachable hosts
-            var allKnownGateways = discovered.Concat(initialGateways ?? []).ToList();
+            var savedGatewaySeeds = new List<DiscoveredServerCandidate>();
+            var savedRouteByGatewayId = new Dictionary<Guid, SavedGatewayRoute>();
+            if (unreachableHosts.Count > 0)
+                (savedGatewaySeeds, savedRouteByGatewayId) = ResolveSavedGateways();
+            var allKnownGateways = savedGatewaySeeds
+                .Concat(discovered)
+                .Concat(initialGateways ?? [])
+                .DistinctBy(gateway => gateway.Id)
+                .ToList();
             if (unreachableHosts.Count > 0 && allKnownGateways.Count > 0)
             {
                 ReportProgress(SmartDiscoveryProgressKind.MultiHopProbing, "", $"Фаза 3: Поиск multi-hop маршрутов ({unreachableHosts.Count} недоступных хостов)...", discovered.Count, problematic.Count, totalCount, 60);
@@ -639,9 +647,10 @@ public sealed class SmartDiscoveryEngine
 
                     foreach (var gateway in availableGateways)
                     {
-                        if (gateway.RouteHops.Count >= maxHops) continue;
-
-                        var gatewayChain = BuildGatewayChain(gateway, discovered.Concat(initialGateways ?? []).ToList());
+                        var gatewayChain = BuildGatewayChain(
+                            gateway, discovered.Concat(initialGateways ?? []).ToList(), savedRouteByGatewayId);
+                        var savedPrefixLength = gatewayChain.SavedRoute?.Servers.Count ?? 0;
+                        if (gateway.RouteHops.Count - savedPrefixLength >= maxHops) continue;
 
                         for (var i = unreachableHosts.Count - 1; i >= 0; i--)
                         {
@@ -659,19 +668,25 @@ public sealed class SmartDiscoveryEngine
                             if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
                                 continue;
 
-                            foreach (var entryPoint in entryPoints)
+                            var gatewayEntryPoints = gatewayChain.SavedRoute is { } savedRoute
+                                ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
+                                : entryPoints;
+
+                            foreach (var entryPoint in gatewayEntryPoints)
                             {
                                 if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
                                     continue;
 
                                 var canHop = await probe.ProbeHopReachabilityAsync(
-                                    entryPoint, gatewayChain, targetHost, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                                    entryPoint, gatewayChain.Servers, targetHost, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
                                 Log($"Фаза 3: хост {targetHost} через шлюз {gateway.ProposedName} и {DescribeEntryPoint(entryPoint)} — {(canHop ? "доступен" : "недоступен")}.");
 
                                 if (!canHop) continue;
 
                                 var (candidate, hopProblem) = await AuthenticateHostAsync(
-                                    targetHost, entryPoint, gatewayChain, gateway.RouteHops, cancellationToken, previousServerId: gateway.Id).ConfigureAwait(false);
+                                    targetHost, entryPoint, gatewayChain.Servers, gateway.RouteHops, cancellationToken,
+                                    previousServerId: gateway.Id,
+                                    lockEntryPoint: gatewayChain.SavedRoute is not null).ConfigureAwait(false);
 
                                 if (candidate != null)
                                 {
@@ -779,7 +794,8 @@ public sealed class SmartDiscoveryEngine
             IReadOnlyList<ManagedServer> intermediateGateways,
             IReadOnlyList<RouteHop> hopHops,
             CancellationToken ct,
-            Guid? previousServerId = null)
+            Guid? previousServerId = null,
+            bool lockEntryPoint = false)
         {
             List<(string User, string Pass)> confirmedSnapshot;
             lock (syncLock)
@@ -796,7 +812,10 @@ public sealed class SmartDiscoveryEngine
                 ct.ThrowIfCancellationRequested();
                 var stopAll = false;
 
-                foreach (var attemptEntryPoint in ResolveAttemptEntryPoints(entryPoint))
+                IReadOnlyList<BaseProxy?> attemptEntryPoints = lockEntryPoint
+                    ? new BaseProxy?[] { entryPoint }
+                    : ResolveAttemptEntryPoints(entryPoint);
+                foreach (var attemptEntryPoint in attemptEntryPoints)
                 {
                     if (attemptEntryPoint != null && !await EnsureEntryPointReadyAsync(attemptEntryPoint, ct).ConfigureAwait(false))
                         continue;
@@ -1136,20 +1155,111 @@ public sealed class SmartDiscoveryEngine
             UseKeyboardInteractive = true
         };
 
-    private static IReadOnlyList<ManagedServer> BuildGatewayChain(
+    private (List<DiscoveredServerCandidate> Seeds, Dictionary<Guid, SavedGatewayRoute> Routes)
+        ResolveSavedGateways()
+    {
+        var seeds = new List<DiscoveredServerCandidate>();
+        var routes = new Dictionary<Guid, SavedGatewayRoute>();
+
+        HashSet<Guid> scopeIdSet;
+        if (options.TargetGroupId.HasValue)
+        {
+            var group = config.FindGroup(options.TargetGroupId.Value);
+            if (group is null) return (seeds, routes);
+            scopeIdSet = ServersInGroup(group).Select(server => server.Id).ToHashSet();
+        }
+        else
+        {
+            scopeIdSet = config.UngroupedServers.Select(server => server.Id).ToHashSet();
+        }
+
+        foreach (var id in ConnectivityBatchPlanner.DirectlyReachable(config, scopeIdSet))
+        {
+            var server = config.FindServer(id);
+            if (server is null) continue;
+            var ordered = RoutePlanner.OrderPreferred(
+                    config, RoutePlanner.Candidates(config, id), server.PreferredRoute)
+                .Where(candidate => candidate.Servers
+                    .Take(candidate.Servers.Count - 1)
+                    .All(prefixServer => !scopeIdSet.Contains(prefixServer.Id)))
+                .ToArray();
+            var route = server.PreferredRoute is { } preferred
+                ? ordered.FirstOrDefault(candidate => RoutePreferencePolicy.Matches(preferred, candidate))
+                : null;
+            route ??= ordered.FirstOrDefault(candidate =>
+                candidate.Servers.Count > 1 &&
+                config.Links.Any(link =>
+                    link.FromServerId == candidate.Servers[^2].Id &&
+                    link.ToServerId == id &&
+                    link.LastSuccessUtc is not null));
+            route ??= ordered.FirstOrDefault(candidate => candidate.Servers.Count > 1);
+            route ??= ordered.FirstOrDefault();
+            if (route is null) continue;
+
+            seeds.Add(new DiscoveredServerCandidate
+            {
+                Id = server.Id,
+                Host = server.Host,
+                Port = server.Port > 0 ? server.Port : 22,
+                ProposedName = server.Name,
+                Username = server.Username,
+                Password = server.Password,
+                RouteHops = route.Servers
+                    .Select(item => new RouteHop(item.Id, item.Name, item.Host, item.Port))
+                    .ToList(),
+                ExistingServerId = server.Id,
+                IsDuplicate = true,
+                IsSelected = false,
+                VerifiedProxyId = route.WithoutProxy || route.Proxy.Id == Guid.Empty ? null : route.Proxy.Id
+            });
+            routes[server.Id] = new SavedGatewayRoute(route, route.Servers.ToArray());
+        }
+
+        return (
+            seeds
+                .OrderBy(seed => seed.RouteHops.Count)
+                .ThenBy(seed => seed.ProposedName, StringComparer.CurrentCultureIgnoreCase)
+                .ThenBy(seed => seed.Id)
+                .ToList(),
+            routes);
+    }
+
+    private sealed record SavedGatewayRoute(
+        RouteCandidate Route, IReadOnlyList<ManagedServer> Servers);
+
+    private sealed record GatewayChain(
+        IReadOnlyList<ManagedServer> Servers, RouteCandidate? SavedRoute);
+
+    private static GatewayChain BuildGatewayChain(
         DiscoveredServerCandidate gateway,
-        IReadOnlyList<DiscoveredServerCandidate> allDiscovered)
+        IReadOnlyList<DiscoveredServerCandidate> allDiscovered,
+        IReadOnlyDictionary<Guid, SavedGatewayRoute> savedRouteByGatewayId)
     {
         var chain = new List<ManagedServer>();
         var current = gateway;
         var visited = new HashSet<Guid>();
+        RouteCandidate? savedRoute = null;
 
         while (current != null && visited.Add(current.Id))
         {
+            if (savedRouteByGatewayId.TryGetValue(current.Id, out var saved))
+            {
+                chain.InsertRange(0, saved.Servers);
+                savedRoute = saved.Route;
+                break;
+            }
+
             chain.Insert(0, CandidateToServer(current));
             if (current.RequiredPreviousServerId.HasValue)
             {
-                current = allDiscovered.FirstOrDefault(d => d.Id == current.RequiredPreviousServerId.Value);
+                var previousId = current.RequiredPreviousServerId.Value;
+                if (savedRouteByGatewayId.TryGetValue(previousId, out var savedDependency))
+                {
+                    chain.InsertRange(0, savedDependency.Servers);
+                    savedRoute = savedDependency.Route;
+                    break;
+                }
+                current = allDiscovered.FirstOrDefault(d => d.Id == previousId);
             }
             else
             {
@@ -1157,7 +1267,7 @@ public sealed class SmartDiscoveryEngine
             }
         }
 
-        return chain;
+        return new GatewayChain(chain, savedRoute);
     }
 
     private static double CalculatePercentage(int discovered, int problem, int total)

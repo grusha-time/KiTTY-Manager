@@ -3255,12 +3255,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunDirectedConnectivityAsync(
+    private async Task<bool> RunDirectedConnectivityAsync(
         string scopeName, IReadOnlyList<ConnectivityPairChoice> requestedPairs)
     {
         var pairs = ConnectivityPairSelectionPolicy.Selected(requestedPairs);
-        if (pairs.Count == 0) return;
-        if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return; }
+        if (pairs.Count == 0) return false;
+        if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return false; }
         using var cts = new CancellationTokenSource();
         operationCancellation = cts;
         var progress = new LinkBuildingProgress { Owner = this, CancelRequested = () => cts.Cancel() };
@@ -3410,12 +3410,14 @@ public partial class MainWindow : Window
                 (failures.Length == 0 ? "" : "\n\n" + string.Join(Environment.NewLine, failures)),
                 "Результат построения связей", MessageBoxButton.OK,
                 unavailCount == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+            return true;
         }
         catch (OperationCanceledException)
         {
             Status("Проверка остановлена. Уже подтверждённые направления сохранены.");
+            return false;
         }
-        catch (Exception ex) { Error(ex); }
+        catch (Exception ex) { Error(ex); return false; }
         finally { EndProgressOperation(cts, progress); }
     }
 
@@ -3458,7 +3460,7 @@ public partial class MainWindow : Window
             async (viaServerId, cancellationToken) =>
             {
                 await OpenRoutedConsoleAsync(source, viaServerId, cancellationToken);
-            }) { Owner = this };
+            }, hideEntryPointLinks: true) { Owner = this };
         _ = dialog.ShowDialog();
     }
 
@@ -3801,7 +3803,9 @@ public partial class MainWindow : Window
             },
             ConfirmHostKey,
             text => Dispatcher.BeginInvoke(() => RouteLog("SmartDiscovery: " + text)),
-            PreviewDiscoveredCandidateAsync)
+            PreviewDiscoveredCandidateAsync,
+            async pairs => await RunDirectedConnectivityAsync(
+                "Связи новых сессий с существующими серверами группы", pairs))
         {
             Owner = this
         };

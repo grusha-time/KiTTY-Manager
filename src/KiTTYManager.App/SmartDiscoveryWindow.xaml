@@ -377,6 +377,9 @@
                  VerticalAlignment="Center" Foreground="{DynamicResource MutedTextBrush}" FontWeight="SemiBold"/>
 
       <WrapPanel Grid.Column="1" HorizontalAlignment="Right">
+        <CheckBox x:Name="LinkExistingIndependentServersCheckBox" IsChecked="True"
+                  Content="Построить связь с существующими независимыми серверами группы"
+                  VerticalAlignment="Center" Margin="0,0,12,0"/>
         <Button x:Name="CreateSessionsButton" Content="Создать сессии" Tag="Success" IsDefault="True"
                 Click="CreateSessions_Click" Margin="0,0,8,0" Padding="20,8"/>
         <Button Content="Закрыть" IsCancel="True" Click="Close_Click"/>

@@ -18,6 +18,7 @@ public partial class SmartDiscoveryWindow : Window
     private readonly Func<ManagedServer, string, bool>? hostKeyVerifier;
     private readonly Action<string>? log;
     private readonly Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate;
+    private readonly Func<IReadOnlyList<ConnectivityPairChoice>, Task<bool>>? buildLinksToExistingGroupServers;
 
     private ManagerConfig LiveConfig => getConfig();
 
@@ -26,6 +27,7 @@ public partial class SmartDiscoveryWindow : Window
 
     private CancellationTokenSource? scanCts;
     private bool isScanning;
+    private bool isCreatingSessions;
     private bool passwordsMasked;
     private bool groupPickerCloseOnMouseUp;
     private string rawPasswords = "";
@@ -38,7 +40,8 @@ public partial class SmartDiscoveryWindow : Window
         Action? onSessionsCreated = null,
         Func<ManagedServer, string, bool>? hostKeyVerifier = null,
         Action<string>? log = null,
-        Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate = null)
+        Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate = null,
+        Func<IReadOnlyList<ConnectivityPairChoice>, Task<bool>>? buildLinksToExistingGroupServers = null)
     {
         this.getConfig = getConfig;
         this.ensureJumphost = ensureJumphost;
@@ -46,6 +49,7 @@ public partial class SmartDiscoveryWindow : Window
         this.hostKeyVerifier = hostKeyVerifier;
         this.log = log;
         this.previewCandidate = previewCandidate;
+        this.buildLinksToExistingGroupServers = buildLinksToExistingGroupServers;
 
         Closing += (_, _) =>
         {
@@ -72,8 +76,10 @@ public partial class SmartDiscoveryWindow : Window
         Action? onSessionsCreated = null,
         Func<ManagedServer, string, bool>? hostKeyVerifier = null,
         Action<string>? log = null,
-        Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate = null)
-        : this(() => liveConfig, ensureJumphost, onSessionsCreated, hostKeyVerifier, log, previewCandidate)
+        Func<DiscoveredServerCandidate, IReadOnlyList<DiscoveredServerCandidate>, Task>? previewCandidate = null,
+        Func<IReadOnlyList<ConnectivityPairChoice>, Task<bool>>? buildLinksToExistingGroupServers = null)
+        : this(() => liveConfig, ensureJumphost, onSessionsCreated, hostKeyVerifier, log, previewCandidate,
+            buildLinksToExistingGroupServers)
     {
     }
 
@@ -646,8 +652,26 @@ public partial class SmartDiscoveryWindow : Window
         }
     }
 
-    private void CreateSessions_Click(object sender, RoutedEventArgs e)
+    private IReadOnlyDictionary<Guid, IReadOnlyList<Guid>> SnapshotIndependentServerIds()
     {
+        var config = LiveConfig;
+        var snapshot = new Dictionary<Guid, IReadOnlyList<Guid>>
+        {
+            [Guid.Empty] = ConnectivityBatchPlanner.DirectlyReachable(
+                config, config.UngroupedServers.Select(server => server.Id))
+        };
+        foreach (var group in config.AllGroups())
+            snapshot[group.Id] = ConnectivityBatchPlanner.DirectlyReachable(config, NestedServerIds(group));
+        return snapshot;
+
+        static IEnumerable<Guid> NestedServerIds(ServerGroup group) =>
+            group.Servers.Select(server => server.Id)
+                .Concat(group.Groups.SelectMany(NestedServerIds));
+    }
+
+    private async void CreateSessions_Click(object sender, RoutedEventArgs e)
+    {
+        if (isCreatingSessions) return;
         CandidatesGrid.CommitEdit(DataGridEditingUnit.Row, true);
 
         var selected = discoveredCandidates.Where(c => c.IsSelected).ToList();
@@ -658,8 +682,14 @@ public partial class SmartDiscoveryWindow : Window
             return;
         }
 
+        isCreatingSessions = true;
+        CreateSessionsButton.IsEnabled = false;
         try
         {
+            IReadOnlyDictionary<Guid, IReadOnlyList<Guid>>? existingIndependentByGroup = null;
+            if (LinkExistingIndependentServersCheckBox.IsChecked == true)
+                existingIndependentByGroup = SnapshotIndependentServerIds();
+
             var selection = GetEntryPointSelection();
             var options = new SmartDiscoveryOptions
             {
@@ -673,6 +703,40 @@ public partial class SmartDiscoveryWindow : Window
 
             onSessionsCreated();
 
+            if (created.Count > 0 && existingIndependentByGroup is not null &&
+                buildLinksToExistingGroupServers is not null)
+            {
+                var pairs = SmartDiscoverySessionCreator.PlanLinksToExistingGroupServers(
+                    LiveConfig, existingIndependentByGroup, created.Select(server => server.Id));
+                if (pairs.Count > 0)
+                {
+                    try
+                    {
+                        if (!await buildLinksToExistingGroupServers(pairs))
+                        {
+                            ReportLog("Построение связей с существующими сессиями не выполнено.");
+                            ThemedMessageDialog.Show(this,
+                                "Сессии созданы, но связи с существующими серверами группы не построены: операция занята или отменена.",
+                                "Создание связей", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        ReportLog("Построение связей с существующими сессиями отменено.");
+                        ThemedMessageDialog.Show(this,
+                            "Сессии созданы, но связи с существующими серверами группы не построены: операция отменена.",
+                            "Создание связей", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    }
+                    catch (Exception ex)
+                    {
+                        ReportLog($"Не удалось построить связи с существующими сессиями: {ex.Message}");
+                        ThemedMessageDialog.Show(this,
+                            "Сессии созданы, но связи с существующими серверами группы не построены.",
+                            "Создание связей", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    }
+                }
+            }
+
             ThemedMessageDialog.Show(this, $"Успешно создано сессий: {created.Count}",
                 "Создание сессий", MessageBoxButton.OK, MessageBoxImage.Information);
 
@@ -682,6 +746,11 @@ public partial class SmartDiscoveryWindow : Window
         {
             ThemedMessageDialog.Show(this, $"Не удалось создать сессии: {ex.Message}",
                 "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            isCreatingSessions = false;
+            CreateSessionsButton.IsEnabled = !isScanning && discoveredCandidates.Count > 0;
         }
     }
 
