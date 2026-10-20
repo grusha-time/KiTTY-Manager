@@ -1279,6 +1279,15 @@ internal sealed partial class SelfTestRunner
         // 5. Search with no matches
         var noMatches = GroupSelectionPolicy.Build(config, draft.NewGroups, "несуществующий текст");
         Equal(0, noMatches.Count);
+
+        // 6. Picker selection keeps a matching current group, otherwise selects the searched result.
+        var activeSearch = GroupSelectionPolicy.Build(config, draft.NewGroups, "активная");
+        Equal<Guid?>(allRows[1].GroupId,
+            GroupSelectionPolicy.SelectForSearch(activeSearch, allRows[1].GroupId, "активная"));
+        Equal<Guid?>(dbSearch[2].GroupId,
+            GroupSelectionPolicy.SelectForSearch(dbSearch, allRows[0].GroupId, "базы"));
+        Equal<Guid?>(null,
+            GroupSelectionPolicy.SelectForSearch(dbSearch, null, "несуществующий текст"));
     }
 
     private static void AddToServerGroupPlacement()

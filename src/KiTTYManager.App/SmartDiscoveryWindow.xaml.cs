@@ -210,16 +210,22 @@ public partial class SmartDiscoveryWindow : Window
 
     private void RefreshGroupChoices()
     {
+        var search = GroupSearchBox?.Text;
+        var rows = GroupSelectionPolicy.Build(LiveConfig, null, search);
         var choices = new List<GroupChoice>
         {
             new(null, "[Без группы — верхний уровень]", "Верхний уровень", new Thickness(0))
         };
-        choices.AddRange(GroupSelectionPolicy.Build(LiveConfig, null, GroupSearchBox?.Text)
-            .Select(row => new GroupChoice(row.GroupId, row.Name,
-                $"{row.Path} · сессий: {row.ServerCount}", new Thickness(row.Depth * 14, 0, 0, 0))));
+        choices.AddRange(rows.Select(row => new GroupChoice(row.GroupId, row.Name,
+            $"{row.Path} · сессий: {row.ServerCount}", new Thickness(row.Depth * 14, 0, 0, 0))));
 
         GroupChoicesList.ItemsSource = choices;
-        GroupChoicesList.SelectedItem = choices.FirstOrDefault(c => c.Id is not null) ?? choices.FirstOrDefault();
+        var selectedId = GroupSelectionPolicy.SelectForSearch(rows, targetGroupId, search);
+        var selectedChoice = string.IsNullOrWhiteSpace(search)
+            ? choices.FirstOrDefault(c => c.Id == selectedId) ?? choices[0]
+            : choices.FirstOrDefault(c => selectedId.HasValue && c.Id == selectedId);
+        GroupChoicesList.SelectedItem = selectedChoice;
+        if (selectedChoice is not null) GroupChoicesList.ScrollIntoView(selectedChoice);
         NoGroupChoicesText.Visibility = choices.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 

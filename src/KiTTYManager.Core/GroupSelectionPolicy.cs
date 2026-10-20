@@ -25,6 +25,21 @@ public static class GroupSelectionPolicy
         return rows;
     }
 
+    public static Guid? SelectForSearch(
+        IReadOnlyList<GroupSelectionRow> rows, Guid? currentId, string? searchText)
+    {
+        var search = searchText?.Trim() ?? "";
+        if (search.Length == 0)
+            return currentId;
+
+        var current = rows.FirstOrDefault(row => row.GroupId == currentId);
+        if (current is not null && (Contains(current.Name, search) || Contains(current.Path, search)))
+            return current.GroupId;
+
+        return rows.FirstOrDefault(row =>
+            Contains(row.Name, search) || Contains(row.Path, search))?.GroupId;
+    }
+
     private static List<HierarchyNode> BuildHierarchy(
         ManagerConfig config,
         IEnumerable<NewGroupDraft>? newGroups)
