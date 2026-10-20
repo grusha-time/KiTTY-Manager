@@ -11,19 +11,109 @@ public static class SmartDiscoverySessionCreator
         var selected = candidates.Where(c => c.IsSelected).ToList();
         if (selected.Count == 0) return [];
 
-        // Validate dependencies: if a candidate has RequiredPreviousServerId,
-        // ensure that gateway is either already in config or among the selected candidates being created.
+        var candidateById = candidates.ToDictionary(c => c.Id);
+
+        Guid ResolveDependencyId(Guid dependencyId)
+        {
+            if (!candidateById.TryGetValue(dependencyId, out var dependency))
+                return dependencyId;
+            if (dependency.IsSelected)
+                return dependency.Id;
+            if (dependency.ExistingServerId is Guid savedId && config.FindServer(savedId) is not null)
+                return savedId;
+            return dependency.Id;
+        }
+
+        var reconciled = new HashSet<Guid>();
+        void ReconcileVerifiedDependency(Guid dependencyId)
+        {
+            if (!candidateById.TryGetValue(dependencyId, out var dependency) || dependency.IsSelected)
+                return;
+            if (dependency.ExistingServerId is not Guid savedId || config.FindServer(savedId) is not { } saved)
+                return;
+            if (!reconciled.Add(dependency.Id))
+                return;
+
+            saved.UseKeyboardInteractive = true;
+            saved.Username = dependency.Username;
+            saved.Password = dependency.Password;
+            saved.HostKeyFingerprint = dependency.HostKeyFingerprint;
+            saved.HostKeyAlgorithm = dependency.HostKeyAlgorithm;
+            saved.HostKeyBits = dependency.HostKeyBits;
+            saved.PreferredProxyId = dependency.VerifiedProxyId;
+            saved.RequiredPreviousServerId = dependency.RequiredPreviousServerId.HasValue
+                ? ResolveDependencyId(dependency.RequiredPreviousServerId.Value)
+                : null;
+            saved.TryDirectWithoutJumphost = saved.PreferredProxyId is null && saved.RequiredPreviousServerId is null;
+            if (dependency.PrivilegeEscalation.Success)
+            {
+                saved.RootLogin = dependency.PrivilegeEscalation.RootCommand;
+                saved.RootPassword = dependency.PrivilegeEscalation.RootPassword;
+            }
+
+            foreach (var fromId in dependency.DiscoveredLinksFrom)
+            {
+                if (fromId == dependency.Id) continue;
+                var resolvedFromId = ResolveDependencyId(fromId);
+                if (resolvedFromId == saved.Id) continue;
+                if (config.Links.Any(l => l.FromServerId == resolvedFromId && l.ToServerId == saved.Id))
+                    continue;
+
+                var linkResult = new ConnectivityResult(
+                    TargetId: saved.Id,
+                    Success: true,
+                    Message: "Smart Discovery",
+                    Duration: TimeSpan.Zero,
+                    Strategy: "DirectTcpIp",
+                    ProxyId: dependency.VerifiedProxyId,
+                    SourceId: resolvedFromId);
+                ServerLinkPairPolicy.RememberDirectedSuccess(config, linkResult, DateTimeOffset.UtcNow);
+            }
+
+            if (dependency.RequiredPreviousServerId.HasValue)
+                ReconcileVerifiedDependency(dependency.RequiredPreviousServerId.Value);
+        }
+
         var allServerIds = config.AllServers().Select(s => s.Id).ToHashSet();
+        var validatedDependencies = new HashSet<Guid>();
+        void ValidateDependencyChain(Guid dependencyId)
+        {
+            if (!candidateById.TryGetValue(dependencyId, out var dependency))
+            {
+                if (!allServerIds.Contains(dependencyId))
+                {
+                    throw new InvalidOperationException(
+                        $"Промежуточный шлюз {dependencyId} не выбран для создания и отсутствует в конфигурации.");
+                }
+                return;
+            }
+
+            if (dependency.IsSelected || !validatedDependencies.Add(dependency.Id))
+                return;
+
+            if (dependency.ExistingServerId is not Guid savedId || config.FindServer(savedId) is null)
+            {
+                throw new InvalidOperationException(
+                    $"Промежуточный шлюз для сервера {dependency.Host} ({dependency.ProposedName}) не выбран для создания и отсутствует в конфигурации.");
+            }
+
+            if (dependency.RequiredPreviousServerId.HasValue)
+                ValidateDependencyChain(dependency.RequiredPreviousServerId.Value);
+            foreach (var fromId in dependency.DiscoveredLinksFrom)
+            {
+                if (fromId != dependency.Id)
+                    ValidateDependencyChain(fromId);
+            }
+        }
+
         foreach (var c in selected)
         {
             if (c.RequiredPreviousServerId.HasValue)
+                ValidateDependencyChain(c.RequiredPreviousServerId.Value);
+            foreach (var fromId in c.DiscoveredLinksFrom)
             {
-                var reqId = c.RequiredPreviousServerId.Value;
-                if (!allServerIds.Contains(reqId) && !selected.Any(s => s.Id == reqId))
-                {
-                    throw new InvalidOperationException(
-                        $"Промежуточный шлюз для сервера {c.Host} ({c.ProposedName}) не выбран для создания и отсутствует в конфигурации.");
-                }
+                if (fromId != c.Id)
+                    ValidateDependencyChain(fromId);
             }
         }
 
@@ -52,6 +142,7 @@ public static class SmartDiscoverySessionCreator
             // Determine target group (synchronize edited GroupName over stale GroupId)
             ServerGroup? targetGroup = null;
             string? effectiveSubgroupName = c.SubgroupName;
+            List<ServerGroup>? idPathRemainder = null;
 
             if (!string.IsNullOrWhiteSpace(c.GroupName))
             {
@@ -73,23 +164,35 @@ public static class SmartDiscoverySessionCreator
                 }
                 else
                 {
-                    // If c.GroupId points to a group with the exact same name, keep it
                     if (c.GroupId.HasValue)
                     {
-                        var groupById = config.FindGroup(c.GroupId.Value);
-                        if (groupById != null && string.Equals(groupById.Name, trimmedGroup, StringComparison.OrdinalIgnoreCase))
+                        var ancestry = config.GroupAncestry(c.GroupId.Value);
+                        if (ancestry.Count > 0 && string.Equals(ancestry[0].Name, trimmedGroup, StringComparison.OrdinalIgnoreCase))
                         {
-                            targetGroup = groupById;
+                            targetGroup = ancestry[0];
+                            idPathRemainder = ancestry.Skip(1).ToList();
                         }
                     }
 
                     if (targetGroup is null)
                     {
-                        targetGroup = config.Groups.FirstOrDefault(g => string.Equals(g.Name, trimmedGroup, StringComparison.OrdinalIgnoreCase));
+                        if (c.GroupId.HasValue)
+                        {
+                            var groupById = config.FindGroup(c.GroupId.Value);
+                            if (groupById != null && string.Equals(groupById.Name, trimmedGroup, StringComparison.OrdinalIgnoreCase))
+                            {
+                                targetGroup = groupById;
+                            }
+                        }
+
                         if (targetGroup is null)
                         {
-                            targetGroup = new ServerGroup { Name = trimmedGroup };
-                            config.Groups.Add(targetGroup);
+                            targetGroup = config.Groups.FirstOrDefault(g => string.Equals(g.Name, trimmedGroup, StringComparison.OrdinalIgnoreCase));
+                            if (targetGroup is null)
+                            {
+                                targetGroup = new ServerGroup { Name = trimmedGroup };
+                                config.Groups.Add(targetGroup);
+                            }
                         }
                     }
                 }
@@ -113,16 +216,42 @@ public static class SmartDiscoverySessionCreator
             var subgroupName = !string.IsNullOrWhiteSpace(effectiveSubgroupName) ? effectiveSubgroupName : options?.TargetSubgroupName;
             if (targetGroup is not null && !string.IsNullOrWhiteSpace(subgroupName))
             {
-                var sub = targetGroup.Groups.FirstOrDefault(g => string.Equals(g.Name, subgroupName.Trim(), StringComparison.OrdinalIgnoreCase));
-                if (sub is null)
+                var idPathValid = idPathRemainder is not null;
+                var sectionIndex = 0;
+                foreach (var part in subgroupName.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 {
-                    sub = new ServerGroup { Name = subgroupName.Trim() };
-                    targetGroup.Groups.Add(sub);
+                    ServerGroup? sub;
+                    if (idPathValid && sectionIndex < idPathRemainder!.Count &&
+                        string.Equals(idPathRemainder[sectionIndex].Name, part, StringComparison.OrdinalIgnoreCase))
+                    {
+                        sub = idPathRemainder[sectionIndex];
+                    }
+                    else
+                    {
+                        idPathValid = false;
+                        sub = targetGroup.Groups.FirstOrDefault(g => string.Equals(g.Name, part, StringComparison.OrdinalIgnoreCase));
+                        if (sub is null)
+                        {
+                            sub = new ServerGroup { Name = part };
+                            targetGroup.Groups.Add(sub);
+                        }
+                    }
+                    targetGroup = sub;
+                    sectionIndex++;
                 }
-                targetGroup = sub;
+            }
+
+            if (c.RequiredPreviousServerId.HasValue)
+                ReconcileVerifiedDependency(c.RequiredPreviousServerId.Value);
+            foreach (var fromId in c.DiscoveredLinksFrom)
+            {
+                if (fromId != c.Id)
+                    ReconcileVerifiedDependency(fromId);
             }
 
             var server = CreateDraftServer(c);
+            if (c.RequiredPreviousServerId.HasValue)
+                server.RequiredPreviousServerId = ResolveDependencyId(c.RequiredPreviousServerId.Value);
             server.Name = name;
 
             if (targetGroup is not null)
@@ -134,18 +263,20 @@ public static class SmartDiscoverySessionCreator
             var now = DateTimeOffset.UtcNow;
             foreach (var fromId in c.DiscoveredLinksFrom)
             {
-                if (!config.Links.Any(l => l.FromServerId == fromId && l.ToServerId == c.Id))
-                {
-                    var linkResult = new ConnectivityResult(
-                        TargetId: c.Id,
-                        Success: true,
-                        Message: "Smart Discovery",
-                        Duration: TimeSpan.Zero,
-                        Strategy: "DirectTcpIp",
-                        ProxyId: c.VerifiedProxyId,
-                        SourceId: fromId);
-                    ServerLinkPairPolicy.RememberDirectedSuccess(config, linkResult, now);
-                }
+                if (fromId == c.Id) continue;
+                var resolvedFromId = ResolveDependencyId(fromId);
+                if (config.Links.Any(l => l.FromServerId == resolvedFromId && l.ToServerId == c.Id))
+                    continue;
+
+                var linkResult = new ConnectivityResult(
+                    TargetId: c.Id,
+                    Success: true,
+                    Message: "Smart Discovery",
+                    Duration: TimeSpan.Zero,
+                    Strategy: "DirectTcpIp",
+                    ProxyId: c.VerifiedProxyId,
+                    SourceId: resolvedFromId);
+                ServerLinkPairPolicy.RememberDirectedSuccess(config, linkResult, now);
             }
 
             created.Add(server);
@@ -158,6 +289,22 @@ public static class SmartDiscoverySessionCreator
         }
 
         return created;
+    }
+
+    public static (string? RootGroupName, string? SubgroupPath) ResolveGroupAssignment(
+        ManagerConfig config, Guid? targetGroupId, string? typedSubgroupName)
+    {
+        var typed = string.IsNullOrWhiteSpace(typedSubgroupName) ? null : typedSubgroupName.Trim();
+        if (!targetGroupId.HasValue)
+            return (null, typed);
+
+        var ancestry = config.GroupAncestry(targetGroupId.Value);
+        if (ancestry.Count == 0)
+            return (null, typed);
+
+        var sections = ancestry.Skip(1).Select(group => group.Name).ToList();
+        if (typed is not null) sections.Add(typed);
+        return (ancestry[0].Name, sections.Count > 0 ? string.Join(" / ", sections) : null);
     }
 
     public static ManagedServer CreateDraftServer(DiscoveredServerCandidate c) =>

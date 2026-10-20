@@ -34,6 +34,7 @@ public sealed class PrivilegeEscalationResult
 public sealed class DiscoveredServerCandidate : INotifyPropertyChanged
 {
     private bool isSelected = true;
+    private bool isDuplicate;
     private string proposedName = "";
     private Guid? groupId;
     private string? groupName;
@@ -41,6 +42,7 @@ public sealed class DiscoveredServerCandidate : INotifyPropertyChanged
     private string username = "";
     private string password = "";
     private bool showPassword;
+    private bool showRootPassword;
     private string statusMessage = "";
 
     public Guid Id { get; set; } = Guid.NewGuid();
@@ -109,10 +111,28 @@ public sealed class DiscoveredServerCandidate : INotifyPropertyChanged
     public string DisplayPassword =>
         ShowPassword ? Password : (string.IsNullOrEmpty(Password) ? "" : new string('•', Math.Min(Math.Max(Password.Length, 6), 12)));
 
+    public bool ShowRootPassword
+    {
+        get => showRootPassword;
+        set
+        {
+            if (showRootPassword != value)
+            {
+                showRootPassword = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(DisplayRootPassword));
+            }
+        }
+    }
+
+    public string DisplayRootPassword =>
+        ShowRootPassword ? PrivilegeEscalation.RootPassword : (string.IsNullOrEmpty(PrivilegeEscalation.RootPassword) ? "" : new string('•', Math.Min(Math.Max(PrivilegeEscalation.RootPassword.Length, 6), 12)));
+
     public PrivilegeEscalationResult PrivilegeEscalation { get; set; } = new();
     public List<RouteHop> RouteHops { get; set; } = [];
     public List<Guid> DiscoveredLinksFrom { get; set; } = [];
     public Guid? RequiredPreviousServerId { get; set; }
+    public Guid? ExistingServerId { get; set; }
     public Guid? VerifiedProxyId { get; set; }
 
     public string StatusMessage
@@ -125,6 +145,12 @@ public sealed class DiscoveredServerCandidate : INotifyPropertyChanged
     {
         get => isSelected;
         set { if (isSelected != value) { isSelected = value; OnPropertyChanged(); } }
+    }
+
+    public bool IsDuplicate
+    {
+        get => isDuplicate;
+        set { if (isDuplicate != value) { isDuplicate = value; OnPropertyChanged(); } }
     }
 
     public string HostKeyFingerprint { get; set; } = "";

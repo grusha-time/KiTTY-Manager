@@ -677,7 +677,8 @@ public sealed class SmartDiscoveryEngine
                                 {
                                     candidate.RequiredPreviousServerId = gateway.Id;
                                     candidate.DiscoveredLinksFrom = [gateway.Id];
-                                    candidate.StatusMessage = $"Обнаружен через шлюз {gateway.ProposedName}";
+                                    if (!candidate.IsDuplicate)
+                                        candidate.StatusMessage = $"Обнаружен через шлюз {gateway.ProposedName}";
 
                                     lock (syncLock)
                                     {
@@ -841,6 +842,13 @@ public sealed class SmartDiscoveryEngine
                             new RouteHop(Guid.NewGuid(), proposedName, host, 22)
                         };
 
+                        var existingServer = config.AllServers().FirstOrDefault(s =>
+                            s.Port == 22 && string.Equals((s.Host ?? "").Trim(), host, StringComparison.OrdinalIgnoreCase));
+                        var isDuplicate = existingServer is not null;
+
+                        var (rootGroupName, subgroupPath) =
+                            SmartDiscoverySessionCreator.ResolveGroupAssignment(config, options.TargetGroupId, options.TargetSubgroupName);
+
                         var discoveredLinksFrom = new List<Guid>();
                         if (previousServerId.HasValue)
                         {
@@ -860,20 +868,24 @@ public sealed class SmartDiscoveryEngine
                             Hostname = result.Hostname,
                             ProposedName = proposedName,
                             GroupId = options.TargetGroupId,
-                            GroupName = config.FindGroup(options.TargetGroupId ?? Guid.Empty)?.Name,
-                            SubgroupName = options.TargetSubgroupName,
+                            GroupName = rootGroupName,
+                            SubgroupName = subgroupPath,
                             Username = u,
                             Password = p,
                             PrivilegeEscalation = result.Escalation ?? new(),
                             RouteHops = hops,
                             DiscoveredLinksFrom = discoveredLinksFrom,
                             RequiredPreviousServerId = previousServerId,
+                            ExistingServerId = existingServer?.Id,
                             VerifiedProxyId = attemptEntryPoint?.Id,
                             HostKeyFingerprint = result.HostKeyFingerprint,
                             HostKeyAlgorithm = result.HostKeyAlgorithm,
                             HostKeyBits = result.HostKeyBits,
-                            StatusMessage = intermediateGateways.Count > 0 ? "Обнаружен через шлюз" : "Готов к созданию",
-                            IsSelected = true
+                            StatusMessage = isDuplicate
+                                ? "Дубль: сессия с таким хостом уже существует"
+                                : intermediateGateways.Count > 0 ? "Обнаружен через шлюз" : "Готов к созданию",
+                            IsDuplicate = isDuplicate,
+                            IsSelected = !isDuplicate
                         };
 
                         Log($"Хост {host}: вход выполнен (пользователь {u}) через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}; повышение прав: {result.Escalation?.StatusDescription ?? "не подтверждено"}.");

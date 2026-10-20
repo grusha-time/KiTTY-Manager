@@ -55,6 +55,16 @@ public static class ConfigIndex
         return "";
     }
 
+    public static IReadOnlyList<ServerGroup> GroupAncestry(this ManagerConfig config, Guid groupId)
+    {
+        foreach (var group in config.Groups)
+        {
+            var ancestry = FindAncestry(group, groupId, []);
+            if (ancestry is not null) return ancestry;
+        }
+        return [];
+    }
+
     private static IEnumerable<ServerGroup> Flatten(ServerGroup group)
     {
         yield return group;
@@ -68,6 +78,18 @@ public static class ConfigIndex
         foreach (var child in group.Groups)
         {
             var result = FindPath(child, id, path);
+            if (result is not null) return result;
+        }
+        return null;
+    }
+
+    private static List<ServerGroup>? FindAncestry(ServerGroup group, Guid id, List<ServerGroup> parents)
+    {
+        var path = new List<ServerGroup>(parents) { group };
+        if (group.Id == id) return path;
+        foreach (var child in group.Groups)
+        {
+            var result = FindAncestry(child, id, path);
             if (result is not null) return result;
         }
         return null;

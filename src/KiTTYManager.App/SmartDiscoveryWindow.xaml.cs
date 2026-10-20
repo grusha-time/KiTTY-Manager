@@ -27,6 +27,7 @@ public partial class SmartDiscoveryWindow : Window
     private CancellationTokenSource? scanCts;
     private bool isScanning;
     private bool passwordsMasked;
+    private bool groupPickerCloseOnMouseUp;
     private string rawPasswords = "";
     private Guid? targetGroupId;
     private IReadOnlyList<string> currentPasswords = [];
@@ -54,7 +55,10 @@ public partial class SmartDiscoveryWindow : Window
         SourceInitialized += (_, _) => DarkWindowChrome.Apply(this);
         InitializeComponent();
 
-        CandidatesGrid.ItemsSource = discoveredCandidates;
+        var candidatesView = new System.Windows.Data.ListCollectionView(discoveredCandidates);
+        candidatesView.GroupDescriptions.Add(
+            new System.Windows.Data.PropertyGroupDescription(nameof(DiscoveredServerCandidate.IsDuplicate)));
+        CandidatesGrid.ItemsSource = candidatesView;
         ProblemsGrid.ItemsSource = problematicCandidates;
 
         PopulateJumpHosts();
@@ -125,12 +129,35 @@ public partial class SmartDiscoveryWindow : Window
             System.Windows.Threading.DispatcherPriority.Input);
     }
 
-    private void ChooseGroupButton_Click(object sender, RoutedEventArgs e) => OpenGroupPicker();
-
     private void TargetGroupBox_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
+        if (GroupPickerPopup.IsOpen)
+        {
+            GroupPickerPopup.IsOpen = false;
+            groupPickerCloseOnMouseUp = true;
+        }
+        e.Handled = true;
+    }
+
+    private void TargetGroupBox_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (groupPickerCloseOnMouseUp)
+        {
+            groupPickerCloseOnMouseUp = false;
+            e.Handled = true;
+            return;
+        }
         OpenGroupPicker();
         e.Handled = true;
+    }
+
+    private void TargetGroupBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key is Key.Enter or Key.Space or Key.Down)
+        {
+            OpenGroupPicker();
+            e.Handled = true;
+        }
     }
 
     private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e) => RefreshGroupChoices();
@@ -245,6 +272,22 @@ public partial class SmartDiscoveryWindow : Window
         log?.Invoke(sanitized);
     }
 
+    private void AddCandidateInOrder(DiscoveredServerCandidate candidate)
+    {
+        if (candidate.IsDuplicate)
+        {
+            discoveredCandidates.Add(candidate);
+            return;
+        }
+        var firstDuplicate = discoveredCandidates.FirstOrDefault(c => c.IsDuplicate);
+        if (firstDuplicate is null)
+        {
+            discoveredCandidates.Add(candidate);
+            return;
+        }
+        discoveredCandidates.Insert(discoveredCandidates.IndexOf(firstDuplicate), candidate);
+    }
+
     private async void StartScan_Click(object sender, RoutedEventArgs e)
     {
         if (isScanning) return;
@@ -263,7 +306,7 @@ public partial class SmartDiscoveryWindow : Window
 
         var selection = GetEntryPointSelection();
         var targetSubgroup = TargetSubgroupBox.Text.Trim();
-        var parallelism = int.TryParse((ParallelismComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var p) ? p : 4;
+        var parallelism = int.TryParse((ParallelismComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var p) ? p : 16;
 
         scanCts = new CancellationTokenSource();
         SetScanningState(true);
@@ -296,7 +339,7 @@ public partial class SmartDiscoveryWindow : Window
 
             discoveredCandidates.Clear();
             foreach (var cand in result.Discovered)
-                discoveredCandidates.Add(cand);
+                AddCandidateInOrder(cand);
 
             problematicCandidates.Clear();
             foreach (var prob in result.Problematic)
@@ -345,7 +388,7 @@ public partial class SmartDiscoveryWindow : Window
         currentPasswords = passwords;
         var selection = GetEntryPointSelection();
         var targetSubgroup = TargetSubgroupBox.Text.Trim();
-        var parallelism = int.TryParse((ParallelismComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var p) ? p : 4;
+        var parallelism = int.TryParse((ParallelismComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString(), out var p) ? p : 16;
 
         scanCts = new CancellationTokenSource();
         SetScanningState(true);
@@ -375,7 +418,7 @@ public partial class SmartDiscoveryWindow : Window
 
             foreach (var newlyFound in retryResult.Discovered)
             {
-                discoveredCandidates.Add(newlyFound);
+                AddCandidateInOrder(newlyFound);
                 var existingProb = problematicCandidates.FirstOrDefault(p => string.Equals(p.Host, newlyFound.Host, StringComparison.OrdinalIgnoreCase));
                 if (existingProb != null)
                     problematicCandidates.Remove(existingProb);
@@ -430,19 +473,20 @@ public partial class SmartDiscoveryWindow : Window
         LoginsInputBox.IsEnabled = !scanning;
         JumpHostComboBox.IsEnabled = !scanning;
         TargetGroupBox.IsEnabled = !scanning;
-        ChooseGroupButton.IsEnabled = !scanning;
     }
 
     private void UpdateCounts()
     {
-        SummaryCountsTextBlock.Text = $"Найдено сессий: {discoveredCandidates.Count} | Проблемных: {problematicCandidates.Count}";
+        var duplicateCount = discoveredCandidates.Count(c => c.IsDuplicate);
+        var newCount = discoveredCandidates.Count(c => !c.IsDuplicate);
+        SummaryCountsTextBlock.Text = $"Новых: {newCount} | Дублей: {duplicateCount} | Проблемных: {problematicCandidates.Count}";
         RetrySelectedButton.IsEnabled = !isScanning && problematicCandidates.Any(p => p.IsSelected);
         CreateSessionsButton.IsEnabled = !isScanning && discoveredCandidates.Count > 0;
     }
 
     private void SelectAllCandidates_Click(object sender, RoutedEventArgs e)
     {
-        foreach (var c in discoveredCandidates) c.IsSelected = true;
+        foreach (var c in discoveredCandidates) c.IsSelected = !c.IsDuplicate;
     }
 
     private void DeselectAllCandidates_Click(object sender, RoutedEventArgs e)
@@ -472,14 +516,13 @@ public partial class SmartDiscoveryWindow : Window
             return;
         }
 
-        var groupName = targetGroupId.HasValue ? LiveConfig.FindGroup(targetGroupId.Value)?.Name : "";
-        var subgroupName = TargetSubgroupBox.Text.Trim();
-
+        var (rootGroupName, subgroupPath) =
+            SmartDiscoverySessionCreator.ResolveGroupAssignment(LiveConfig, targetGroupId, TargetSubgroupBox.Text);
         foreach (var c in selected)
         {
             c.GroupId = targetGroupId;
-            c.GroupName = groupName;
-            c.SubgroupName = subgroupName;
+            c.GroupName = rootGroupName;
+            c.SubgroupName = subgroupPath;
         }
 
         ThemedMessageDialog.Show(this, $"Группа/подгруппа обновлена для {selected.Count} сессий.",
@@ -502,6 +545,21 @@ public partial class SmartDiscoveryWindow : Window
             {
                 System.Windows.Clipboard.SetText(candidate.Password ?? "");
             }
+            catch { }
+        }
+    }
+
+    private void ToggleRootPasswordVisibility_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is DiscoveredServerCandidate candidate)
+            candidate.ShowRootPassword = !candidate.ShowRootPassword;
+    }
+
+    private void CopyCandidateRootPassword_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is DiscoveredServerCandidate candidate)
+        {
+            try { System.Windows.Clipboard.SetText(candidate.PrivilegeEscalation.RootPassword ?? ""); }
             catch { }
         }
     }

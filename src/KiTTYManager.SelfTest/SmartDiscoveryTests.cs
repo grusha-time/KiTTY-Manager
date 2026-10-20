@@ -18,6 +18,7 @@ internal sealed partial class SelfTestRunner
 
         public List<(string host, string user, string pass)> AttemptedLogins { get; } = [];
         public List<(string host, Guid? proxyId)> ReachabilityAttempts { get; } = [];
+        public List<List<(string Host, string Password)>> HopChains { get; } = [];
 
         public Task<bool> ProbeReachabilityAsync(
             BaseProxy? jumpHost, string host, int port, TimeSpan timeout, CancellationToken cancellationToken)
@@ -34,6 +35,8 @@ internal sealed partial class SelfTestRunner
         {
             if (intermediateGateways.Count == 0)
                 return ProbeReachabilityAsync(jumpHost, targetHost, targetPort, timeout, cancellationToken);
+
+            HopChains.Add(intermediateGateways.Select(g => (g.Host, g.Password)).ToList());
 
             var lastGateway = intermediateGateways[^1].Host;
             return Task.FromResult(HopReachability.Contains((lastGateway, targetHost)));
@@ -716,6 +719,165 @@ internal sealed partial class SelfTestRunner
         Equal(null, createdDirect.PreferredProxyId);
         var directLink = config.Links.Single(l => l.FromServerId == candGateway.Id && l.ToServerId == candDirect.Id);
         Equal(null, directLink.LastSuccessfulProxyId);
+
+        // 7. Duplicate gateway: discovery and preview keep the verified candidate chain,
+        // while creation reconciles the reused saved session (stale credentials and route).
+        var duplicateGatewayConfig = new ManagerConfig();
+        var savedUpstream = new ManagedServer
+        {
+            Name = "Saved Upstream", Host = "10.7.7.0", Port = 22, Username = "legacy", Password = "UPSTREAM"
+        };
+        duplicateGatewayConfig.UngroupedServers.Add(savedUpstream);
+        var existingGateway = new ManagedServer
+        {
+            Name = "Existing Gateway", Host = "10.7.7.1", Port = 22, Username = "legacy", Password = "STALE",
+            RequiredPreviousServerId = savedUpstream.Id
+        };
+        duplicateGatewayConfig.UngroupedServers.Add(existingGateway);
+
+        var duplicateGatewayProbe = new TestSmartDiscoveryProbe();
+        duplicateGatewayProbe.DirectlyReachable.Add("10.7.7.1");
+        duplicateGatewayProbe.ValidCredentials["10.7.7.1"] = [("root", "fresh")];
+        duplicateGatewayProbe.ValidCredentials["10.7.7.9"] = [("root", "pwB")];
+        duplicateGatewayProbe.ValidCredentials["10.7.7.10"] = [("root", "pwC")];
+        duplicateGatewayProbe.HopReachability.Add(("10.7.7.1", "10.7.7.9"));
+        duplicateGatewayProbe.HopReachability.Add(("10.7.7.9", "10.7.7.10"));
+
+        var duplicateGatewayOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.7.7.1", "10.7.7.9", "10.7.7.10"],
+            Usernames = ["root"],
+            Passwords = ["fresh", "pwB", "pwC"],
+            MaxParallelConnections = 1,
+            MaxAttemptsPerHost = 3
+        };
+
+        var duplicateGatewayEngine = new SmartDiscoveryEngine(
+            duplicateGatewayConfig, duplicateGatewayOptions, duplicateGatewayProbe);
+        var duplicateGatewayResult = duplicateGatewayEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        var duplicateGatewayCandidate = duplicateGatewayResult.Discovered.Single(c => c.Host == "10.7.7.1");
+        var dependentCandidate = duplicateGatewayResult.Discovered.Single(c => c.Host == "10.7.7.9");
+        var thirdHopCandidate = duplicateGatewayResult.Discovered.Single(c => c.Host == "10.7.7.10");
+        Equal(true, duplicateGatewayCandidate.IsDuplicate);
+        Equal(false, duplicateGatewayCandidate.IsSelected);
+        Equal(existingGateway.Id, duplicateGatewayCandidate.ExistingServerId);
+        Equal(duplicateGatewayCandidate.Id, dependentCandidate.RequiredPreviousServerId);
+        Equal(duplicateGatewayCandidate.Id, dependentCandidate.DiscoveredLinksFrom.Single());
+        Equal(dependentCandidate.Id, thirdHopCandidate.RequiredPreviousServerId);
+        Equal(dependentCandidate.Id, thirdHopCandidate.DiscoveredLinksFrom.Single());
+
+        var thirdHopChain = duplicateGatewayProbe.HopChains.Last();
+        Equal("10.7.7.1", thirdHopChain[0].Host);
+        Equal("fresh", thirdHopChain[0].Password);
+        Equal("10.7.7.9", thirdHopChain[1].Host);
+        Equal("pwB", thirdHopChain[1].Password);
+
+        var duplicateGatewayPreview = SmartDiscoverySessionCreator.CreatePreviewConfig(
+            duplicateGatewayConfig, duplicateGatewayResult.Discovered);
+        var previewCandidates = SmartDiscoverySessionCreator.CreatePreviewCandidates(duplicateGatewayPreview, thirdHopCandidate);
+        Equal(1, previewCandidates.Count);
+        Equal(duplicateGatewayCandidate.Id, previewCandidates[0].Servers[0].Id);
+        Equal("fresh", previewCandidates[0].Servers[0].Password);
+        Equal(dependentCandidate.Id, previewCandidates[0].Servers[1].Id);
+        Equal(thirdHopCandidate.Id, previewCandidates[0].Servers[2].Id);
+
+        foreach (var c in duplicateGatewayResult.Discovered) c.IsSelected = !c.IsDuplicate;
+        var duplicateGatewayCreated = SmartDiscoverySessionCreator.CreateSessions(
+            duplicateGatewayConfig, duplicateGatewayResult.Discovered);
+        Equal(2, duplicateGatewayCreated.Count);
+        Equal(existingGateway.Id, duplicateGatewayCreated.Single(s => s.Host == "10.7.7.9").RequiredPreviousServerId);
+        Equal(dependentCandidate.Id, duplicateGatewayCreated.Single(s => s.Host == "10.7.7.10").RequiredPreviousServerId);
+        Equal("root", existingGateway.Username);
+        Equal("fresh", existingGateway.Password);
+        Equal(null, existingGateway.RequiredPreviousServerId);
+        Equal(null, existingGateway.PreferredProxyId);
+        Equal("UPSTREAM", savedUpstream.Password);
+        Equal(true, duplicateGatewayConfig.Links.Any(
+            l => l.FromServerId == existingGateway.Id && l.ToServerId == dependentCandidate.Id));
+        Equal(true, duplicateGatewayConfig.Links.Any(
+            l => l.FromServerId == dependentCandidate.Id && l.ToServerId == thirdHopCandidate.Id));
+
+        // 8. Reused duplicate in the middle: verified incoming link is registered and a route can be planned.
+        var middleDuplicateConfig = new ManagerConfig();
+        var savedMiddle = new ManagedServer
+        {
+            Name = "Saved Middle", Host = "10.8.8.1", Port = 22, Username = "legacy", Password = "STALE_MIDDLE",
+            UseKeyboardInteractive = false
+        };
+        middleDuplicateConfig.UngroupedServers.Add(savedMiddle);
+        var firstNew = new DiscoveredServerCandidate
+        {
+            Host = "10.8.8.0", ProposedName = "First", Username = "root", Password = "pwFirst"
+        };
+        var middleDuplicate = new DiscoveredServerCandidate
+        {
+            Host = "10.8.8.1", ProposedName = "Saved Middle", Username = "root", Password = "pwMiddle",
+            IsDuplicate = true, IsSelected = false, ExistingServerId = savedMiddle.Id,
+            RequiredPreviousServerId = firstNew.Id
+        };
+        middleDuplicate.DiscoveredLinksFrom.Add(firstNew.Id);
+        var lastNew = new DiscoveredServerCandidate
+        {
+            Host = "10.8.8.2", ProposedName = "Last", Username = "root", Password = "pwLast",
+            RequiredPreviousServerId = middleDuplicate.Id
+        };
+        lastNew.DiscoveredLinksFrom.Add(middleDuplicate.Id);
+
+        var middleCreated = SmartDiscoverySessionCreator.CreateSessions(
+            middleDuplicateConfig, [firstNew, middleDuplicate, lastNew]);
+        Equal(2, middleCreated.Count);
+        Equal(firstNew.Id, savedMiddle.RequiredPreviousServerId);
+        Equal("pwMiddle", savedMiddle.Password);
+        Equal(true, savedMiddle.UseKeyboardInteractive);
+        Equal(true, middleDuplicateConfig.Links.Any(
+            l => l.FromServerId == firstNew.Id && l.ToServerId == savedMiddle.Id && l.LastSuccessUtc is not null));
+        Equal(true, middleDuplicateConfig.Links.Any(
+            l => l.FromServerId == savedMiddle.Id && l.ToServerId == lastNew.Id && l.LastSuccessUtc is not null));
+        var middlePaths = RoutePlanner.FindPaths(middleDuplicateConfig, lastNew.Id);
+        Equal(true, middlePaths.Any(path => path.Select(s => s.Id).SequenceEqual([firstNew.Id, savedMiddle.Id, lastNew.Id])));
+
+        // 9. Unselected new gateway behind a reused duplicate: the complete chain is validated before mutation.
+        var brokenChainConfig = new ManagerConfig();
+        var savedBrokenMiddle = new ManagedServer
+        {
+            Name = "Broken Middle", Host = "10.9.9.1", Port = 22, Username = "legacy", Password = "KEEP"
+        };
+        brokenChainConfig.UngroupedServers.Add(savedBrokenMiddle);
+        var missingGateway = new DiscoveredServerCandidate
+        {
+            Host = "10.9.9.0", ProposedName = "Missing", Username = "root", Password = "pw", IsSelected = false
+        };
+        var brokenMiddle = new DiscoveredServerCandidate
+        {
+            Host = "10.9.9.1", ProposedName = "Broken Middle", Username = "root", Password = "pw",
+            IsDuplicate = true, IsSelected = false, ExistingServerId = savedBrokenMiddle.Id,
+            RequiredPreviousServerId = missingGateway.Id
+        };
+        brokenMiddle.DiscoveredLinksFrom.Add(missingGateway.Id);
+        var brokenTarget = new DiscoveredServerCandidate
+        {
+            Host = "10.9.9.2", ProposedName = "Target", Username = "root", Password = "pw",
+            RequiredPreviousServerId = brokenMiddle.Id
+        };
+        brokenTarget.DiscoveredLinksFrom.Add(brokenMiddle.Id);
+
+        var rejected = false;
+        try
+        {
+            SmartDiscoverySessionCreator.CreateSessions(
+                brokenChainConfig, [missingGateway, brokenMiddle, brokenTarget]);
+        }
+        catch (InvalidOperationException)
+        {
+            rejected = true;
+        }
+        Equal(true, rejected);
+        Equal(null, savedBrokenMiddle.RequiredPreviousServerId);
+        Equal("KEEP", savedBrokenMiddle.Password);
+        Equal(1, brokenChainConfig.AllServers().Count());
+        Equal(0, brokenChainConfig.Links.Count);
+        Equal(0, brokenChainConfig.Groups.Count);
     }
 
     private static void AutoEntryPointSelectionTests()
@@ -884,6 +1046,36 @@ internal sealed partial class SelfTestRunner
         Equal(1, authFailoverResult.Discovered.Count);
         Equal(bravoProxy.Id, authFailoverResult.Discovered[0].VerifiedProxyId);
         Equal(1, authFailoverCounts[bravoProxy.Id]);
+
+        // 6. Duplicate detection: a host already present in the config is marked as a duplicate
+        var duplicateConfig = new ManagerConfig();
+        duplicateConfig.UngroupedServers.Add(new ManagedServer { Name = "Existing", Host = "10.9.6.1", Port = 22 });
+
+        var duplicateProbe = new TestSmartDiscoveryProbe();
+        duplicateProbe.DirectlyReachable.Add("10.9.6.1");
+        duplicateProbe.DirectlyReachable.Add("10.9.6.2");
+        duplicateProbe.ValidCredentials["10.9.6.1"] = [("root", "pw")];
+        duplicateProbe.ValidCredentials["10.9.6.2"] = [("root", "pw")];
+
+        var duplicateOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.9.6.1", "10.9.6.2"],
+            Usernames = ["root"],
+            Passwords = ["pw"],
+            MaxParallelConnections = 1
+        };
+
+        var duplicateEngine = new SmartDiscoveryEngine(duplicateConfig, duplicateOptions, duplicateProbe);
+        var duplicateResult = duplicateEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(2, duplicateResult.Discovered.Count);
+        var duplicateCandidate = duplicateResult.Discovered.Single(c => c.Host == "10.9.6.1");
+        var freshCandidate = duplicateResult.Discovered.Single(c => c.Host == "10.9.6.2");
+        Equal(true, duplicateCandidate.IsDuplicate);
+        Equal(false, duplicateCandidate.IsSelected);
+        Equal(true, duplicateCandidate.StatusMessage.Contains("Дубль", StringComparison.Ordinal));
+        Equal(false, freshCandidate.IsDuplicate);
+        Equal(true, freshCandidate.IsSelected);
     }
 
     private static void ManagedEntryPointLinkTests()
@@ -1124,5 +1316,108 @@ internal sealed partial class SelfTestRunner
 
         // Proxied candidates never use the proxy-free preview chain
         Equal(0, SmartDiscoverySessionCreator.CreatePreviewCandidates(preview, dependent).Count);
+
+        // Group assignment helper: nested groups resolve to root name + subgroup sections
+        var nestedConfig = new ManagerConfig();
+        var regionGroup = new ServerGroup { Name = "Region" };
+        var subGroup = new ServerGroup { Name = "Sub" };
+        regionGroup.Groups.Add(subGroup);
+        nestedConfig.Groups.Add(regionGroup);
+
+        var (rootName, subgroupPath) = SmartDiscoverySessionCreator.ResolveGroupAssignment(nestedConfig, subGroup.Id, null);
+        Equal("Region", rootName);
+        Equal("Sub", subgroupPath);
+
+        var (extraRootName, extraSubgroupPath) = SmartDiscoverySessionCreator.ResolveGroupAssignment(nestedConfig, subGroup.Id, "Extra");
+        Equal("Region", extraRootName);
+        Equal("Sub / Extra", extraSubgroupPath);
+
+        var (topRootName, topSubgroupPath) = SmartDiscoverySessionCreator.ResolveGroupAssignment(nestedConfig, regionGroup.Id, "Sub");
+        Equal("Region", topRootName);
+        Equal("Sub", topSubgroupPath);
+
+        var (noneRootName, noneSubgroupPath) = SmartDiscoverySessionCreator.ResolveGroupAssignment(nestedConfig, null, "X");
+        Equal(null, noneRootName);
+        Equal("X", noneSubgroupPath);
+
+        // CreateSessions walks a multi-level subgroup chain "Sub / Extra"
+        var nestedCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.20",
+            Port = 22,
+            Username = "root",
+            Password = "pw6",
+            ProposedName = "Nested Server",
+            GroupId = subGroup.Id,
+            GroupName = "Region",
+            SubgroupName = "Sub / Extra",
+            IsSelected = true
+        };
+        var nestedCreated = SmartDiscoverySessionCreator.CreateSessions(nestedConfig, [nestedCandidate]);
+        Equal(1, nestedCreated.Count);
+        var nestedExtra = regionGroup.Groups.Single(g => g.Name == "Sub").Groups.Single(g => g.Name == "Extra");
+        Equal(true, nestedExtra.Servers.Any(s => s.Id == nestedCandidate.Id));
+
+        // Duplicate root names: the selected group's ID ancestry wins over a same-named root
+        var duplicateRootsConfig = new ManagerConfig();
+        var firstRegion = new ServerGroup { Name = "Region" };
+        var firstRegionSub = new ServerGroup { Name = "Sub" };
+        firstRegion.Groups.Add(firstRegionSub);
+        var secondRegion = new ServerGroup { Name = "Region" };
+        var secondRegionSub = new ServerGroup { Name = "Sub" };
+        secondRegion.Groups.Add(secondRegionSub);
+        duplicateRootsConfig.Groups.AddRange([firstRegion, secondRegion]);
+
+        var duplicateRootCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.30",
+            Port = 22,
+            Username = "root",
+            Password = "pw7",
+            ProposedName = "Duplicate Root Server",
+            GroupId = secondRegionSub.Id,
+            GroupName = "Region",
+            SubgroupName = "Sub",
+            IsSelected = true
+        };
+        var duplicateRootCreated = SmartDiscoverySessionCreator.CreateSessions(duplicateRootsConfig, [duplicateRootCandidate]);
+        Equal(1, duplicateRootCreated.Count);
+        Equal(false, firstRegionSub.Servers.Any(s => s.Id == duplicateRootCandidate.Id));
+        Equal(true, secondRegionSub.Servers.Any(s => s.Id == duplicateRootCandidate.Id));
+
+        // Duplicate sibling names: the selected group's ID ancestry wins over a same-named sibling
+        var duplicateSiblingsConfig = new ManagerConfig();
+        var siblingsRoot = new ServerGroup { Name = "Region" };
+        var firstSiblingSub = new ServerGroup { Name = "Sub" };
+        var secondSiblingSub = new ServerGroup { Name = "Sub" };
+        siblingsRoot.Groups.AddRange([firstSiblingSub, secondSiblingSub]);
+        duplicateSiblingsConfig.Groups.Add(siblingsRoot);
+
+        var duplicateSiblingCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.31",
+            Port = 22,
+            Username = "root",
+            Password = "pw8",
+            ProposedName = "Duplicate Sibling Server",
+            GroupId = secondSiblingSub.Id,
+            GroupName = "Region",
+            SubgroupName = "Sub",
+            IsSelected = true
+        };
+        var duplicateSiblingCreated = SmartDiscoverySessionCreator.CreateSessions(duplicateSiblingsConfig, [duplicateSiblingCandidate]);
+        Equal(1, duplicateSiblingCreated.Count);
+        Equal(false, firstSiblingSub.Servers.Any(s => s.Id == duplicateSiblingCandidate.Id));
+        Equal(true, secondSiblingSub.Servers.Any(s => s.Id == duplicateSiblingCandidate.Id));
+
+        // Root password display mirrors login password masking
+        var rootPasswordCandidate = new DiscoveredServerCandidate
+        {
+            Host = "10.0.0.21",
+            PrivilegeEscalation = new() { RootPassword = "rootpw" }
+        };
+        Equal(new string('•', 6), rootPasswordCandidate.DisplayRootPassword);
+        rootPasswordCandidate.ShowRootPassword = true;
+        Equal("rootpw", rootPasswordCandidate.DisplayRootPassword);
     }
 }

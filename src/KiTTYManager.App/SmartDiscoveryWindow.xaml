@@ -43,6 +43,12 @@
       <Setter Property="VerticalContentAlignment" Value="Stretch"/>
       <Setter Property="Padding" Value="0"/>
     </Style>
+    <Style x:Key="DiscoveryEditableCellStyle" TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+      <Setter Property="ToolTip" Value="Двойной клик — редактировать"/>
+    </Style>
+    <Style x:Key="DiscoveryReadOnlyCellStyle" TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+      <Setter Property="ToolTip" Value="Двойной клик — открыть сессию без сохранения"/>
+    </Style>
   </Window.Resources>
   <Grid Margin="18">
     <Grid.RowDefinitions>
@@ -112,13 +118,12 @@
           <Grid Grid.Column="3" Margin="0,0,12,0">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*"/>
-              <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
             <TextBox x:Name="TargetGroupBox" IsReadOnly="True" Cursor="Hand"
                      PreviewMouseLeftButtonDown="TargetGroupBox_PreviewMouseLeftButtonDown"
+                     PreviewMouseLeftButtonUp="TargetGroupBox_PreviewMouseLeftButtonUp"
+                     PreviewKeyDown="TargetGroupBox_PreviewKeyDown"
                      ToolTip="Целевая группа для создаваемых сессий"/>
-            <Button x:Name="ChooseGroupButton" Grid.Column="1" Content="…" Click="ChooseGroupButton_Click"
-                    Margin="6,0,0,0" MinWidth="36" Padding="10,0" ToolTip="Выбрать группу"/>
             <Popup x:Name="GroupPickerPopup" PlacementTarget="{Binding ElementName=TargetGroupBox}"
                    Placement="Bottom" StaysOpen="False" AllowsTransparency="True" PopupAnimation="Fade">
               <Border Width="380" MaxHeight="470" Margin="0,6,0,0" Padding="12"
@@ -165,7 +170,7 @@
           <TextBox x:Name="TargetSubgroupBox" Grid.Column="5" Margin="0,0,12,0" ToolTip="Название подгруппы (необязательно)"/>
 
           <TextBlock Grid.Column="6" Text="Потоки:" VerticalAlignment="Center" Margin="0,0,6,0"/>
-          <ComboBox x:Name="ParallelismComboBox" Grid.Column="7" SelectedIndex="1">
+          <ComboBox x:Name="ParallelismComboBox" Grid.Column="7" SelectedIndex="3">
             <ComboBoxItem Content="2"/>
             <ComboBoxItem Content="4"/>
             <ComboBoxItem Content="8"/>
@@ -218,19 +223,25 @@
                                       ElementStyle="{StaticResource DiscoveryCheckBoxStyle}"
                                       EditingElementStyle="{StaticResource DiscoveryCheckBoxStyle}"
                                       CellStyle="{StaticResource DiscoveryCheckBoxCellStyle}"/>
-              <DataGridTextColumn Header="IP / Хост" Binding="{Binding Host}" IsReadOnly="True" Width="120"/>
-              <DataGridTextColumn Header="Hostname" Binding="{Binding Hostname}" IsReadOnly="True" Width="120"/>
+              <DataGridTextColumn Header="IP / Хост" Binding="{Binding Host}" IsReadOnly="True" Width="120"
+                                  CellStyle="{StaticResource DiscoveryReadOnlyCellStyle}"/>
+              <DataGridTextColumn Header="Hostname" Binding="{Binding Hostname}" IsReadOnly="True" Width="120"
+                                  CellStyle="{StaticResource DiscoveryReadOnlyCellStyle}"/>
               <DataGridTextColumn Header="Название сессии" Binding="{Binding ProposedName, UpdateSourceTrigger=PropertyChanged}" Width="160"
-                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"
+                                  CellStyle="{StaticResource DiscoveryEditableCellStyle}"/>
               <DataGridTextColumn Header="Группа" Binding="{Binding GroupName, UpdateSourceTrigger=PropertyChanged}" Width="120"
-                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"
+                                  CellStyle="{StaticResource DiscoveryEditableCellStyle}"/>
               <DataGridTextColumn Header="Подгруппа" Binding="{Binding SubgroupName, UpdateSourceTrigger=PropertyChanged}" Width="120"
-                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"
+                                  CellStyle="{StaticResource DiscoveryEditableCellStyle}"/>
               <DataGridTextColumn Header="Логин" Binding="{Binding Username, UpdateSourceTrigger=PropertyChanged}" Width="90"
-                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"/>
+                                  EditingElementStyle="{StaticResource DataGridEditingTextBoxStyle}"
+                                  CellStyle="{StaticResource DiscoveryEditableCellStyle}"/>
 
               <!-- Masked / Clear Password with Toggle & Copy -->
-              <DataGridTemplateColumn Header="Пароль" Width="150">
+              <DataGridTemplateColumn Header="Пароль" Width="150" CellStyle="{StaticResource DiscoveryReadOnlyCellStyle}">
                 <DataGridTemplateColumn.CellTemplate>
                   <DataTemplate>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
@@ -242,7 +253,21 @@
                 </DataGridTemplateColumn.CellTemplate>
               </DataGridTemplateColumn>
 
-              <DataGridTextColumn Header="Повышение прав" Binding="{Binding PrivilegeEscalation.StatusDescription}" IsReadOnly="True" Width="180"/>
+              <!-- Masked / Clear Root Password with Toggle & Copy -->
+              <DataGridTemplateColumn Header="Пароль Root" Width="150" CellStyle="{StaticResource DiscoveryReadOnlyCellStyle}">
+                <DataGridTemplateColumn.CellTemplate>
+                  <DataTemplate>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                      <TextBlock Text="{Binding DisplayRootPassword}" VerticalAlignment="Center" Width="70" TextTrimming="CharacterEllipsis"/>
+                      <Button Content="👁" Click="ToggleRootPasswordVisibility_Click" Padding="4,1" MinHeight="22" Margin="4,0,0,0" ToolTip="Показать/скрыть"/>
+                      <Button Content="Коп." Click="CopyCandidateRootPassword_Click" Padding="4,1" MinHeight="22" Margin="4,0,0,0" ToolTip="Копировать пароль root"/>
+                    </StackPanel>
+                  </DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+              </DataGridTemplateColumn>
+
+              <DataGridTextColumn Header="Повышение прав" Binding="{Binding PrivilegeEscalation.StatusDescription}" IsReadOnly="True" Width="180"
+                                  CellStyle="{StaticResource DiscoveryReadOnlyCellStyle}"/>
 
               <!-- Links button -->
               <DataGridTemplateColumn Header="Связи" Width="75">
@@ -253,8 +278,44 @@
                 </DataGridTemplateColumn.CellTemplate>
               </DataGridTemplateColumn>
 
-              <DataGridTextColumn Header="Статус" Binding="{Binding StatusMessage}" IsReadOnly="True" Width="*"/>
+              <DataGridTextColumn Header="Статус" Binding="{Binding StatusMessage}" IsReadOnly="True" Width="*"
+                                  CellStyle="{StaticResource DiscoveryReadOnlyCellStyle}"/>
             </DataGrid.Columns>
+            <DataGrid.GroupStyle>
+              <GroupStyle>
+                <GroupStyle.ContainerStyle>
+                  <Style TargetType="{x:Type GroupItem}">
+                    <Setter Property="Template">
+                      <Setter.Value>
+                        <ControlTemplate TargetType="{x:Type GroupItem}">
+                          <StackPanel>
+                            <Border BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,1,0,0" Margin="0,6,0,0" Padding="4,6,0,4">
+                              <StackPanel Orientation="Horizontal">
+                                <TextBlock FontWeight="SemiBold" Foreground="{DynamicResource MutedTextBrush}">
+                                  <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                      <Setter Property="Text" Value="Новые"/>
+                                      <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Name}" Value="True">
+                                          <Setter Property="Text" Value="Дубли"/>
+                                        </DataTrigger>
+                                      </Style.Triggers>
+                                    </Style>
+                                  </TextBlock.Style>
+                                </TextBlock>
+                                <TextBlock Text="{Binding ItemCount, StringFormat='({0})'}" Margin="6,0,0,0"
+                                           Foreground="{DynamicResource MutedTextBrush}"/>
+                              </StackPanel>
+                            </Border>
+                            <ItemsPresenter/>
+                          </StackPanel>
+                        </ControlTemplate>
+                      </Setter.Value>
+                    </Setter>
+                  </Style>
+                </GroupStyle.ContainerStyle>
+              </GroupStyle>
+            </DataGrid.GroupStyle>
           </DataGrid>
         </Grid>
       </TabItem>
