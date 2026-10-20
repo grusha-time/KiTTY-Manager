@@ -25,7 +25,9 @@ public static class Socks5TcpProbe
         try
         {
             using var client = await ConnectAsync(proxy, host, port, timeoutSource.Token).ConfigureAwait(false);
-            return true;
+            var banner = new byte[1];
+            var read = await client.GetStream().ReadAsync(banner, 0, 1, timeoutSource.Token).ConfigureAwait(false);
+            return read > 0;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -40,6 +42,10 @@ public static class Socks5TcpProbe
             return false;
         }
         catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
         {
             return false;
         }

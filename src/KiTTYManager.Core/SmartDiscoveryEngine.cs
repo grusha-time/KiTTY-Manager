@@ -23,6 +23,18 @@ public interface ISmartDiscoveryProbe
     Task<bool> ProbeHopReachabilityAsync(
         BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
         string targetHost, int targetPort, TimeSpan timeout, CancellationToken cancellationToken);
+
+    async Task<IReadOnlyDictionary<string, bool>> ProbeHopBatchReachabilityAsync(
+        BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+        IReadOnlyList<string> targetHosts, int targetPort, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var results = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var host in targetHosts)
+        {
+            results[host] = await ProbeHopReachabilityAsync(jumpHost, intermediateGateways, host, targetPort, timeout, cancellationToken).ConfigureAwait(false);
+        }
+        return results;
+    }
 }
 
 public sealed class SmartDiscoveryAuthResult
@@ -155,6 +167,126 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
         catch
         {
             return false;
+        }
+    }
+
+    public virtual async Task<IReadOnlyDictionary<string, bool>> ProbeHopBatchReachabilityAsync(
+        BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+        IReadOnlyList<string> targetHosts, int targetPort, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var results = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        if (targetHosts.Count == 0) return results;
+
+        if (intermediateGateways.Count == 0)
+        {
+            foreach (var host in targetHosts)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                results[host] = await ProbeReachabilityAsync(jumpHost, host, targetPort, timeout, cancellationToken).ConfigureAwait(false);
+            }
+            return results;
+        }
+
+        var ssh = new SshConnectionService
+        {
+            Timeout = timeout,
+            EndpointProbeTimeout = timeout,
+            HostKeyVerifier = hostKeyVerifier ?? ((_, _) => autoConfirmHostKeys)
+        };
+
+        var candidate = new RouteCandidate(
+            jumpHost ?? new BaseProxy(),
+            intermediateGateways,
+            WithoutProxy: jumpHost == null);
+
+        try
+        {
+            using var route = await ssh.ConnectProbeAsync(candidate, cancellationToken).ConfigureAwait(false);
+            if (route.Client == null || !route.Client.IsConnected)
+            {
+                foreach (var host in targetHosts)
+                    results[host] = false;
+                return results;
+            }
+
+            var maxBatchParallel = Math.Min(8, Math.Max(1, targetHosts.Count));
+            using var batchSemaphore = new SemaphoreSlim(maxBatchParallel, maxBatchParallel);
+
+            var probeTasks = targetHosts.Select(async host =>
+            {
+                await batchSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var reachable = false;
+                    ForwardedPortLocal? forward = null;
+                    try
+                    {
+                        forward = new ForwardedPortLocal("127.0.0.1", 0, host, (uint)targetPort);
+                        lock (route.Client)
+                        {
+                            route.Client.AddForwardedPort(forward);
+                        }
+                        forward.Start();
+
+                        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        cts.CancelAfter(timeout);
+                        using var client = new TcpClient();
+                        await client.ConnectAsync(System.Net.IPAddress.Loopback, checked((int)forward.BoundPort), cts.Token).ConfigureAwait(false);
+                        var banner = new byte[1];
+                        var read = await client.GetStream().ReadAsync(banner, 0, 1, cts.Token).ConfigureAwait(false);
+                        reachable = read > 0;
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        reachable = false;
+                    }
+                    finally
+                    {
+                        if (forward != null)
+                        {
+                            try { forward.Stop(); } catch { }
+                            try
+                            {
+                                lock (route.Client)
+                                {
+                                    route.Client.RemoveForwardedPort(forward);
+                                }
+                            }
+                            catch { }
+                            forward.Dispose();
+                        }
+                    }
+
+                    return (Host: host, Reachable: reachable);
+                }
+                finally
+                {
+                    batchSemaphore.Release();
+                }
+            });
+
+            var probeResults = await Task.WhenAll(probeTasks).ConfigureAwait(false);
+            foreach (var r in probeResults)
+            {
+                results[r.Host] = r.Reachable;
+            }
+
+            return results;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            foreach (var host in targetHosts)
+                results[host] = false;
+            return results;
         }
     }
 
@@ -609,9 +741,17 @@ public sealed class SmartDiscoveryEngine
                         }
                         else if (problem != null)
                         {
-                            problematic.Add(problem);
-                            ReportProgress(SmartDiscoveryProgressKind.HostFailed, host, $"Ошибка: {problem.Reason}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
-                            Log($"Хост {host}: ошибка на этапе \"{problem.Stage}\".");
+                            if (problem.Stage == "Доступность")
+                            {
+                                unreachableHosts.Add(host);
+                                Log($"Хост {host}: сбой доступности при прямой проверке ({problem.Reason}), направлен в multi-hop поиск.");
+                            }
+                            else
+                            {
+                                problematic.Add(problem);
+                                ReportProgress(SmartDiscoveryProgressKind.HostFailed, host, $"Ошибка: {problem.Reason}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
+                                Log($"Хост {host}: ошибка на этапе \"{problem.Stage}\".");
+                            }
                         }
                     }
                 }
@@ -652,33 +792,53 @@ public sealed class SmartDiscoveryEngine
                         var savedPrefixLength = gatewayChain.SavedRoute?.Servers.Count ?? 0;
                         if (gateway.RouteHops.Count - savedPrefixLength >= maxHops) continue;
 
-                        for (var i = unreachableHosts.Count - 1; i >= 0; i--)
+                        var gatewayEntryPoints = gatewayChain.SavedRoute is { } savedRoute
+                            ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
+                            : entryPoints;
+
+                        var nonRetryableOnThisGateway = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                        foreach (var entryPoint in gatewayEntryPoints)
                         {
+                            if (unreachableHosts.Count == 0) break;
                             cancellationToken.ThrowIfCancellationRequested();
-                            var targetHost = unreachableHosts[i];
 
-                            // If target host already exceeded max attempts across all routes, don't keep probing
-                            lock (syncLock)
-                            {
-                                if (hostAttempts.TryGetValue(targetHost, out var att) && att >= options.MaxAttemptsPerHost)
-                                    continue;
-                            }
-
-                            // Prevent cycles
-                            if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
+                            if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
                                 continue;
 
-                            var gatewayEntryPoints = gatewayChain.SavedRoute is { } savedRoute
-                                ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
-                                : entryPoints;
-
-                            foreach (var entryPoint in gatewayEntryPoints)
+                            var candidateHosts = new List<string>();
+                            lock (syncLock)
                             {
-                                if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
-                                    continue;
+                                foreach (var targetHost in unreachableHosts)
+                                {
+                                    if (nonRetryableOnThisGateway.Contains(targetHost))
+                                        continue;
+                                    if (hostAttempts.TryGetValue(targetHost, out var att) && att >= options.MaxAttemptsPerHost)
+                                        continue;
+                                    if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
+                                        continue;
+                                    candidateHosts.Add(targetHost);
+                                }
+                            }
 
-                                var canHop = await probe.ProbeHopReachabilityAsync(
-                                    entryPoint, gatewayChain.Servers, targetHost, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                            if (candidateHosts.Count == 0) continue;
+
+                            var batchResults = await probe.ProbeHopBatchReachabilityAsync(
+                                entryPoint, gatewayChain.Servers, candidateHosts, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+
+                            foreach (var targetHost in candidateHosts)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+
+                                lock (syncLock)
+                                {
+                                    if (!unreachableHosts.Contains(targetHost, StringComparer.OrdinalIgnoreCase))
+                                        continue;
+                                    if (hostAttempts.TryGetValue(targetHost, out var used) && used >= options.MaxAttemptsPerHost)
+                                        continue;
+                                }
+
+                                var canHop = batchResults.TryGetValue(targetHost, out var ok) && ok;
                                 Log($"Фаза 3: хост {targetHost} через шлюз {gateway.ProposedName} и {DescribeEntryPoint(entryPoint)} — {(canHop ? "доступен" : "недоступен")}.");
 
                                 if (!canHop) continue;
@@ -700,7 +860,7 @@ public sealed class SmartDiscoveryEngine
                                         discovered.Add(candidate);
                                         reservedNames.Add(candidate.ProposedName);
                                         nextWaveGateways.Add(candidate);
-                                        unreachableHosts.RemoveAt(i);
+                                        unreachableHosts.RemoveAll(h => string.Equals(h, targetHost, StringComparison.OrdinalIgnoreCase));
                                         lastHostProblems.Remove(targetHost);
 
                                         confirmedCredentials.RemoveAll(c => c.User == candidate.Username && c.Pass == candidate.Password);
@@ -709,25 +869,18 @@ public sealed class SmartDiscoveryEngine
                                         ReportProgress(SmartDiscoveryProgressKind.HostSucceeded, targetHost, $"Сессия найдена через {gateway.ProposedName}: {candidate.ProposedName}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
                                     }
                                     Log($"Хост {targetHost}: сессия \"{candidate.ProposedName}\" найдена через шлюз {gateway.ProposedName} и {DescribeVerifiedEntryPoint(candidate.VerifiedProxyId)}.");
-                                    break;
                                 }
-
-                                if (hopProblem != null)
+                                else if (hopProblem != null)
                                 {
                                     lock (syncLock)
                                     {
                                         lastHostProblems[targetHost] = hopProblem;
                                     }
-                                }
 
-                                // An authentication or host-key problem will not change through another entry point.
-                                if (hopProblem?.Stage != "Доступность")
-                                    break;
-
-                                lock (syncLock)
-                                {
-                                    if (hostAttempts.TryGetValue(targetHost, out var used) && used >= options.MaxAttemptsPerHost)
-                                        break;
+                                    if (hopProblem.Stage != "Доступность")
+                                    {
+                                        nonRetryableOnThisGateway.Add(targetHost);
+                                    }
                                 }
                             }
                         }
@@ -811,6 +964,7 @@ public sealed class SmartDiscoveryEngine
             {
                 ct.ThrowIfCancellationRequested();
                 var stopAll = false;
+                var allUnreachable = true;
 
                 IReadOnlyList<BaseProxy?> attemptEntryPoints = lockEntryPoint
                     ? new BaseProxy?[] { entryPoint }
@@ -820,17 +974,14 @@ public sealed class SmartDiscoveryEngine
                     if (attemptEntryPoint != null && !await EnsureEntryPointReadyAsync(attemptEntryPoint, ct).ConfigureAwait(false))
                         continue;
 
-                    int currentAttempts;
                     lock (syncLock)
                     {
-                        hostAttempts.TryGetValue(host, out currentAttempts);
-                        if (currentAttempts >= maxAttempts)
+                        if (hostAttempts.TryGetValue(host, out var currentAttempts) && currentAttempts >= maxAttempts)
                         {
                             lastReason = $"Превышен лимит попыток подбора ({maxAttempts}) для узла {host}";
                             stopAll = true;
                             break;
                         }
-                        hostAttempts[host] = ++currentAttempts;
                     }
 
                     var targetServer = new ManagedServer
@@ -847,6 +998,13 @@ public sealed class SmartDiscoveryEngine
 
                     if (result.Success)
                     {
+                        allUnreachable = false;
+                        lock (syncLock)
+                        {
+                            hostAttempts.TryGetValue(host, out var used);
+                            hostAttempts[host] = used + 1;
+                        }
+
                         var candidateId = Guid.NewGuid();
                         string proposedName;
                         lock (syncLock)
@@ -913,6 +1071,12 @@ public sealed class SmartDiscoveryEngine
 
                     if (result.IsHostKeyRejected)
                     {
+                        allUnreachable = false;
+                        lock (syncLock)
+                        {
+                            hostAttempts.TryGetValue(host, out var used);
+                            hostAttempts[host] = used + 1;
+                        }
                         Log($"Хост {host}: host key отклонён через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
                         currentStage = "HostKey";
                         lastReason = result.ErrorMessage;
@@ -921,6 +1085,12 @@ public sealed class SmartDiscoveryEngine
                     }
                     else if (result.IsAuthFailure)
                     {
+                        allUnreachable = false;
+                        lock (syncLock)
+                        {
+                            hostAttempts.TryGetValue(host, out var used);
+                            hostAttempts[host] = used + 1;
+                        }
                         Log($"Хост {host}: вход (пользователь {u}) не удался через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)} (аутентификация).");
                         currentStage = "Аутентификация";
                         lastReason = $"Неверный логин или пароль: {result.ErrorMessage}";
@@ -934,7 +1104,7 @@ public sealed class SmartDiscoveryEngine
                     }
                 }
 
-                if (stopAll) break;
+                if (stopAll || allUnreachable) break;
             }
 
             var problem = new ProblematicServerCandidate
@@ -1161,40 +1331,96 @@ public sealed class SmartDiscoveryEngine
         var seeds = new List<DiscoveredServerCandidate>();
         var routes = new Dictionary<Guid, SavedGatewayRoute>();
 
-        HashSet<Guid> scopeIdSet;
-        if (options.TargetGroupId.HasValue)
+        var seedDistance = new Dictionary<Guid, int>();
+
+        HashSet<Guid> FindIndependentServerIds(HashSet<Guid> scope)
         {
-            var group = config.FindGroup(options.TargetGroupId.Value);
-            if (group is null) return (seeds, routes);
-            scopeIdSet = ServersInGroup(group).Select(server => server.Id).ToHashSet();
-        }
-        else
-        {
-            scopeIdSet = config.UngroupedServers.Select(server => server.Id).ToHashSet();
+            var independentIds = new HashSet<Guid>(ConnectivityBatchPlanner.DirectlyReachable(config, scope));
+
+            foreach (var id in scope)
+            {
+                if (independentIds.Contains(id)) continue;
+                var server = config.FindServer(id);
+                if (server?.PreferredRoute is not null)
+                {
+                    var cachedCandidate = RoutePlanner.CandidateFromCached(config, server.PreferredRoute);
+                    if (cachedCandidate is not null &&
+                        cachedCandidate.Servers.Take(cachedCandidate.Servers.Count - 1).All(p => !scope.Contains(p.Id)))
+                    {
+                        independentIds.Add(id);
+                        continue;
+                    }
+                }
+
+                var candidates = RoutePlanner.Candidates(config, id);
+                if (candidates.Any(c => c.Servers.Take(c.Servers.Count - 1).All(prefix => !scope.Contains(prefix.Id))))
+                {
+                    independentIds.Add(id);
+                }
+            }
+
+            if (independentIds.Count == 0)
+            {
+                foreach (var id in scope)
+                {
+                    var server = config.FindServer(id);
+                    if ((server?.PreferredRoute is not null && RoutePlanner.CandidateFromCached(config, server.PreferredRoute) is not null) ||
+                        RoutePlanner.Candidates(config, id).Count > 0)
+                    {
+                        independentIds.Add(id);
+                    }
+                }
+            }
+
+            return independentIds;
         }
 
-        foreach (var id in ConnectivityBatchPlanner.DirectlyReachable(config, scopeIdSet))
+        void TryAddGatewaySeed(Guid id, HashSet<Guid> scope, int distance)
         {
+            if (routes.ContainsKey(id)) return;
             var server = config.FindServer(id);
-            if (server is null) continue;
-            var ordered = RoutePlanner.OrderPreferred(
-                    config, RoutePlanner.Candidates(config, id), server.PreferredRoute)
-                .Where(candidate => candidate.Servers
-                    .Take(candidate.Servers.Count - 1)
-                    .All(prefixServer => !scopeIdSet.Contains(prefixServer.Id)))
-                .ToArray();
-            var route = server.PreferredRoute is { } preferred
-                ? ordered.FirstOrDefault(candidate => RoutePreferencePolicy.Matches(preferred, candidate))
-                : null;
-            route ??= ordered.FirstOrDefault(candidate =>
-                candidate.Servers.Count > 1 &&
-                config.Links.Any(link =>
-                    link.FromServerId == candidate.Servers[^2].Id &&
-                    link.ToServerId == id &&
-                    link.LastSuccessUtc is not null));
-            route ??= ordered.FirstOrDefault(candidate => candidate.Servers.Count > 1);
-            route ??= ordered.FirstOrDefault();
-            if (route is null) continue;
+            if (server is null) return;
+
+            RouteCandidate? route = null;
+
+            if (server.PreferredRoute is not null)
+            {
+                var cachedCandidate = RoutePlanner.CandidateFromCached(config, server.PreferredRoute);
+                if (cachedCandidate is not null &&
+                    cachedCandidate.Servers.Take(cachedCandidate.Servers.Count - 1).All(prefix => !scope.Contains(prefix.Id)))
+                {
+                    route = cachedCandidate;
+                }
+            }
+
+            if (route is null)
+            {
+                var candidates = RoutePlanner.Candidates(config, id);
+                var ordered = RoutePlanner.OrderPreferred(
+                        config, candidates, server.PreferredRoute)
+                    .Where(candidate => candidate.Servers
+                        .Take(candidate.Servers.Count - 1)
+                        .All(prefixServer => !scope.Contains(prefixServer.Id)))
+                    .ToArray();
+                if (ordered.Length == 0)
+                {
+                    ordered = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute).ToArray();
+                }
+
+                route = server.PreferredRoute is { } preferred
+                    ? ordered.FirstOrDefault(candidate => RoutePreferencePolicy.Matches(preferred, candidate))
+                    : null;
+                route ??= ordered.FirstOrDefault(candidate =>
+                    candidate.Servers.Count > 1 &&
+                    config.Links.Any(link =>
+                        link.FromServerId == candidate.Servers[^2].Id &&
+                        link.ToServerId == id &&
+                        link.LastSuccessUtc is not null));
+                route ??= ordered.FirstOrDefault(candidate => candidate.Servers.Count > 1);
+                route ??= ordered.FirstOrDefault();
+            }
+
+            if (route is null) return;
 
             seeds.Add(new DiscoveredServerCandidate
             {
@@ -1213,11 +1439,41 @@ public sealed class SmartDiscoveryEngine
                 VerifiedProxyId = route.WithoutProxy || route.Proxy.Id == Guid.Empty ? null : route.Proxy.Id
             });
             routes[server.Id] = new SavedGatewayRoute(route, route.Servers.ToArray());
+            if (!seedDistance.ContainsKey(server.Id))
+                seedDistance[server.Id] = distance;
+        }
+
+        if (options.TargetGroupId.HasValue)
+        {
+            var ancestry = config.GroupAncestry(options.TargetGroupId.Value);
+            if (ancestry.Count > 0)
+            {
+                // Iterate over EVERY level in ancestry from target group up to root
+                for (var i = ancestry.Count - 1; i >= 0; i--)
+                {
+                    var group = ancestry[i];
+                    var distance = ancestry.Count - 1 - i;
+                    var levelScope = ServersInGroup(group).Select(server => server.Id).ToHashSet();
+                    foreach (var id in FindIndependentServerIds(levelScope))
+                    {
+                        TryAddGatewaySeed(id, levelScope, distance);
+                    }
+                }
+            }
+        }
+        else
+        {
+            var ungroupedScope = config.UngroupedServers.Select(server => server.Id).ToHashSet();
+            foreach (var id in FindIndependentServerIds(ungroupedScope))
+            {
+                TryAddGatewaySeed(id, ungroupedScope, 0);
+            }
         }
 
         return (
             seeds
-                .OrderBy(seed => seed.RouteHops.Count)
+                .OrderBy(seed => seedDistance.TryGetValue(seed.Id, out var d) ? d : int.MaxValue)
+                .ThenBy(seed => seed.RouteHops.Count)
                 .ThenBy(seed => seed.ProposedName, StringComparer.CurrentCultureIgnoreCase)
                 .ThenBy(seed => seed.Id)
                 .ToList(),

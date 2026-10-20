@@ -305,16 +305,33 @@ public static class SmartDiscoverySessionCreator
             var created = config.FindServer(createdId);
             if (created is null) continue;
 
-            var scopeId = config.FindServerGroup(createdId)?.Id ?? Guid.Empty;
-            if (!existingIndependentByGroup.TryGetValue(scopeId, out var sources)) continue;
-
-            foreach (var sourceId in sources.Distinct())
+            var group = config.FindServerGroup(createdId);
+            var scopeIds = new List<Guid>();
+            if (group is not null)
             {
-                if (createdIds.Contains(sourceId)) continue;
-                var source = config.FindServer(sourceId);
-                if (source is null || sourceId == createdId) continue;
-                if (!seen.Add((sourceId, createdId))) continue;
-                result.Add(new ConnectivityPairChoice(source.Id, created.Id, source.Name, created.Name));
+                var ancestry = config.GroupAncestry(group.Id);
+                if (ancestry.Count > 0)
+                    scopeIds.AddRange(ancestry.Select(g => g.Id));
+                else
+                    scopeIds.Add(group.Id);
+            }
+            else
+            {
+                scopeIds.Add(Guid.Empty);
+            }
+
+            foreach (var scopeId in scopeIds)
+            {
+                if (!existingIndependentByGroup.TryGetValue(scopeId, out var sources)) continue;
+
+                foreach (var sourceId in sources.Distinct())
+                {
+                    if (createdIds.Contains(sourceId)) continue;
+                    var source = config.FindServer(sourceId);
+                    if (source is null || sourceId == createdId) continue;
+                    if (!seen.Add((sourceId, createdId))) continue;
+                    result.Add(new ConnectivityPairChoice(source.Id, created.Id, source.Name, created.Name));
+                }
             }
         }
 

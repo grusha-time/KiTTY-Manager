@@ -16,6 +16,7 @@ internal sealed partial class SelfTestRunner
         public HashSet<(Guid proxy, string host)> ProxyAuthUnreachable { get; } = [];
         public HashSet<string> HostKeyRejectedHosts { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<Guid, HashSet<string>> ProxyReachable { get; } = [];
+        public HashSet<string> DirectAuthUnreachable { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Action<string>? OnHostProbed { get; set; }
         public string AuthErrorMessage { get; set; } = "Неверные учетные данные";
 
@@ -23,6 +24,7 @@ internal sealed partial class SelfTestRunner
         public List<(string host, Guid? proxyId)> ReachabilityAttempts { get; } = [];
         public List<List<(string Host, string Password)>> HopChains { get; } = [];
         public List<DiscoveryHopAttempt> HopAttempts { get; } = [];
+        public List<(IReadOnlyList<ManagedServer> Gateways, IReadOnlyList<string> TargetHosts)> BatchHopAttempts { get; } = [];
 
         public Task<bool> ProbeReachabilityAsync(
             BaseProxy? jumpHost, string host, int port, TimeSpan timeout, CancellationToken cancellationToken)
@@ -60,12 +62,56 @@ internal sealed partial class SelfTestRunner
             return Task.FromResult(HopReachability.Contains((lastGateway, targetHost)));
         }
 
+        public Task<IReadOnlyDictionary<string, bool>> ProbeHopBatchReachabilityAsync(
+            BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+            IReadOnlyList<string> targetHosts, int targetPort, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            if (intermediateGateways.Count > 0)
+            {
+                HopChains.Add(intermediateGateways.Select(g => (g.Host, g.Password)).ToList());
+                HopAttempts.Add(new DiscoveryHopAttempt(
+                    intermediateGateways.Select(g => new ManagedServer
+                    {
+                        Id = g.Id,
+                        Name = g.Name,
+                        Host = g.Host,
+                        Port = g.Port,
+                        Username = g.Username,
+                        Password = g.Password,
+                        PrivateKeyPath = g.PrivateKeyPath,
+                        PrivateKeyPassphrase = g.PrivateKeyPassphrase,
+                        UseKeyboardInteractive = g.UseKeyboardInteractive
+                    }).ToArray(),
+                    jumpHost?.Id));
+            }
+            BatchHopAttempts.Add((intermediateGateways, targetHosts.ToList()));
+            var results = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (var host in targetHosts)
+            {
+                if (intermediateGateways.Count == 0)
+                {
+                    results[host] = DirectlyReachable.Contains(host);
+                }
+                else
+                {
+                    var lastGateway = intermediateGateways[^1].Host;
+                    results[host] = HopReachability.Contains((lastGateway, host));
+                }
+            }
+            return Task.FromResult<IReadOnlyDictionary<string, bool>>(results);
+        }
+
         public Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
             BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
             ManagedServer target, IReadOnlyList<string> candidatePasswords,
             TimeSpan timeout, CancellationToken cancellationToken)
         {
             AttemptedLogins.Add((target.Host, target.Username, target.Password));
+
+            if (intermediateGateways.Count == 0 && DirectAuthUnreachable.Contains(target.Host))
+            {
+                return Task.FromResult(SmartDiscoveryAuthResult.FailedReachability("Сбой прямого сетевого подключения"));
+            }
 
             if (HostKeyRejectedHosts.Contains(target.Host))
             {
@@ -267,6 +313,33 @@ internal sealed partial class SelfTestRunner
         // Host 3 attempts should be capped at MaxAttemptsPerHost (4)
         var host3Attempts = probe.AttemptedLogins.Where(a => a.host == "10.0.0.3").ToList();
         Equal(4, host3Attempts.Count);
+
+        // Network connection failure during authentication must NOT burn credential attempts,
+        // and must break early without trying remaining passwords.
+        var unreachableProbe = new TestSmartDiscoveryProbe();
+        unreachableProbe.DirectlyReachable.Add("10.0.0.5");
+        unreachableProbe.DirectAuthUnreachable.Add("10.0.0.5");
+
+        var unreachableOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.0.0.5"],
+            Usernames = ["admin"],
+            Passwords = ["pass1", "pass2", "pass3", "pass4", "pass5"],
+            MaxParallelConnections = 1,
+            MaxAttemptsPerHost = 3
+        };
+
+        var unreachableEngine = new SmartDiscoveryEngine(config, unreachableOptions, unreachableProbe);
+        var unreachableResult = unreachableEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(0, unreachableResult.Discovered.Count);
+        Equal(1, unreachableResult.Problematic.Count);
+        var prob5 = unreachableResult.Problematic.Single(p => p.Host == "10.0.0.5");
+        Equal("Доступность", prob5.Stage);
+
+        // Crucial: Only 1 attempt made (broke early after first password failed on network reachability)
+        var host5Attempts = unreachableProbe.AttemptedLogins.Where(a => a.host == "10.0.0.5").ToList();
+        Equal(1, host5Attempts.Count);
     }
 
     private static void PrivilegeEscalationOrderingTests()
@@ -661,6 +734,393 @@ internal sealed partial class SelfTestRunner
             directSavedCreated.Single(s => s.Host == directWaveTargetHost).RequiredPreviousServerId);
         Equal(true, directSavedConfig.Links.Any(
             link => link.FromServerId == directSavedGateway.Id && link.ToServerId == directWaveGateway.Id));
+
+        // SOCKS5 probe banner read verification
+        try
+        {
+            using (var noBannerSocks = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0))
+            {
+                noBannerSocks.Start();
+                var port = ((System.Net.IPEndPoint)noBannerSocks.LocalEndpoint).Port;
+                var serverTask = Task.Run(async () =>
+                {
+                    using var client = await noBannerSocks.AcceptTcpClientAsync();
+                    await using var stream = client.GetStream();
+                    var greeting = new byte[3];
+                    await stream.ReadExactlyAsync(greeting);
+                    await stream.WriteAsync(new byte[] { 0x05, 0x00 });
+                    var reqHeader = new byte[4];
+                    await stream.ReadExactlyAsync(reqHeader);
+                    var addrLen = reqHeader[3] switch
+                    {
+                        0x01 => 4,
+                        0x03 => stream.ReadByte(),
+                        0x04 => 16,
+                        _ => 4
+                    };
+                    var addrBuf = new byte[addrLen + 2];
+                    await stream.ReadExactlyAsync(addrBuf);
+                    await stream.WriteAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 22 });
+                    client.Close();
+                });
+
+                var proxy = new BaseProxy { Host = "127.0.0.1", Port = port };
+                var canConnectNoBanner = Socks5TcpProbe.CanConnectAsync(
+                    proxy, "10.0.0.1", 22, TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                Equal(false, canConnectNoBanner);
+                serverTask.GetAwaiter().GetResult();
+            }
+
+            using (var withBannerSocks = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0))
+            {
+                withBannerSocks.Start();
+                var port = ((System.Net.IPEndPoint)withBannerSocks.LocalEndpoint).Port;
+                var serverTask = Task.Run(async () =>
+                {
+                    using var client = await withBannerSocks.AcceptTcpClientAsync();
+                    await using var stream = client.GetStream();
+                    var greeting = new byte[3];
+                    await stream.ReadExactlyAsync(greeting);
+                    await stream.WriteAsync(new byte[] { 0x05, 0x00 });
+                    var reqHeader = new byte[4];
+                    await stream.ReadExactlyAsync(reqHeader);
+                    var addrLen = reqHeader[3] switch
+                    {
+                        0x01 => 4,
+                        0x03 => stream.ReadByte(),
+                        0x04 => 16,
+                        _ => 4
+                    };
+                    var addrBuf = new byte[addrLen + 2];
+                    await stream.ReadExactlyAsync(addrBuf);
+                    await stream.WriteAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 22 });
+                    await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes("SSH-2.0-TestServer\r\n"));
+                    await stream.ReadAsync(new byte[1]);
+                });
+
+                var proxy = new BaseProxy { Host = "127.0.0.1", Port = port };
+                var canConnectWithBanner = Socks5TcpProbe.CanConnectAsync(
+                    proxy, "10.0.0.1", 22, TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+                Equal(true, canConnectWithBanner);
+                serverTask.GetAwaiter().GetResult();
+            }
+        }
+        catch (System.Net.Sockets.SocketException)
+        {
+            // Ignored in sandboxed test environments where loopback socket binding is restricted
+        }
+
+        // Phase 2 fallback to Phase 3 when direct connection is unreachable
+        var fallbackConfig = new ManagerConfig();
+        var fallbackGroup = new ServerGroup { Name = "Fallback Group" };
+        var directGateway = new ManagedServer
+        {
+            Name = "Direct Gateway",
+            Host = "10.50.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "GW_PASSWORD",
+            TryDirectWithoutJumphost = true
+        };
+        directGateway.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [directGateway.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        fallbackGroup.Servers.Add(directGateway);
+        fallbackConfig.Groups.Add(fallbackGroup);
+
+        var fallbackProbe = new TestSmartDiscoveryProbe();
+        const string falsePositiveDirectHost = "10.50.0.2";
+        fallbackProbe.DirectlyReachable.Add(falsePositiveDirectHost);
+        fallbackProbe.DirectAuthUnreachable.Add(falsePositiveDirectHost);
+        fallbackProbe.HopReachability.Add((directGateway.Host, falsePositiveDirectHost));
+        fallbackProbe.ValidCredentials[falsePositiveDirectHost] = [("root", "TARGET_PASSWORD")];
+
+        var fallbackOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [falsePositiveDirectHost],
+            Usernames = ["root"],
+            Passwords = ["TARGET_PASSWORD"],
+            TargetGroupId = fallbackGroup.Id,
+            MaxParallelConnections = 1,
+            AutoSelectJumpHost = false
+        };
+
+        var fallbackEngine = new SmartDiscoveryEngine(fallbackConfig, fallbackOptions, fallbackProbe);
+        var fallbackResult = fallbackEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, fallbackResult.Discovered.Count);
+        Equal(0, fallbackResult.Problematic.Count);
+        var discoveredCandidate = fallbackResult.Discovered.Single();
+        Equal(falsePositiveDirectHost, discoveredCandidate.Host);
+        Equal(directGateway.Id, discoveredCandidate.RequiredPreviousServerId);
+
+        // Subgroup discovery seeds independent servers from ancestor/root group
+        var hierarchyConfig = new ManagerConfig();
+        var rootGroup = new ServerGroup { Name = "Root Group" };
+        var subGroup = new ServerGroup { Name = "Sub Group" };
+        rootGroup.Groups.Add(subGroup);
+        hierarchyConfig.Groups.Add(rootGroup);
+
+        var ancestorGateway = new ManagedServer
+        {
+            Name = "Ancestor Gateway",
+            Host = "10.60.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "ROOT_PW",
+            TryDirectWithoutJumphost = true
+        };
+        ancestorGateway.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [ancestorGateway.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        rootGroup.Servers.Add(ancestorGateway);
+
+        const string subTargetHost = "10.60.0.50";
+        var hierarchyProbe = new TestSmartDiscoveryProbe();
+        hierarchyProbe.HopReachability.Add((ancestorGateway.Host, subTargetHost));
+        hierarchyProbe.ValidCredentials[subTargetHost] = [("root", "SUB_PW")];
+
+        var hierarchyOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [subTargetHost],
+            Usernames = ["root"],
+            Passwords = ["SUB_PW"],
+            TargetGroupId = subGroup.Id,
+            MaxParallelConnections = 1
+        };
+
+        var hierarchyEngine = new SmartDiscoveryEngine(hierarchyConfig, hierarchyOptions, hierarchyProbe);
+        var hierarchyResult = hierarchyEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, hierarchyResult.Discovered.Count);
+        Equal(0, hierarchyResult.Problematic.Count);
+        var subTarget = hierarchyResult.Discovered.Single();
+        Equal(subTargetHost, subTarget.Host);
+        Equal(ancestorGateway.Id, subTarget.RequiredPreviousServerId);
+
+        // Phase 3 batch hop reachability optimization
+        var batchOptConfig = new ManagerConfig();
+        var batchOptGroup = new ServerGroup { Name = "Batch Group" };
+        var batchOptGateway = new ManagedServer
+        {
+            Name = "Batch Gateway",
+            Host = "10.70.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "GW_PW",
+            TryDirectWithoutJumphost = true
+        };
+        batchOptGateway.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [batchOptGateway.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        batchOptGroup.Servers.Add(batchOptGateway);
+        batchOptConfig.Groups.Add(batchOptGroup);
+
+        const string reachableHost = "10.70.0.10";
+        const string unreachableHost = "10.70.0.11";
+
+        var batchOptProbe = new TestSmartDiscoveryProbe();
+        batchOptProbe.HopReachability.Add((batchOptGateway.Host, reachableHost));
+        batchOptProbe.ValidCredentials[reachableHost] = [("root", "REACHABLE_PW")];
+        batchOptProbe.ValidCredentials[unreachableHost] = [("root", "UNREACHABLE_PW")];
+
+        var batchOptOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [reachableHost, unreachableHost],
+            Usernames = ["root"],
+            Passwords = ["REACHABLE_PW", "UNREACHABLE_PW"],
+            TargetGroupId = batchOptGroup.Id,
+            MaxParallelConnections = 1
+        };
+
+        var batchOptEngine = new SmartDiscoveryEngine(batchOptConfig, batchOptOptions, batchOptProbe);
+        var batchOptResult = batchOptEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, batchOptResult.Discovered.Count);
+        Equal(1, batchOptResult.Problematic.Count);
+        Equal(reachableHost, batchOptResult.Discovered.Single().Host);
+        Equal(unreachableHost, batchOptResult.Problematic.Single().Host);
+
+        Equal(true, batchOptProbe.BatchHopAttempts.Any(b =>
+            b.TargetHosts.Contains(reachableHost) && b.TargetHosts.Contains(unreachableHost)));
+
+        Equal(true, batchOptProbe.AttemptedLogins.Any(a => a.host == reachableHost));
+        Equal(false, batchOptProbe.AttemptedLogins.Any(a => a.host == unreachableHost));
+
+        var defaultProbe = new DefaultSmartDiscoveryProbe();
+        var directBatch = defaultProbe.ProbeHopBatchReachabilityAsync(
+            null, [], ["127.0.0.1"], 1, TimeSpan.FromMilliseconds(50), CancellationToken.None).GetAwaiter().GetResult();
+        Equal(1, directBatch.Count);
+
+        // Regression test: A (root) -> B (subgroup) -> new target asserts B is RequiredPreviousServerId
+        var abConfig = new ManagerConfig();
+        var abProxy = new BaseProxy { Name = "AB Jumphost", Host = "127.0.0.1", Port = 2222 };
+        abConfig.BaseProxies.Add(abProxy);
+
+        var abRootGroup = new ServerGroup { Name = "AB Root Group" };
+        var abSubGroup = new ServerGroup { Name = "AB Sub Group" };
+        abRootGroup.Groups.Add(abSubGroup);
+        abConfig.Groups.Add(abRootGroup);
+
+        var serverA = new ManagedServer
+        {
+            Name = "Server A",
+            Host = "10.80.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "PW_A",
+            TryDirectWithoutJumphost = true,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = abProxy.Id,
+                ServerIds = [Guid.Empty],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        serverA.PreferredRoute.ServerIds[0] = serverA.Id;
+        abRootGroup.Servers.Add(serverA);
+
+        var serverB = new ManagedServer
+        {
+            Name = "Server B",
+            Host = "10.80.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "PW_B",
+            RequiredPreviousServerId = serverA.Id,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = abProxy.Id,
+                ServerIds = [serverA.Id, Guid.Empty],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        serverB.PreferredRoute.ServerIds[1] = serverB.Id;
+        abSubGroup.Servers.Add(serverB);
+
+        abConfig.Links.Add(new ServerLink
+        {
+            FromServerId = serverA.Id,
+            ToServerId = serverB.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow,
+            LastStrategy = "DirectTcpIp",
+            LastSuccessfulProxyId = abProxy.Id
+        });
+
+        const string newTargetHost = "10.80.0.99";
+        var abProbe = new TestSmartDiscoveryProbe();
+        abProbe.HopReachability.Add((serverB.Host, newTargetHost));
+        abProbe.ValidCredentials[newTargetHost] = [("root", "TARGET_PW")];
+
+        var abOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [newTargetHost],
+            Usernames = ["root"],
+            Passwords = ["TARGET_PW"],
+            TargetGroupId = abSubGroup.Id,
+            MaxParallelConnections = 1
+        };
+
+        var abEngine = new SmartDiscoveryEngine(abConfig, abOptions, abProbe);
+        var abResult = abEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, abResult.Discovered.Count);
+        Equal(0, abResult.Problematic.Count);
+        var abTarget = abResult.Discovered.Single();
+        Equal(newTargetHost, abTarget.Host);
+        Equal(serverB.Id, abTarget.RequiredPreviousServerId);
+        Equal(string.Join('/', serverA.Host, serverB.Host, newTargetHost), string.Join('/', abTarget.RouteHops.Select(h => h.Host)));
+
+        // Regression test: 3-level hierarchy: Root (A) -> Intermediate (B) -> Target (empty)
+        // Target host is reachable only through B
+        var threeLevelConfig = new ManagerConfig();
+        var threeLevelProxy = new BaseProxy { Name = "3L JH", Host = "127.0.0.1", Port = 2300 };
+        threeLevelConfig.BaseProxies.Add(threeLevelProxy);
+
+        var threeLevelRoot = new ServerGroup { Name = "3L Root Group" };
+        var threeLevelMid = new ServerGroup { Name = "3L Intermediate Group" };
+        var threeLevelTargetGroup = new ServerGroup { Name = "3L Target Group" };
+        threeLevelMid.Groups.Add(threeLevelTargetGroup);
+        threeLevelRoot.Groups.Add(threeLevelMid);
+        threeLevelConfig.Groups.Add(threeLevelRoot);
+
+        var server3LA = new ManagedServer
+        {
+            Name = "Server 3L A",
+            Host = "10.90.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "PW_A_3L",
+            TryDirectWithoutJumphost = true,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = threeLevelProxy.Id,
+                ServerIds = [Guid.Empty],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        server3LA.PreferredRoute.ServerIds[0] = server3LA.Id;
+        threeLevelRoot.Servers.Add(server3LA);
+
+        var server3LB = new ManagedServer
+        {
+            Name = "Server 3L B",
+            Host = "10.90.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "PW_B_3L",
+            RequiredPreviousServerId = server3LA.Id,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = threeLevelProxy.Id,
+                ServerIds = [server3LA.Id, Guid.Empty],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        server3LB.PreferredRoute.ServerIds[1] = server3LB.Id;
+        threeLevelMid.Servers.Add(server3LB);
+
+        threeLevelConfig.Links.Add(new ServerLink
+        {
+            FromServerId = server3LA.Id,
+            ToServerId = server3LB.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow,
+            LastStrategy = "DirectTcpIp",
+            LastSuccessfulProxyId = threeLevelProxy.Id
+        });
+
+        const string threeLevelTargetHost = "10.90.0.99";
+        var threeLevelProbe = new TestSmartDiscoveryProbe();
+        threeLevelProbe.HopReachability.Add((server3LB.Host, threeLevelTargetHost));
+        threeLevelProbe.ValidCredentials[threeLevelTargetHost] = [("root", "TARGET_3L_PW")];
+
+        var threeLevelOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = [threeLevelTargetHost],
+            Usernames = ["root"],
+            Passwords = ["TARGET_3L_PW"],
+            TargetGroupId = threeLevelTargetGroup.Id,
+            MaxParallelConnections = 1
+        };
+
+        var threeLevelEngine = new SmartDiscoveryEngine(threeLevelConfig, threeLevelOptions, threeLevelProbe);
+        var threeLevelResult = threeLevelEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, threeLevelResult.Discovered.Count);
+        Equal(0, threeLevelResult.Problematic.Count);
+        var threeLevelDiscovered = threeLevelResult.Discovered.Single();
+        Equal(threeLevelTargetHost, threeLevelDiscovered.Host);
+        Equal(server3LB.Id, threeLevelDiscovered.RequiredPreviousServerId);
+        Equal(string.Join('/', server3LA.Host, server3LB.Host, threeLevelTargetHost), string.Join('/', threeLevelDiscovered.RouteHops.Select(h => h.Host)));
     }
 
     private static void CancellationPreservesDiscoveredCandidatesTests()
@@ -1137,9 +1597,10 @@ internal sealed partial class SelfTestRunner
         var plannedLinks = SmartDiscoverySessionCreator.PlanLinksToExistingGroupServers(
             planConfig, independentByGroup, createdIds);
 
-        Equal(3, plannedLinks.Count);
+        Equal(5, plannedLinks.Count);
         Equal(false, plannedLinks.Any(pair => createdIds.Contains(pair.SourceId)));
-        Equal(false, plannedLinks.Any(pair => pair.SourceId == planRootServer.Id));
+        Equal(true, plannedLinks.Any(pair => pair.SourceId == planRootServer.Id && pair.TargetId == editedDestination.Id));
+        Equal(true, plannedLinks.Any(pair => pair.SourceId == planRootServer.Id && pair.TargetId == newlyCreatedSource.Id));
         Equal(true, plannedLinks.Any(pair =>
             pair.SourceId == planNestedServer.Id && pair.TargetId == editedDestination.Id &&
             pair.SourceName == planNestedServer.Name && pair.TargetName == editedDestination.Name));
