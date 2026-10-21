@@ -10,6 +10,13 @@ public sealed record SmartDiscoveryResult(
     List<DiscoveredServerCandidate> Discovered,
     List<ProblematicServerCandidate> Problematic);
 
+public interface IDiscoveryGatewaySession : IAsyncDisposable, IDisposable
+{
+    Task<bool> ProbeReachabilityAsync(string host, int port, TimeSpan timeout, CancellationToken cancellationToken);
+    Task<IReadOnlyDictionary<string, bool>> ProbeBatchReachabilityAsync(IReadOnlyList<string> hosts, int port, TimeSpan timeout, CancellationToken cancellationToken);
+    Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(ManagedServer target, IReadOnlyList<string> candidatePasswords, TimeSpan timeout, CancellationToken cancellationToken);
+}
+
 public interface ISmartDiscoveryProbe
 {
     Task<bool> ProbeReachabilityAsync(
@@ -35,6 +42,10 @@ public interface ISmartDiscoveryProbe
         }
         return results;
     }
+
+    Task<IDiscoveryGatewaySession?> OpenGatewaySessionAsync(
+        BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+        TimeSpan timeout, CancellationToken cancellationToken) => Task.FromResult<IDiscoveryGatewaySession?>(null);
 }
 
 public sealed class SmartDiscoveryAuthResult
@@ -377,9 +388,152 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
         }
     }
 
+    public virtual async Task<IDiscoveryGatewaySession?> OpenGatewaySessionAsync(
+        BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+        TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (intermediateGateways.Count == 0) return null;
+
+        var ssh = new SshConnectionService
+        {
+            Timeout = timeout,
+            EndpointProbeTimeout = timeout,
+            HostKeyVerifier = hostKeyVerifier ?? ((_, _) => autoConfirmHostKeys)
+        };
+
+        var candidate = new RouteCandidate(
+            jumpHost ?? new BaseProxy(),
+            intermediateGateways,
+            WithoutProxy: jumpHost == null);
+
+        ActiveRoute? route = null;
+        ForwardedPortDynamic? dynamicPort = null;
+        try
+        {
+            route = await ssh.ConnectProbeAsync(candidate, cancellationToken).ConfigureAwait(false);
+            if (route.Client == null || !route.Client.IsConnected)
+            {
+                route.Dispose();
+                return null;
+            }
+
+            dynamicPort = new ForwardedPortDynamic("127.0.0.1", 0);
+            route.Client.AddForwardedPort(dynamicPort);
+            dynamicPort.Start();
+
+            var socksProxy = new BaseProxy
+            {
+                Id = Guid.NewGuid(),
+                Name = "GatewaySocks5",
+                Host = "127.0.0.1",
+                Port = checked((int)dynamicPort.BoundPort),
+                Enabled = true
+            };
+
+            return new DefaultDiscoveryGatewaySession(route, dynamicPort, socksProxy, autoConfirmHostKeys, hostKeyVerifier);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            dynamicPort?.Dispose();
+            route?.Dispose();
+            throw;
+        }
+        catch
+        {
+            dynamicPort?.Dispose();
+            route?.Dispose();
+            return null;
+        }
+    }
+
+    private sealed class DefaultDiscoveryGatewaySession : IDiscoveryGatewaySession
+    {
+        private readonly ActiveRoute route;
+        private readonly ForwardedPortDynamic dynamicPort;
+        private readonly BaseProxy socksProxy;
+        private readonly bool autoConfirmHostKeys;
+        private readonly Func<ManagedServer, string, bool>? hostKeyVerifier;
+        private int disposed;
+
+        public DefaultDiscoveryGatewaySession(
+            ActiveRoute route,
+            ForwardedPortDynamic dynamicPort,
+            BaseProxy socksProxy,
+            bool autoConfirmHostKeys,
+            Func<ManagedServer, string, bool>? hostKeyVerifier)
+        {
+            this.route = route;
+            this.dynamicPort = dynamicPort;
+            this.socksProxy = socksProxy;
+            this.autoConfirmHostKeys = autoConfirmHostKeys;
+            this.hostKeyVerifier = hostKeyVerifier;
+        }
+
+        public async Task<bool> ProbeReachabilityAsync(string host, int port, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            return await Socks5TcpProbe.CanConnectAsync(socksProxy, host, port, timeout, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<IReadOnlyDictionary<string, bool>> ProbeBatchReachabilityAsync(
+            IReadOnlyList<string> hosts, int port, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var results = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            if (hosts.Count == 0) return results;
+
+            var maxParallel = Math.Min(8, Math.Max(1, hosts.Count));
+            using var semaphore = new SemaphoreSlim(maxParallel, maxParallel);
+
+            var tasks = hosts.Select(async host =>
+            {
+                await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var ok = await ProbeReachabilityAsync(host, port, timeout, cancellationToken).ConfigureAwait(false);
+                    return (Host: host, Reachable: ok);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+
+            var r = await Task.WhenAll(tasks).ConfigureAwait(false);
+            foreach (var item in r)
+            {
+                results[item.Host] = item.Reachable;
+            }
+            return results;
+        }
+
+        public async Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
+            ManagedServer target, IReadOnlyList<string> candidatePasswords,
+            TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var probe = new DefaultSmartDiscoveryProbe(autoConfirmHostKeys, hostKeyVerifier);
+            return await probe.AuthenticateAndProbeAsync(
+                socksProxy, [], target, candidatePasswords, timeout, cancellationToken).ConfigureAwait(false);
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            try { dynamicPort.Stop(); } catch { }
+            try { route.Client?.RemoveForwardedPort(dynamicPort); } catch { }
+            try { dynamicPort.Dispose(); } catch { }
+            try { route.Dispose(); } catch { }
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
     internal static async Task<PrivilegeEscalationResult> ProbePrivilegeEscalationCoreAsync(
         Func<string, TimeSpan, CancellationToken, Task<(int ExitStatus, string Result)>> runCommand,
-        Func<string, string, TimeSpan, CancellationToken, Task<(bool Success, string Method, string Command, string Password)>> tryPasswordEscalation,
+        Func<string, string, string, TimeSpan, CancellationToken, Task<(bool Success, string Method, string Command, string Password)>> tryPasswordEscalation,
         string username, string loginPassword, IReadOnlyList<string> candidatePasswords,
         TimeSpan timeout, CancellationToken cancellationToken)
     {
@@ -397,26 +551,13 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
             };
         }
 
-        // 2. Check passwordless sudo (run sudo -k first to invalidate any cached ticket)
-        var (sudoExit, sudoRes) = await runCommand("sudo -k 2>/dev/null; sudo -n id 2>/dev/null", timeout, cancellationToken).ConfigureAwait(false);
-        if (sudoExit == 0 && sudoRes.Contains("uid=0"))
-        {
-            return new PrivilegeEscalationResult
-            {
-                Method = "sudo (без пароля)",
-                RootCommand = "sudo -i",
-                RootPassword = "",
-                StatusDescription = "Доступен sudo без ввода пароля",
-                Success = true
-            };
-        }
-
-        // 3. Try OTHER candidate passwords first
         var otherPasswords = candidatePasswords.Where(p => p != loginPassword && p.Length > 0).Distinct().ToList();
+
+        // 2. First priority: su - (su -c 'id') password guessing (other passwords first, login password second)
         foreach (var pw in otherPasswords)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var (success, method, cmd, pass) = await tryPasswordEscalation(pw, "root", timeout, cancellationToken).ConfigureAwait(false);
+            var (success, method, cmd, pass) = await tryPasswordEscalation("su", pw, "root", timeout, cancellationToken).ConfigureAwait(false);
             if (success)
             {
                 return new PrivilegeEscalationResult
@@ -430,11 +571,10 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
             }
         }
 
-        // 4. Try login password last
         if (!string.IsNullOrEmpty(loginPassword))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var (success, method, cmd, pass) = await tryPasswordEscalation(loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
+            var (success, method, cmd, pass) = await tryPasswordEscalation("su", loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
             if (success)
             {
                 return new PrivilegeEscalationResult
@@ -448,6 +588,57 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
             }
         }
 
+        // 3. Second priority (only if all su - fail):
+        // 3a. Check passwordless sudo (run sudo -k first to invalidate any cached ticket)
+        var (sudoExit, sudoRes) = await runCommand("sudo -k 2>/dev/null; sudo -n id 2>/dev/null", timeout, cancellationToken).ConfigureAwait(false);
+        if (sudoExit == 0 && sudoRes.Contains("uid=0"))
+        {
+            return new PrivilegeEscalationResult
+            {
+                Method = "sudo (без пароля)",
+                RootCommand = "sudo -i",
+                RootPassword = "",
+                StatusDescription = "Доступен sudo без ввода пароля",
+                Success = true
+            };
+        }
+
+        // 3b. sudo -i password guessing (other passwords first, login password second)
+        foreach (var pw in otherPasswords)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var (success, method, cmd, pass) = await tryPasswordEscalation("sudo", pw, "root", timeout, cancellationToken).ConfigureAwait(false);
+            if (success)
+            {
+                return new PrivilegeEscalationResult
+                {
+                    Method = method,
+                    RootCommand = cmd,
+                    RootPassword = pass,
+                    StatusDescription = $"Повышение через {method} (пароль root) подтверждено",
+                    Success = true
+                };
+            }
+        }
+
+        if (!string.IsNullOrEmpty(loginPassword))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var (success, method, cmd, pass) = await tryPasswordEscalation("sudo", loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
+            if (success)
+            {
+                return new PrivilegeEscalationResult
+                {
+                    Method = method,
+                    RootCommand = cmd,
+                    RootPassword = pass,
+                    StatusDescription = $"Повышение через {method} (пароль пользователя) подтверждено",
+                    Success = true
+                };
+            }
+        }
+
+        // 4. If neither works -> Не повышено
         return new PrivilegeEscalationResult
         {
             Method = "Не повышено",
@@ -464,53 +655,59 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
     {
         return await ProbePrivilegeEscalationCoreAsync(
             (cmd, to, ct) => RunCommandAsync(client, cmd, to, ct),
-            async (pw, label, to, ct) =>
+            async (method, pw, label, to, ct) =>
             {
-                var res = await TryPasswordEscalationAsync(client, pw, label, to, ct).ConfigureAwait(false);
+                var res = await TryPasswordEscalationAsync(client, method, pw, label, to, ct).ConfigureAwait(false);
                 return (res.Success, res.Method, res.RootCommand, res.RootPassword);
             },
             username, loginPassword, candidatePasswords, timeout, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<PrivilegeEscalationResult> TryPasswordEscalationAsync(
-        SshClient client, string password, string passwordKindLabel, TimeSpan timeout, CancellationToken cancellationToken)
+        SshClient client, string method, string password, string passwordKindLabel, TimeSpan timeout, CancellationToken cancellationToken)
     {
         using var stepCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         stepCts.CancelAfter(timeout);
         var ct = stepCts.Token;
 
-        // Sudo check via input stream
-        try
+        if (method == "sudo")
         {
-            using var sudoCmd = client.CreateCommand("sudo -k -S -p '' id 2>/dev/null");
-            sudoCmd.CommandTimeout = timeout;
-            var sudoTask = sudoCmd.ExecuteAsync(ct);
-            using (var stream = sudoCmd.CreateInputStream())
+            // Sudo check via input stream
+            try
             {
-                var pwBytes = Encoding.UTF8.GetBytes(password + "\n");
-                await stream.WriteAsync(pwBytes, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
-                Array.Clear(pwBytes);
-            }
-            await sudoTask.ConfigureAwait(false);
-            if (sudoCmd.ExitStatus == 0 && (sudoCmd.Result ?? "").Contains("uid=0"))
-            {
-                return new PrivilegeEscalationResult
+                using var sudoCmd = client.CreateCommand("sudo -k -S -p '' id 2>/dev/null");
+                sudoCmd.CommandTimeout = timeout;
+                var sudoTask = sudoCmd.ExecuteAsync(ct);
+                using (var stream = sudoCmd.CreateInputStream())
                 {
-                    Method = "sudo",
-                    RootCommand = "sudo -i",
-                    RootPassword = password,
-                    StatusDescription = $"Повышение через sudo (пароль {passwordKindLabel}) подтверждено",
-                    Success = true
-                };
+                    var pwBytes = Encoding.UTF8.GetBytes(password + "\n");
+                    await stream.WriteAsync(pwBytes, ct).ConfigureAwait(false);
+                    await stream.FlushAsync(ct).ConfigureAwait(false);
+                    Array.Clear(pwBytes);
+                }
+                await sudoTask.ConfigureAwait(false);
+                if (sudoCmd.ExitStatus == 0 && (sudoCmd.Result ?? "").Contains("uid=0"))
+                {
+                    return new PrivilegeEscalationResult
+                    {
+                        Method = "sudo",
+                        RootCommand = "sudo -i",
+                        RootPassword = password,
+                        StatusDescription = $"Повышение через sudo (пароль {passwordKindLabel}) подтверждено",
+                        Success = true
+                    };
+                }
             }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch { }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch { }
 
+            return new PrivilegeEscalationResult { Method = "Не повышено", RootCommand = "", Success = false };
+        }
+
+        // method == "su"
         // Su check via input stream
         try
         {
@@ -654,15 +851,91 @@ public sealed class SmartDiscoveryEngine
                     reservedNames.Add(gw.ProposedName);
             }
         }
+
+        var (rootGroupName, subgroupPath) =
+            SmartDiscoverySessionCreator.ResolveGroupAssignment(config, options.TargetGroupId, options.TargetSubgroupName);
+
+        // Fast Duplicate Detection by (Host, Username)
+        var hostUsernames = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var allConfigServers = config.AllServers().ToList();
+
+        foreach (var host in targetHosts)
+        {
+            var remainingUsernames = new List<string>();
+            foreach (var u in usernames)
+            {
+                var existingServer = allConfigServers.FirstOrDefault(s =>
+                    (s.Port <= 0 || s.Port == 22) &&
+                    string.Equals((s.Host ?? "").Trim(), host, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(s.Username) &&
+                    string.Equals(s.Username, u, StringComparison.Ordinal));
+
+                if (existingServer != null)
+                {
+                    if (discovered.Any(d => d.Id == existingServer.Id))
+                        continue;
+
+                    var existingRoute = RoutePlanner.Candidates(config, existingServer.Id).FirstOrDefault()
+                        ?? (existingServer.PreferredRoute is not null ? RoutePlanner.CandidateFromCached(config, existingServer.PreferredRoute) : null);
+                    var routeHops = existingRoute != null && existingRoute.Servers.Count > 0
+                        ? existingRoute.Servers.Select(s => new RouteHop(s.Id, s.Name, s.Host, s.Port > 0 ? s.Port : 22)).ToList()
+                        : new List<RouteHop> { new RouteHop(existingServer.Id, existingServer.Name, host, existingServer.Port > 0 ? existingServer.Port : 22) };
+                    var verifiedProxyId = existingRoute != null && !existingRoute.WithoutProxy && existingRoute.Proxy.Id != Guid.Empty
+                        ? existingRoute.Proxy.Id
+                        : (Guid?)null;
+
+                    var dupCandidate = new DiscoveredServerCandidate
+                    {
+                        Id = existingServer.Id,
+                        Host = host,
+                        Port = existingServer.Port > 0 ? existingServer.Port : 22,
+                        Hostname = !string.IsNullOrWhiteSpace(existingServer.Host) ? existingServer.Host : host,
+                        ProposedName = existingServer.Name,
+                        GroupId = options.TargetGroupId,
+                        GroupName = rootGroupName,
+                        SubgroupName = subgroupPath,
+                        Username = existingServer.Username,
+                        Password = existingServer.Password,
+                        PrivilegeEscalation = new PrivilegeEscalationResult(),
+                        RouteHops = routeHops,
+                        DiscoveredLinksFrom = [],
+                        RequiredPreviousServerId = existingServer.RequiredPreviousServerId,
+                        ExistingServerId = existingServer.Id,
+                        VerifiedProxyId = existingServer.PreferredProxyId ?? verifiedProxyId,
+                        HostKeyFingerprint = existingServer.HostKeyFingerprint,
+                        HostKeyAlgorithm = existingServer.HostKeyAlgorithm,
+                        HostKeyBits = existingServer.HostKeyBits,
+                        StatusMessage = "Дубль: сессия уже сохранена в программе",
+                        IsDuplicate = true,
+                        IsSelected = false
+                    };
+
+                    discovered.Add(dupCandidate);
+                    reservedNames.Add(existingServer.Name);
+                    Log($"Хост {host}: найден дубль существующей сессии \"{existingServer.Name}\" (пользователь {u}).");
+                }
+                else
+                {
+                    remainingUsernames.Add(u);
+                }
+            }
+
+            if (remainingUsernames.Count > 0)
+            {
+                hostUsernames[host] = remainingUsernames;
+            }
+        }
+
+        var activeHosts = targetHosts.Where(hostUsernames.ContainsKey).ToList();
         var hostAttempts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var lastHostProblems = new Dictionary<string, ProblematicServerCandidate>(StringComparer.OrdinalIgnoreCase);
         var syncLock = new object();
 
         ReportProgress(SmartDiscoveryProgressKind.Starting, "", $"Запуск сканирования {totalCount} хостов...", discovered.Count, problematic.Count, totalCount, 0);
 
-        if (totalCount == 0)
+        if (totalCount == 0 || activeHosts.Count == 0)
         {
-            ReportProgress(SmartDiscoveryProgressKind.Completed, "", "Список целевых хостов пуст.", 0, 0, 0, 100);
+            ReportProgress(SmartDiscoveryProgressKind.Completed, "", $"Сканирование завершено: найдено {discovered.Count}, проблемных {problematic.Count}.", discovered.Count, problematic.Count, totalCount, 100);
             return new SmartDiscoveryResult(discovered, problematic);
         }
 
@@ -670,16 +943,11 @@ public sealed class SmartDiscoveryEngine
         var semaphore = new SemaphoreSlim(maxParallel, maxParallel);
         var entryPoints = ResolveEntryPoints();
 
-        LogScanStart(totalCount, entryPoints);
+        LogScanStart(activeHosts.Count, entryPoints);
 
-        try
+        async Task ProbeDirectReachabilityAsync(List<string> hostsToProbe, Dictionary<string, BaseProxy?> reachableVia)
         {
-            // Phase 1: Probe reachability directly or via an entry point
-            ReportProgress(SmartDiscoveryProgressKind.ReachabilityProbing, "", "Фаза 1: Проверка сетевой доступности портов 22...", discovered.Count, problematic.Count, totalCount, 5);
-            Log("Фаза 1: проверка сетевой доступности порта 22.");
-
-            var reachableVia = new Dictionary<string, BaseProxy?>(StringComparer.OrdinalIgnoreCase);
-            var reachabilityTasks = targetHosts.Select(async host =>
+            var reachabilityTasks = hostsToProbe.Select(async host =>
             {
                 await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
@@ -710,22 +978,23 @@ public sealed class SmartDiscoveryEngine
             }).ToList();
 
             await Task.WhenAll(reachabilityTasks).ConfigureAwait(false);
+        }
 
-            var directlyReachable = targetHosts.Where(reachableVia.ContainsKey).ToList();
-            var unreachableHosts = targetHosts.Where(h => !reachableVia.ContainsKey(h)).ToList();
-
-            // Phase 2: Credential verification on directly reachable hosts
-            ReportProgress(SmartDiscoveryProgressKind.AuthenticationProbing, "", $"Фаза 2: Проверка учётных данных ({directlyReachable.Count} доступных узлов)...", discovered.Count, problematic.Count, totalCount, 25);
-            Log($"Фаза 2: проверка учётных данных для {directlyReachable.Count} доступных хостов.");
-
+        async Task AuthenticateDirectHostsAsync(
+            List<string> directlyReachable,
+            Dictionary<string, BaseProxy?> reachableVia,
+            List<string> unreachableHosts)
+        {
             var authTasks = directlyReachable.Select(async host =>
             {
                 await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
                 try
                 {
                     reachableVia.TryGetValue(host, out var winningEntryPoint);
+                    hostUsernames.TryGetValue(host, out var uList);
                     var (candidate, problem) = await AuthenticateHostAsync(
-                        host, winningEntryPoint, intermediateGateways: [], hopHops: [], cancellationToken).ConfigureAwait(false);
+                        host, winningEntryPoint, intermediateGateways: [], hopHops: [], cancellationToken,
+                        overrideUsernames: uList).ConfigureAwait(false);
 
                     lock (syncLock)
                     {
@@ -762,69 +1031,83 @@ public sealed class SmartDiscoveryEngine
             }).ToList();
 
             await Task.WhenAll(authTasks).ConfigureAwait(false);
+        }
 
-            // Phase 3: Multi-hop discovery for remaining unreachable hosts
-            var savedGatewaySeeds = new List<DiscoveredServerCandidate>();
-            var savedRouteByGatewayId = new Dictionary<Guid, SavedGatewayRoute>();
-            if (unreachableHosts.Count > 0)
-                (savedGatewaySeeds, savedRouteByGatewayId) = ResolveSavedGateways();
-            var allKnownGateways = savedGatewaySeeds
-                .Concat(discovered)
-                .Concat(initialGateways ?? [])
-                .DistinctBy(gateway => gateway.Id)
-                .ToList();
-            if (unreachableHosts.Count > 0 && allKnownGateways.Count > 0)
+        async Task ProbeGatewayWaveAsync(
+            List<string> hostsToProbe,
+            List<DiscoveredServerCandidate> gatewaysToUse,
+            Dictionary<Guid, SavedGatewayRoute> routeMap,
+            int maxHops = 3)
+        {
+            var availableGateways = gatewaysToUse.Where(g => !g.IsDuplicate || routeMap.ContainsKey(g.Id)).ToList();
+            while (hostsToProbe.Count > 0 && availableGateways.Count > 0)
             {
-                ReportProgress(SmartDiscoveryProgressKind.MultiHopProbing, "", $"Фаза 3: Поиск multi-hop маршрутов ({unreachableHosts.Count} недоступных хостов)...", discovered.Count, problematic.Count, totalCount, 60);
-                Log($"Фаза 3: поиск multi-hop маршрутов для {unreachableHosts.Count} недоступных хостов.");
+                var nextWaveGateways = new List<DiscoveredServerCandidate>();
 
-                var availableGateways = allKnownGateways.ToList();
-                const int maxHops = 3;
-
-                while (unreachableHosts.Count > 0 && availableGateways.Count > 0)
+                foreach (var gateway in availableGateways)
                 {
-                    var nextWaveGateways = new List<DiscoveredServerCandidate>();
+                    var gatewayChain = BuildGatewayChain(
+                        gateway, discovered.Concat(initialGateways ?? []).ToList(), routeMap);
+                    if (gatewayChain is null) continue;
+                    var savedPrefixLength = gatewayChain.SavedRoute?.Servers.Count ?? 0;
+                    if (gateway.RouteHops.Count - savedPrefixLength >= maxHops) continue;
 
-                    foreach (var gateway in availableGateways)
+                    var gatewayEntryPoints = gatewayChain.SavedRoute is { } savedRoute
+                        ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
+                        : entryPoints;
+
+                    var nonRetryableOnThisGateway = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var entryPoint in gatewayEntryPoints)
                     {
-                        var gatewayChain = BuildGatewayChain(
-                            gateway, discovered.Concat(initialGateways ?? []).ToList(), savedRouteByGatewayId);
-                        var savedPrefixLength = gatewayChain.SavedRoute?.Servers.Count ?? 0;
-                        if (gateway.RouteHops.Count - savedPrefixLength >= maxHops) continue;
+                        if (hostsToProbe.Count == 0) break;
+                        cancellationToken.ThrowIfCancellationRequested();
 
-                        var gatewayEntryPoints = gatewayChain.SavedRoute is { } savedRoute
-                            ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
-                            : entryPoints;
+                        if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
+                            continue;
 
-                        var nonRetryableOnThisGateway = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                        foreach (var entryPoint in gatewayEntryPoints)
+                        var candidateHosts = new List<string>();
+                        lock (syncLock)
                         {
-                            if (unreachableHosts.Count == 0) break;
-                            cancellationToken.ThrowIfCancellationRequested();
-
-                            if (entryPoint != null && !await EnsureEntryPointReadyAsync(entryPoint, cancellationToken).ConfigureAwait(false))
-                                continue;
-
-                            var candidateHosts = new List<string>();
-                            lock (syncLock)
+                            foreach (var targetHost in hostsToProbe)
                             {
-                                foreach (var targetHost in unreachableHosts)
-                                {
-                                    if (nonRetryableOnThisGateway.Contains(targetHost))
-                                        continue;
-                                    if (hostAttempts.TryGetValue(targetHost, out var att) && att >= options.MaxAttemptsPerHost)
-                                        continue;
-                                    if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
-                                        continue;
-                                    candidateHosts.Add(targetHost);
-                                }
+                                if (nonRetryableOnThisGateway.Contains(targetHost))
+                                    continue;
+                                if (hostAttempts.TryGetValue(targetHost, out var att) && att >= options.MaxAttemptsPerHost)
+                                    continue;
+                                if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
+                                    continue;
+                                candidateHosts.Add(targetHost);
                             }
+                        }
 
-                            if (candidateHosts.Count == 0) continue;
+                        if (candidateHosts.Count == 0) continue;
 
-                            var batchResults = await probe.ProbeHopBatchReachabilityAsync(
-                                entryPoint, gatewayChain.Servers, candidateHosts, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                        IDiscoveryGatewaySession? gatewaySession = null;
+                        try
+                        {
+                            gatewaySession = await probe.OpenGatewaySessionAsync(
+                                entryPoint, gatewayChain.Servers, options.Timeout, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch { }
+
+                        try
+                        {
+                            IReadOnlyDictionary<string, bool> batchResults;
+                            if (gatewaySession != null)
+                            {
+                                batchResults = await gatewaySession.ProbeBatchReachabilityAsync(
+                                    candidateHosts, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                batchResults = await probe.ProbeHopBatchReachabilityAsync(
+                                    entryPoint, gatewayChain.Servers, candidateHosts, 22, options.EndpointProbeTimeout, cancellationToken).ConfigureAwait(false);
+                            }
 
                             foreach (var targetHost in candidateHosts)
                             {
@@ -832,35 +1115,48 @@ public sealed class SmartDiscoveryEngine
 
                                 lock (syncLock)
                                 {
-                                    if (!unreachableHosts.Contains(targetHost, StringComparer.OrdinalIgnoreCase))
+                                    if (!hostsToProbe.Contains(targetHost, StringComparer.OrdinalIgnoreCase))
                                         continue;
                                     if (hostAttempts.TryGetValue(targetHost, out var used) && used >= options.MaxAttemptsPerHost)
                                         continue;
                                 }
 
                                 var canHop = batchResults.TryGetValue(targetHost, out var ok) && ok;
-                                Log($"Фаза 3: хост {targetHost} через шлюз {gateway.ProposedName} и {DescribeEntryPoint(entryPoint)} — {(canHop ? "доступен" : "недоступен")}.");
+                                Log($"Хост {targetHost} через шлюз {gateway.ProposedName} и {DescribeEntryPoint(entryPoint)} — {(canHop ? "доступен" : "недоступен")}.");
 
                                 if (!canHop) continue;
 
+                                hostUsernames.TryGetValue(targetHost, out var uList);
                                 var (candidate, hopProblem) = await AuthenticateHostAsync(
                                     targetHost, entryPoint, gatewayChain.Servers, gateway.RouteHops, cancellationToken,
                                     previousServerId: gateway.Id,
-                                    lockEntryPoint: gatewayChain.SavedRoute is not null).ConfigureAwait(false);
+                                    lockEntryPoint: gatewayChain.SavedRoute is not null,
+                                    gatewaySession: gatewaySession,
+                                    overrideUsernames: uList).ConfigureAwait(false);
 
                                 if (candidate != null)
                                 {
-                                    candidate.RequiredPreviousServerId = gateway.Id;
-                                    candidate.DiscoveredLinksFrom = [gateway.Id];
                                     if (!candidate.IsDuplicate)
+                                    {
+                                        candidate.RequiredPreviousServerId = gateway.Id;
+                                        candidate.DiscoveredLinksFrom = [gateway.Id];
                                         candidate.StatusMessage = $"Обнаружен через шлюз {gateway.ProposedName}";
+                                    }
+                                    else
+                                    {
+                                        if (!candidate.DiscoveredLinksFrom.Contains(gateway.Id))
+                                            candidate.DiscoveredLinksFrom.Add(gateway.Id);
+                                    }
 
                                     lock (syncLock)
                                     {
                                         discovered.Add(candidate);
                                         reservedNames.Add(candidate.ProposedName);
-                                        nextWaveGateways.Add(candidate);
-                                        unreachableHosts.RemoveAll(h => string.Equals(h, targetHost, StringComparison.OrdinalIgnoreCase));
+                                        if (!candidate.IsDuplicate || routeMap.ContainsKey(candidate.Id))
+                                        {
+                                            nextWaveGateways.Add(candidate);
+                                        }
+                                        hostsToProbe.RemoveAll(h => string.Equals(h, targetHost, StringComparison.OrdinalIgnoreCase));
                                         lastHostProblems.Remove(targetHost);
 
                                         confirmedCredentials.RemoveAll(c => c.User == candidate.Username && c.Pass == candidate.Password);
@@ -884,35 +1180,154 @@ public sealed class SmartDiscoveryEngine
                                 }
                             }
                         }
+                        finally
+                        {
+                            if (gatewaySession != null)
+                            {
+                                try
+                                {
+                                    await gatewaySession.DisposeAsync().ConfigureAwait(false);
+                                }
+                                catch { }
+                            }
+                        }
                     }
+                }
 
-                    availableGateways = nextWaveGateways;
+                availableGateways = nextWaveGateways.Where(g => !g.IsDuplicate || routeMap.ContainsKey(g.Id)).ToList();
+            }
+        }
+
+        try
+        {
+            var (savedGatewaySeeds, savedRouteByGatewayId) = ResolveSavedGateways();
+            var allKnownGateways = savedGatewaySeeds
+                .Concat((initialGateways ?? []).Where(g => !g.IsDuplicate || savedRouteByGatewayId.ContainsKey(g.Id)))
+                .DistinctBy(gateway => gateway.Id)
+                .ToList();
+
+            var preferGateways = options.PreferGroupGateways && options.TargetGroupId.HasValue && allKnownGateways.Count > 0;
+
+            if (preferGateways)
+            {
+                ReportProgress(SmartDiscoveryProgressKind.MultiHopProbing, "", $"Фаза 1: Проверка через шлюзы группы ({activeHosts.Count} хостов)...", discovered.Count, problematic.Count, totalCount, 15);
+                Log($"Фаза 1: проверка через шлюзы группы ({allKnownGateways.Count} шлюзов).");
+
+                var unreachableHosts = activeHosts.ToList();
+                await ProbeGatewayWaveAsync(unreachableHosts, allKnownGateways, savedRouteByGatewayId).ConfigureAwait(false);
+
+                if (unreachableHosts.Count > 0)
+                {
+                    ReportProgress(SmartDiscoveryProgressKind.ReachabilityProbing, "", $"Фаза 2: Проверка прямой сетевой доступности ({unreachableHosts.Count} оставшихся хостов)...", discovered.Count, problematic.Count, totalCount, 50);
+                    Log($"Фаза 2: проверка прямой доступности для {unreachableHosts.Count} хостов.");
+
+                    var reachableVia = new Dictionary<string, BaseProxy?>(StringComparer.OrdinalIgnoreCase);
+                    await ProbeDirectReachabilityAsync(unreachableHosts, reachableVia).ConfigureAwait(false);
+
+                    var directlyReachable = unreachableHosts.Where(reachableVia.ContainsKey).ToList();
+                    unreachableHosts.RemoveAll(reachableVia.ContainsKey);
+
+                    if (directlyReachable.Count > 0)
+                    {
+                        var beforeDirectCount = discovered.Count;
+                        ReportProgress(SmartDiscoveryProgressKind.AuthenticationProbing, "", $"Фаза 3: Проверка учётных данных ({directlyReachable.Count} доступных узлов)...", discovered.Count, problematic.Count, totalCount, 75);
+                        await AuthenticateDirectHostsAsync(directlyReachable, reachableVia, unreachableHosts).ConfigureAwait(false);
+
+                        var newlyDiscovered = discovered.Skip(beforeDirectCount).ToList();
+                        if (newlyDiscovered.Count > 0 && unreachableHosts.Count > 0)
+                        {
+                            ReportProgress(SmartDiscoveryProgressKind.MultiHopProbing, "", $"Фаза 4: Поиск через вновь обнаруженные шлюзы ({unreachableHosts.Count} недоступных хостов)...", discovered.Count, problematic.Count, totalCount, 85);
+                            Log($"Фаза 4: поиск через {newlyDiscovered.Count} вновь обнаруженных шлюзов для {unreachableHosts.Count} хостов.");
+                            await ProbeGatewayWaveAsync(unreachableHosts, newlyDiscovered, savedRouteByGatewayId).ConfigureAwait(false);
+                        }
+                    }
+                }
+
+                foreach (var remaining in unreachableHosts)
+                {
+                    ProblematicServerCandidate prob;
+                    lock (syncLock)
+                    {
+                        if (lastHostProblems.TryGetValue(remaining, out var specificProb))
+                        {
+                            prob = specificProb;
+                        }
+                        else
+                        {
+                            prob = new ProblematicServerCandidate
+                            {
+                                Host = remaining,
+                                Stage = "Доступность",
+                                Reason = "Узел недоступен по TCP (порт 22) напрямую и через обнаруженные шлюзы",
+                                CanRetry = true,
+                                IsSelected = true
+                            };
+                        }
+                    }
+                    problematic.Add(prob);
                 }
             }
-
-            // Any remaining unreachable hosts are added to problematic (preserving specific auth or hostkey problems)
-            foreach (var remaining in unreachableHosts)
+            else
             {
-                ProblematicServerCandidate prob;
-                lock (syncLock)
+                // Phase 1: Probe reachability directly or via an entry point
+                ReportProgress(SmartDiscoveryProgressKind.ReachabilityProbing, "", "Фаза 1: Проверка сетевой доступности портов 22...", discovered.Count, problematic.Count, totalCount, 5);
+                Log("Фаза 1: проверка сетевой доступности порта 22.");
+
+                var reachableVia = new Dictionary<string, BaseProxy?>(StringComparer.OrdinalIgnoreCase);
+                await ProbeDirectReachabilityAsync(activeHosts, reachableVia).ConfigureAwait(false);
+
+                var directlyReachable = activeHosts.Where(reachableVia.ContainsKey).ToList();
+                var unreachableHosts = activeHosts.Where(h => !reachableVia.ContainsKey(h)).ToList();
+
+                // Phase 2: Credential verification on directly reachable hosts
+                ReportProgress(SmartDiscoveryProgressKind.AuthenticationProbing, "", $"Фаза 2: Проверка учётных данных ({directlyReachable.Count} доступных узлов)...", discovered.Count, problematic.Count, totalCount, 25);
+                Log($"Фаза 2: проверка учётных данных для {directlyReachable.Count} доступных хостов.");
+
+                await AuthenticateDirectHostsAsync(directlyReachable, reachableVia, unreachableHosts).ConfigureAwait(false);
+
+                // Phase 3: Multi-hop discovery for remaining unreachable hosts
+                if (unreachableHosts.Count > 0)
                 {
-                    if (lastHostProblems.TryGetValue(remaining, out var specificProb))
+                    var (postGatewaySeeds, postRouteByGatewayId) = ResolveSavedGateways();
+                    var postAllGateways = postGatewaySeeds
+                        .Concat(discovered.Where(g => !g.IsDuplicate || postRouteByGatewayId.ContainsKey(g.Id)))
+                        .Concat((initialGateways ?? []).Where(g => !g.IsDuplicate || postRouteByGatewayId.ContainsKey(g.Id)))
+                        .DistinctBy(gateway => gateway.Id)
+                        .ToList();
+
+                    if (postAllGateways.Count > 0)
                     {
-                        prob = specificProb;
-                    }
-                    else
-                    {
-                        prob = new ProblematicServerCandidate
-                        {
-                            Host = remaining,
-                            Stage = "Доступность",
-                            Reason = "Узел недоступен по TCP (порт 22) напрямую и через обнаруженные шлюзы",
-                            CanRetry = true,
-                            IsSelected = true
-                        };
+                        ReportProgress(SmartDiscoveryProgressKind.MultiHopProbing, "", $"Фаза 3: Поиск multi-hop маршрутов ({unreachableHosts.Count} недоступных хостов)...", discovered.Count, problematic.Count, totalCount, 60);
+                        Log($"Фаза 3: поиск multi-hop маршрутов для {unreachableHosts.Count} недоступных хостов.");
+
+                        await ProbeGatewayWaveAsync(unreachableHosts, postAllGateways, postRouteByGatewayId).ConfigureAwait(false);
                     }
                 }
-                problematic.Add(prob);
+
+                // Any remaining unreachable hosts are added to problematic (preserving specific auth or hostkey problems)
+                foreach (var remaining in unreachableHosts)
+                {
+                    ProblematicServerCandidate prob;
+                    lock (syncLock)
+                    {
+                        if (lastHostProblems.TryGetValue(remaining, out var specificProb))
+                        {
+                            prob = specificProb;
+                        }
+                        else
+                        {
+                            prob = new ProblematicServerCandidate
+                            {
+                                Host = remaining,
+                                Stage = "Доступность",
+                                Reason = "Узел недоступен по TCP (порт 22) напрямую и через обнаруженные шлюзы",
+                                CanRetry = true,
+                                IsSelected = true
+                            };
+                        }
+                    }
+                    problematic.Add(prob);
+                }
             }
 
             ReportProgress(SmartDiscoveryProgressKind.Completed, "", $"Сканирование завершено: найдено {discovered.Count}, проблемных {problematic.Count}.", discovered.Count, problematic.Count, totalCount, 100);
@@ -948,14 +1363,17 @@ public sealed class SmartDiscoveryEngine
             IReadOnlyList<RouteHop> hopHops,
             CancellationToken ct,
             Guid? previousServerId = null,
-            bool lockEntryPoint = false)
+            bool lockEntryPoint = false,
+            IDiscoveryGatewaySession? gatewaySession = null,
+            IReadOnlyList<string>? overrideUsernames = null)
         {
             List<(string User, string Pass)> confirmedSnapshot;
             lock (syncLock)
             {
                 confirmedSnapshot = confirmedCredentials.ToList();
             }
-            var orderedCredentials = GetPrioritizedCredentials(usernames, passwords, confirmedSnapshot);
+            var targetUsers = (overrideUsernames != null && overrideUsernames.Count > 0) ? overrideUsernames : usernames;
+            var orderedCredentials = GetPrioritizedCredentials(targetUsers, passwords, confirmedSnapshot);
             var maxAttempts = Math.Max(1, options.MaxAttemptsPerHost);
             string lastReason = "Не удалось подобрать учётные данные";
             string currentStage = "Аутентификация";
@@ -993,8 +1411,11 @@ public sealed class SmartDiscoveryEngine
                         UseKeyboardInteractive = true
                     };
 
-                    var result = await probe.AuthenticateAndProbeAsync(
-                        attemptEntryPoint, intermediateGateways, targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false);
+                    var result = gatewaySession != null
+                        ? await gatewaySession.AuthenticateAndProbeAsync(
+                            targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false)
+                        : await probe.AuthenticateAndProbeAsync(
+                            attemptEntryPoint, intermediateGateways, targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false);
 
                     if (result.Success)
                     {
@@ -1020,7 +1441,9 @@ public sealed class SmartDiscoveryEngine
                         };
 
                         var existingServer = config.AllServers().FirstOrDefault(s =>
-                            s.Port == 22 && string.Equals((s.Host ?? "").Trim(), host, StringComparison.OrdinalIgnoreCase));
+                            (s.Port <= 0 || s.Port == 22) &&
+                            string.Equals((s.Host ?? "").Trim(), host, StringComparison.OrdinalIgnoreCase) &&
+                            string.Equals(s.Username, u, StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(s.Username));
                         var isDuplicate = existingServer is not null;
 
                         var (rootGroupName, subgroupPath) =
@@ -1039,7 +1462,7 @@ public sealed class SmartDiscoveryEngine
 
                         var candidate = new DiscoveredServerCandidate
                         {
-                            Id = candidateId,
+                            Id = isDuplicate ? existingServer!.Id : candidateId,
                             Host = host,
                             Port = 22,
                             Hostname = result.Hostname,
@@ -1146,7 +1569,9 @@ public sealed class SmartDiscoveryEngine
             MaxParallelConnections = updatedOptions.MaxParallelConnections,
             MaxAttemptsPerHost = updatedOptions.MaxAttemptsPerHost,
             Timeout = updatedOptions.Timeout,
-            EndpointProbeTimeout = updatedOptions.EndpointProbeTimeout
+            EndpointProbeTimeout = updatedOptions.EndpointProbeTimeout,
+            PreferGroupGateways = updatedOptions.PreferGroupGateways,
+            InitialGatewayServerId = updatedOptions.InitialGatewayServerId
         };
 
         var retryEngine = new SmartDiscoveryEngine(
@@ -1289,10 +1714,11 @@ public sealed class SmartDiscoveryEngine
     {
         var result = new List<(string User, string Pass)>();
         var seen = new HashSet<(string, string)>();
+        var allowedUsers = new HashSet<string>(usernames, StringComparer.Ordinal);
 
         foreach (var c in confirmed)
         {
-            if (seen.Add(c))
+            if (allowedUsers.Contains(c.User) && seen.Add(c))
                 result.Add(c);
         }
 
@@ -1387,22 +1813,22 @@ public sealed class SmartDiscoveryEngine
             {
                 var cachedCandidate = RoutePlanner.CandidateFromCached(config, server.PreferredRoute);
                 if (cachedCandidate is not null &&
-                    cachedCandidate.Servers.Take(cachedCandidate.Servers.Count - 1).All(prefix => !scope.Contains(prefix.Id)))
+                    (distance == -1 || cachedCandidate.Servers.Take(cachedCandidate.Servers.Count - 1).All(prefix => !scope.Contains(prefix.Id))))
                 {
                     route = cachedCandidate;
                 }
             }
 
-            if (route is null)
+            if (route is null && (server.PreferredRoute is null || distance == -1))
             {
                 var candidates = RoutePlanner.Candidates(config, id);
                 var ordered = RoutePlanner.OrderPreferred(
                         config, candidates, server.PreferredRoute)
-                    .Where(candidate => candidate.Servers
+                    .Where(candidate => distance == -1 || candidate.Servers
                         .Take(candidate.Servers.Count - 1)
                         .All(prefixServer => !scope.Contains(prefixServer.Id)))
                     .ToArray();
-                if (ordered.Length == 0)
+                if (ordered.Length == 0 && distance == -1)
                 {
                     ordered = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute).ToArray();
                 }
@@ -1443,6 +1869,20 @@ public sealed class SmartDiscoveryEngine
                 seedDistance[server.Id] = distance;
         }
 
+        if (options.InitialGatewayServerId.HasValue)
+        {
+            var initId = options.InitialGatewayServerId.Value;
+            var initServer = config.FindServer(initId);
+            if (initServer is not null)
+            {
+                var initScope = options.TargetGroupId.HasValue
+                    ? (config.FindGroup(options.TargetGroupId.Value) is { } g ? ServersInGroup(g).Select(s => s.Id).ToHashSet() : new HashSet<Guid>())
+                    : config.UngroupedServers.Select(s => s.Id).ToHashSet();
+                initScope.Add(initId);
+                TryAddGatewaySeed(initId, initScope, -1);
+            }
+        }
+
         if (options.TargetGroupId.HasValue)
         {
             var ancestry = config.GroupAncestry(options.TargetGroupId.Value);
@@ -1470,6 +1910,28 @@ public sealed class SmartDiscoveryEngine
             }
         }
 
+        foreach (var server in config.AllServers())
+        {
+            if (routes.ContainsKey(server.Id)) continue;
+            var route = server.PreferredRoute is not null
+                ? RoutePlanner.CandidateFromCached(config, server.PreferredRoute)
+                : null;
+            if (route is null && server.PreferredRoute is null)
+            {
+                var candidates = RoutePlanner.Candidates(config, server.Id);
+                route = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute).FirstOrDefault();
+            }
+            if (route is not null)
+            {
+                if (server.RequiredPreviousServerId.HasValue &&
+                    !route.Servers.Any(s => s.Id == server.RequiredPreviousServerId.Value))
+                {
+                    continue;
+                }
+                routes[server.Id] = new SavedGatewayRoute(route, route.Servers.ToArray());
+            }
+        }
+
         return (
             seeds
                 .OrderBy(seed => seedDistance.TryGetValue(seed.Id, out var d) ? d : int.MaxValue)
@@ -1486,7 +1948,7 @@ public sealed class SmartDiscoveryEngine
     private sealed record GatewayChain(
         IReadOnlyList<ManagedServer> Servers, RouteCandidate? SavedRoute);
 
-    private static GatewayChain BuildGatewayChain(
+    private static GatewayChain? BuildGatewayChain(
         DiscoveredServerCandidate gateway,
         IReadOnlyList<DiscoveredServerCandidate> allDiscovered,
         IReadOnlyDictionary<Guid, SavedGatewayRoute> savedRouteByGatewayId)
@@ -1505,6 +1967,11 @@ public sealed class SmartDiscoveryEngine
                 break;
             }
 
+            if (current.IsDuplicate)
+            {
+                return null;
+            }
+
             chain.Insert(0, CandidateToServer(current));
             if (current.RequiredPreviousServerId.HasValue)
             {
@@ -1516,6 +1983,10 @@ public sealed class SmartDiscoveryEngine
                     break;
                 }
                 current = allDiscovered.FirstOrDefault(d => d.Id == previousId);
+                if (current is null)
+                {
+                    return null;
+                }
             }
             else
             {
@@ -1547,5 +2018,56 @@ public sealed class SmartDiscoveryEngine
             TotalCount = total,
             ProgressPercentage = percentage
         });
+    }
+
+    public static Guid? ResolveAutoSelectGatewayId(ManagerConfig config, Guid groupId)
+    {
+        var ancestry = config.GroupAncestry(groupId);
+        if (ancestry.Count == 0) return null;
+
+        // Pass 1: Walk ancestry from target group up to root searching for an independent server
+        for (var i = ancestry.Count - 1; i >= 0; i--)
+        {
+            var group = ancestry[i];
+            var levelServers = group.Servers;
+            if (levelServers.Count == 0) continue;
+
+            var levelScope = levelServers.Select(s => s.Id).ToHashSet();
+            var directlyReachable = ConnectivityBatchPlanner.DirectlyReachable(config, levelScope);
+            var firstIndependent = directlyReachable.FirstOrDefault();
+            if (firstIndependent != Guid.Empty)
+                return firstIndependent;
+
+            foreach (var server in levelServers)
+            {
+                if (server.PreferredRoute is not null)
+                {
+                    var cached = RoutePlanner.CandidateFromCached(config, server.PreferredRoute);
+                    if (cached is not null && cached.Servers.Take(cached.Servers.Count - 1).All(p => !levelScope.Contains(p.Id)))
+                        return server.Id;
+                }
+            }
+
+            var candidateWithIndependentRoute = levelServers.FirstOrDefault(s =>
+                RoutePlanner.Candidates(config, s.Id).Any(c => c.Servers.Take(c.Servers.Count - 1).All(p => !levelScope.Contains(p.Id))));
+            if (candidateWithIndependentRoute != null)
+                return candidateWithIndependentRoute.Id;
+        }
+
+        // Pass 2: If no independent server found across all levels, fallback across ancestry to any server with a route
+        for (var i = ancestry.Count - 1; i >= 0; i--)
+        {
+            var group = ancestry[i];
+            var anyWithRoute = group.Servers.FirstOrDefault(s => RoutePlanner.Candidates(config, s.Id).Count > 0);
+            if (anyWithRoute != null)
+                return anyWithRoute.Id;
+        }
+
+        // Pass 3: Fallback to the first server in the target group
+        var targetGroup = ancestry[^1];
+        if (targetGroup.Servers.Count > 0)
+            return targetGroup.Servers[0].Id;
+
+        return null;
     }
 }

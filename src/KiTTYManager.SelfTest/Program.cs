@@ -481,6 +481,7 @@ internal sealed partial class SelfTestRunner
         Test("Умное массовое добавление: связь с управляемой точкой входа", ManagedEntryPointLinkTests);
         Test("Умное массовое добавление: журнал не раскрывает пароли", DiscoveryLoggingRedactionTests);
         Test("Умное массовое добавление: предпросмотр конфига до создания сессий", SmartDiscoveryPreviewConfigTests);
+        Test("Умное массовое добавление: расширения Issue #26", SmartDiscoveryIssue26EnhancementsTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {

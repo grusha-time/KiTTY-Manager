@@ -40,10 +40,24 @@ public static class SmartDiscoverySessionCreator
             saved.HostKeyFingerprint = dependency.HostKeyFingerprint;
             saved.HostKeyAlgorithm = dependency.HostKeyAlgorithm;
             saved.HostKeyBits = dependency.HostKeyBits;
-            saved.PreferredProxyId = dependency.VerifiedProxyId;
-            saved.RequiredPreviousServerId = dependency.RequiredPreviousServerId.HasValue
-                ? ResolveDependencyId(dependency.RequiredPreviousServerId.Value)
-                : null;
+            if (dependency.VerifiedProxyId.HasValue)
+            {
+                saved.PreferredProxyId = dependency.VerifiedProxyId;
+            }
+            else if (!dependency.IsDuplicate)
+            {
+                saved.PreferredProxyId = null;
+            }
+
+            if (dependency.RequiredPreviousServerId.HasValue)
+            {
+                saved.RequiredPreviousServerId = ResolveDependencyId(dependency.RequiredPreviousServerId.Value);
+            }
+            else if (!dependency.IsDuplicate)
+            {
+                saved.RequiredPreviousServerId = null;
+            }
+
             saved.TryDirectWithoutJumphost = saved.PreferredProxyId is null && saved.RequiredPreviousServerId is null;
             if (dependency.PrivilegeEscalation.Success)
             {
@@ -407,8 +421,21 @@ public static class SmartDiscoverySessionCreator
         var knownIds = snapshot.AllServers().Select(s => s.Id).ToHashSet();
         foreach (var c in candidates)
         {
-            if (knownIds.Add(c.Id))
+            var targetId = c.ExistingServerId ?? c.Id;
+            if (snapshot.FindServer(targetId) is { } existing)
+            {
+                if (!c.IsDuplicate)
+                {
+                    existing.RequiredPreviousServerId = c.RequiredPreviousServerId;
+                    existing.PreferredProxyId = c.VerifiedProxyId;
+                    existing.TryDirectWithoutJumphost = c.VerifiedProxyId is null && c.RequiredPreviousServerId is null;
+                }
+                if (!string.IsNullOrWhiteSpace(c.Password)) existing.Password = c.Password;
+            }
+            else if (knownIds.Add(c.Id))
+            {
                 snapshot.UngroupedServers.Add(CreateDraftServer(c));
+            }
         }
 
         foreach (var c in candidates)

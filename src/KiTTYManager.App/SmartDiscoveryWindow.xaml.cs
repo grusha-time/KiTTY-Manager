@@ -66,6 +66,7 @@ public partial class SmartDiscoveryWindow : Window
         ProblemsGrid.ItemsSource = problematicCandidates;
 
         PopulateJumpHosts();
+        PopulateInitialGatewaySessions();
         SetTargetGroup(null);
         UpdateCounts();
     }
@@ -104,6 +105,58 @@ public partial class SmartDiscoveryWindow : Window
         }
     }
 
+    private void PopulateInitialGatewaySessions()
+    {
+        InitialGatewaySessionComboBox.Items.Clear();
+        var defaultItem = new ComboBoxItem { Content = "[Не выбрана / Авто]", Tag = null };
+        InitialGatewaySessionComboBox.Items.Add(defaultItem);
+        InitialGatewaySessionComboBox.SelectedItem = defaultItem;
+
+        foreach (var server in LiveConfig.AllServers().OrderBy(s => s.Name, StringComparer.CurrentCultureIgnoreCase))
+        {
+            var item = new ComboBoxItem
+            {
+                Content = $"{server.Name} ({server.Host})",
+                Tag = server.Id
+            };
+            InitialGatewaySessionComboBox.Items.Add(item);
+        }
+    }
+
+    private void SelectInitialGateway(Guid? serverId)
+    {
+        if (!serverId.HasValue)
+        {
+            InitialGatewaySessionComboBox.SelectedIndex = 0;
+            return;
+        }
+
+        foreach (var item in InitialGatewaySessionComboBox.Items.OfType<ComboBoxItem>())
+        {
+            if (item.Tag is Guid id && id == serverId.Value)
+            {
+                InitialGatewaySessionComboBox.SelectedItem = item;
+                return;
+            }
+        }
+
+        InitialGatewaySessionComboBox.SelectedIndex = 0;
+    }
+
+    private static IEnumerable<ManagedServer> GetServersInGroup(ServerGroup group)
+    {
+        foreach (var server in group.Servers) yield return server;
+        foreach (var child in group.Groups)
+            foreach (var server in GetServersInGroup(child))
+                yield return server;
+    }
+
+    private void AutoSelectGatewayForGroup(Guid groupId)
+    {
+        var gatewayId = SmartDiscoveryEngine.ResolveAutoSelectGatewayId(LiveConfig, groupId);
+        SelectInitialGateway(gatewayId);
+    }
+
     private (BaseProxy? Proxy, bool Auto) GetEntryPointSelection() =>
         (JumpHostComboBox.SelectedItem as ComboBoxItem)?.Tag switch
         {
@@ -118,12 +171,14 @@ public partial class SmartDiscoveryWindow : Window
         if (!id.HasValue)
         {
             TargetGroupBox.Text = "[Без группы — верхний уровень]";
+            SelectInitialGateway(null);
             return;
         }
         var path = LiveConfig.GroupPath(id.Value);
         TargetGroupBox.Text = string.IsNullOrEmpty(path)
             ? LiveConfig.FindGroup(id.Value)?.Name ?? ""
             : path;
+        AutoSelectGatewayForGroup(id.Value);
     }
 
     private void OpenGroupPicker()
@@ -339,7 +394,9 @@ public partial class SmartDiscoveryWindow : Window
                 TargetSubgroupName = targetSubgroup,
                 MaxParallelConnections = parallelism,
                 Timeout = TimeSpan.FromSeconds(LiveConfig.ConnectionTimeoutSeconds),
-                EndpointProbeTimeout = TimeSpan.FromSeconds(LiveConfig.EndpointProbeTimeoutSeconds)
+                EndpointProbeTimeout = TimeSpan.FromSeconds(LiveConfig.EndpointProbeTimeoutSeconds),
+                PreferGroupGateways = PreferGroupGatewaysCheckBox.IsChecked == true,
+                InitialGatewayServerId = (InitialGatewaySessionComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?
             };
 
             var progress = new Progress<SmartDiscoveryProgress>(UpdateProgressUi);
@@ -417,7 +474,9 @@ public partial class SmartDiscoveryWindow : Window
                 TargetSubgroupName = targetSubgroup,
                 MaxParallelConnections = parallelism,
                 Timeout = TimeSpan.FromSeconds(LiveConfig.ConnectionTimeoutSeconds),
-                EndpointProbeTimeout = TimeSpan.FromSeconds(LiveConfig.EndpointProbeTimeoutSeconds)
+                EndpointProbeTimeout = TimeSpan.FromSeconds(LiveConfig.EndpointProbeTimeoutSeconds),
+                PreferGroupGateways = PreferGroupGatewaysCheckBox.IsChecked == true,
+                InitialGatewayServerId = (InitialGatewaySessionComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?
             };
 
             var progress = new Progress<SmartDiscoveryProgress>(UpdateProgressUi);

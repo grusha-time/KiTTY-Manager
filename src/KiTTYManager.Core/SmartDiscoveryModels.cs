@@ -17,6 +17,8 @@ public sealed class SmartDiscoveryOptions
     public int MaxAttemptsPerHost { get; set; } = 5;
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan EndpointProbeTimeout { get; set; } = TimeSpan.FromSeconds(4);
+    public bool PreferGroupGateways { get; set; } = true;
+    public Guid? InitialGatewayServerId { get; set; }
 }
 
 public sealed class PrivilegeEscalationResult

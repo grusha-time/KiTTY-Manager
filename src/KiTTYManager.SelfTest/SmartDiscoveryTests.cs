@@ -368,7 +368,7 @@ internal sealed partial class SelfTestRunner
 
         // 2. Exercise actual privilege escalation probing order using ProbePrivilegeEscalationCoreAsync
         var executedCommands = new List<string>();
-        var testedPasswords = new List<(string password, string label)>();
+        var testedPasswords = new List<(string method, string password, string label)>();
 
         Task<(int ExitStatus, string Result)> MockRunCommandNonRoot(string cmd, TimeSpan timeout, CancellationToken ct)
         {
@@ -380,15 +380,15 @@ internal sealed partial class SelfTestRunner
             return Task.FromResult((1, "command not found"));
         }
 
-        // Scenario A: Alternative candidate passwords from pool tested BEFORE login password;
-        // if an alternative candidate password succeeds, login password is not tried.
+        // Scenario A: su - password guessing runs first. If su - with an alternative candidate password succeeds,
+        // login password is not tried and sudo is never executed.
         Task<(bool Success, string Method, string Command, string Password)> MockTryPasswordEscalationA(
-            string pw, string label, TimeSpan timeout, CancellationToken ct)
+            string method, string pw, string label, TimeSpan timeout, CancellationToken ct)
         {
-            testedPasswords.Add((pw, label));
-            if (pw == "altPass2")
+            testedPasswords.Add((method, pw, label));
+            if (method == "su" && pw == "altPass2")
             {
-                return Task.FromResult((true, "sudo", "sudo -i", pw));
+                return Task.FromResult((true, "su", "su -", pw));
             }
             return Task.FromResult((false, "Не повышено", "", ""));
         }
@@ -405,32 +405,32 @@ internal sealed partial class SelfTestRunner
         ).GetAwaiter().GetResult();
 
         Equal(true, resultA.Success);
-        Equal("sudo", resultA.Method);
-        Equal("sudo -i", resultA.RootCommand);
+        Equal("su", resultA.Method);
+        Equal("su -", resultA.RootCommand);
         Equal("altPass2", resultA.RootPassword);
 
-        // Assert: id -u was checked first, then sudo -k & sudo -n id
-        Equal(2, executedCommands.Count);
+        // Assert: id -u was checked first; since su - succeeded, sudo command was NEVER executed!
+        Equal(1, executedCommands.Count);
         Equal("id -u 2>/dev/null", executedCommands[0]);
-        Equal("sudo -k 2>/dev/null; sudo -n id 2>/dev/null", executedCommands[1]);
 
-        // Assert: alternative password altPass1 is tested first
+        // Assert: alternative password altPass1 is tested first for su
         Equal(2, testedPasswords.Count);
-        Equal(("altPass1", "root"), testedPasswords[0]);
+        Equal(("su", "altPass1", "root"), testedPasswords[0]);
         // Assert: alternative password altPass2 is tested next and succeeds
-        Equal(("altPass2", "root"), testedPasswords[1]);
+        Equal(("su", "altPass2", "root"), testedPasswords[1]);
         // Assert: loginPassword was NOT tested because altPass2 succeeded first
         Equal(false, testedPasswords.Any(t => t.password == "loginPassword"));
 
-        // Scenario B: Alternative passwords fail, login password is tested last
+        // Scenario B: All su - attempts fail. Then passwordless sudo is checked and fails.
+        // Finally sudo -i password guessing runs, and login password succeeds.
         executedCommands.Clear();
         testedPasswords.Clear();
 
         Task<(bool Success, string Method, string Command, string Password)> MockTryPasswordEscalationB(
-            string pw, string label, TimeSpan timeout, CancellationToken ct)
+            string method, string pw, string label, TimeSpan timeout, CancellationToken ct)
         {
-            testedPasswords.Add((pw, label));
-            if (pw == "loginPassword")
+            testedPasswords.Add((method, pw, label));
+            if (method == "sudo" && pw == "loginPassword")
             {
                 return Task.FromResult((true, "sudo", "sudo -i", pw));
             }
@@ -448,15 +448,27 @@ internal sealed partial class SelfTestRunner
         ).GetAwaiter().GetResult();
 
         Equal(true, resultB.Success);
+        Equal("sudo", resultB.Method);
+        Equal("sudo -i", resultB.RootCommand);
         Equal("loginPassword", resultB.RootPassword);
 
-        // Sequence: altPass1 -> altPass2 -> loginPassword (with "пользователя" label)
-        Equal(3, testedPasswords.Count);
-        Equal(("altPass1", "root"), testedPasswords[0]);
-        Equal(("altPass2", "root"), testedPasswords[1]);
-        Equal(("loginPassword", "пользователя"), testedPasswords[2]);
+        // Sequence of tested passwords:
+        // su attempts: altPass1 -> altPass2 -> loginPassword
+        // sudo attempts: altPass1 -> altPass2 -> loginPassword (succeeds)
+        Equal(6, testedPasswords.Count);
+        Equal(("su", "altPass1", "root"), testedPasswords[0]);
+        Equal(("su", "altPass2", "root"), testedPasswords[1]);
+        Equal(("su", "loginPassword", "пользователя"), testedPasswords[2]);
+        Equal(("sudo", "altPass1", "root"), testedPasswords[3]);
+        Equal(("sudo", "altPass2", "root"), testedPasswords[4]);
+        Equal(("sudo", "loginPassword", "пользователя"), testedPasswords[5]);
 
-        // Scenario C: Passwordless sudo succeeds on step 2, skipping all password attempts
+        // Executed commands: id -u first, then sudo -k & sudo -n id
+        Equal(2, executedCommands.Count);
+        Equal("id -u 2>/dev/null", executedCommands[0]);
+        Equal("sudo -k 2>/dev/null; sudo -n id 2>/dev/null", executedCommands[1]);
+
+        // Scenario C: All su - attempts fail. Then passwordless sudo succeeds, skipping sudo password attempts.
         executedCommands.Clear();
         testedPasswords.Clear();
 
@@ -470,9 +482,16 @@ internal sealed partial class SelfTestRunner
             return Task.FromResult((1, "failed"));
         }
 
+        Task<(bool Success, string Method, string Command, string Password)> MockTryPasswordAllFail(
+            string method, string pw, string label, TimeSpan timeout, CancellationToken ct)
+        {
+            testedPasswords.Add((method, pw, label));
+            return Task.FromResult((false, "Не повышено", "", ""));
+        }
+
         var resultC = DefaultSmartDiscoveryProbe.ProbePrivilegeEscalationCoreAsync(
             MockRunCommandPasswordless,
-            MockTryPasswordEscalationA,
+            MockTryPasswordAllFail,
             "user",
             "loginPassword",
             candidatePasswords,
@@ -484,7 +503,9 @@ internal sealed partial class SelfTestRunner
         Equal("sudo (без пароля)", resultC.Method);
         Equal("sudo -i", resultC.RootCommand);
         Equal("", resultC.RootPassword);
-        Equal(0, testedPasswords.Count);
+        // Only su attempts were made (3 of them) before passwordless sudo succeeded; 0 sudo password attempts!
+        Equal(3, testedPasswords.Count);
+        Equal(true, testedPasswords.All(t => t.method == "su"));
         Equal(2, executedCommands.Count);
         Equal("id -u 2>/dev/null", executedCommands[0]);
         Equal("sudo -k 2>/dev/null; sudo -n id 2>/dev/null", executedCommands[1]);
@@ -1381,6 +1402,9 @@ internal sealed partial class SelfTestRunner
         // 7. Duplicate gateway: discovery and preview keep the verified candidate chain,
         // while creation reconciles the reused saved session (stale credentials and route).
         var duplicateGatewayConfig = new ManagerConfig();
+        var jh = new BaseProxy { Id = Guid.NewGuid(), Name = "ValidJH", Enabled = true };
+        duplicateGatewayConfig.BaseProxies.Add(jh);
+
         var savedUpstream = new ManagedServer
         {
             Name = "Saved Upstream", Host = "10.7.7.0", Port = 22, Username = "legacy", Password = "UPSTREAM"
@@ -1388,13 +1412,27 @@ internal sealed partial class SelfTestRunner
         duplicateGatewayConfig.UngroupedServers.Add(savedUpstream);
         var existingGateway = new ManagedServer
         {
-            Name = "Existing Gateway", Host = "10.7.7.1", Port = 22, Username = "legacy", Password = "STALE",
-            RequiredPreviousServerId = savedUpstream.Id
+            Name = "Existing Gateway", Host = "10.7.7.1", Port = 22, Username = "root", Password = "fresh",
+            RequiredPreviousServerId = savedUpstream.Id,
+            PreferredProxyId = jh.Id
         };
         duplicateGatewayConfig.UngroupedServers.Add(existingGateway);
+        duplicateGatewayConfig.Links.Add(new ServerLink
+        {
+            FromServerId = savedUpstream.Id,
+            ToServerId = existingGateway.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        });
+        existingGateway.PreferredRoute = new CachedRoute
+        {
+            ProxyId = jh.Id,
+            ServerIds = [savedUpstream.Id, existingGateway.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
 
         var duplicateGatewayProbe = new TestSmartDiscoveryProbe();
         duplicateGatewayProbe.DirectlyReachable.Add("10.7.7.1");
+        duplicateGatewayProbe.ProxyReachable[jh.Id] = ["10.7.7.1"];
         duplicateGatewayProbe.ValidCredentials["10.7.7.1"] = [("root", "fresh")];
         duplicateGatewayProbe.ValidCredentials["10.7.7.9"] = [("root", "pwB")];
         duplicateGatewayProbe.ValidCredentials["10.7.7.10"] = [("root", "pwC")];
@@ -1406,6 +1444,7 @@ internal sealed partial class SelfTestRunner
             TargetHosts = ["10.7.7.1", "10.7.7.9", "10.7.7.10"],
             Usernames = ["root"],
             Passwords = ["fresh", "pwB", "pwC"],
+            JumpHost = jh,
             MaxParallelConnections = 1,
             MaxAttemptsPerHost = 3
         };
@@ -1426,19 +1465,24 @@ internal sealed partial class SelfTestRunner
         Equal(dependentCandidate.Id, thirdHopCandidate.DiscoveredLinksFrom.Single());
 
         var thirdHopChain = duplicateGatewayProbe.HopChains.Last();
-        Equal("10.7.7.1", thirdHopChain[0].Host);
-        Equal("fresh", thirdHopChain[0].Password);
-        Equal("10.7.7.9", thirdHopChain[1].Host);
-        Equal("pwB", thirdHopChain[1].Password);
+        Equal(3, thirdHopChain.Count);
+        Equal("10.7.7.0", thirdHopChain[0].Host);
+        Equal("UPSTREAM", thirdHopChain[0].Password);
+        Equal("10.7.7.1", thirdHopChain[1].Host);
+        Equal("fresh", thirdHopChain[1].Password);
+        Equal("10.7.7.9", thirdHopChain[2].Host);
+        Equal("pwB", thirdHopChain[2].Password);
 
         var duplicateGatewayPreview = SmartDiscoverySessionCreator.CreatePreviewConfig(
             duplicateGatewayConfig, duplicateGatewayResult.Discovered);
-        var previewCandidates = SmartDiscoverySessionCreator.CreatePreviewCandidates(duplicateGatewayPreview, thirdHopCandidate);
+        var previewCandidates = RoutePlanner.Candidates(duplicateGatewayPreview, thirdHopCandidate.Id);
         Equal(1, previewCandidates.Count);
-        Equal(duplicateGatewayCandidate.Id, previewCandidates[0].Servers[0].Id);
-        Equal("fresh", previewCandidates[0].Servers[0].Password);
-        Equal(dependentCandidate.Id, previewCandidates[0].Servers[1].Id);
-        Equal(thirdHopCandidate.Id, previewCandidates[0].Servers[2].Id);
+        Equal(4, previewCandidates[0].Servers.Count);
+        Equal(savedUpstream.Id, previewCandidates[0].Servers[0].Id);
+        Equal(duplicateGatewayCandidate.Id, previewCandidates[0].Servers[1].Id);
+        Equal("fresh", previewCandidates[0].Servers[1].Password);
+        Equal(dependentCandidate.Id, previewCandidates[0].Servers[2].Id);
+        Equal(thirdHopCandidate.Id, previewCandidates[0].Servers[3].Id);
 
         foreach (var c in duplicateGatewayResult.Discovered) c.IsSelected = !c.IsDuplicate;
         var duplicateGatewayCreated = SmartDiscoverySessionCreator.CreateSessions(
@@ -1448,13 +1492,199 @@ internal sealed partial class SelfTestRunner
         Equal(dependentCandidate.Id, duplicateGatewayCreated.Single(s => s.Host == "10.7.7.10").RequiredPreviousServerId);
         Equal("root", existingGateway.Username);
         Equal("fresh", existingGateway.Password);
-        Equal(null, existingGateway.RequiredPreviousServerId);
-        Equal(null, existingGateway.PreferredProxyId);
+        Equal(savedUpstream.Id, existingGateway.RequiredPreviousServerId);
+        Equal(jh.Id, existingGateway.PreferredProxyId);
         Equal("UPSTREAM", savedUpstream.Password);
         Equal(true, duplicateGatewayConfig.Links.Any(
             l => l.FromServerId == existingGateway.Id && l.ToServerId == dependentCandidate.Id));
         Equal(true, duplicateGatewayConfig.Links.Any(
             l => l.FromServerId == dependentCandidate.Id && l.ToServerId == thirdHopCandidate.Id));
+
+        // 7b. Negative scenario: Saved gateway G requires upstream U, but has no valid route to U.
+        // When scanning targets G and T, G is identified as duplicate, but MUST NOT be used
+        // as a direct gateway for T (no hop chains starting with G bypassing U), and T remains problematic.
+        var noRouteGatewayConfig = new ManagerConfig();
+        var missingUpstream = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Missing Upstream",
+            Host = "10.88.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "pwU"
+        };
+        noRouteGatewayConfig.UngroupedServers.Add(missingUpstream);
+        var unroutableGateway = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Unroutable Gateway",
+            Host = "10.88.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "pwG",
+            RequiredPreviousServerId = missingUpstream.Id
+        };
+        noRouteGatewayConfig.UngroupedServers.Add(unroutableGateway);
+
+        var noRouteProbe = new TestSmartDiscoveryProbe();
+        noRouteProbe.DirectlyReachable.Add("10.88.0.2");
+        noRouteProbe.ValidCredentials["10.88.0.2"] = [("root", "pwG")];
+        noRouteProbe.HopReachability.Add(("10.88.0.2", "10.88.0.3"));
+        noRouteProbe.ValidCredentials["10.88.0.3"] = [("root", "pwT")];
+
+        var noRouteOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.88.0.2", "10.88.0.3"],
+            Usernames = ["root"],
+            Passwords = ["pwG", "pwT"],
+            MaxParallelConnections = 1,
+            MaxAttemptsPerHost = 3
+        };
+
+        var noRouteEngine = new SmartDiscoveryEngine(noRouteGatewayConfig, noRouteOptions, noRouteProbe);
+        var noRouteResult = noRouteEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, noRouteResult.Discovered.Count);
+        Equal("10.88.0.2", noRouteResult.Discovered[0].Host);
+        Equal(true, noRouteResult.Discovered[0].IsDuplicate);
+        Equal(1, noRouteResult.Problematic.Count);
+        Equal("10.88.0.3", noRouteResult.Problematic[0].Host);
+        Equal(false, noRouteProbe.HopChains.Any(chain => chain.Count > 0 && chain[0].Host == "10.88.0.2"));
+
+        // 7c. Disabled proxy scenario: saved gateway G has PreferredRoute through a disabled BaseProxy.
+        // RoutePlanner rejects routes through disabled proxies. G must NOT be used as gateway for T,
+        // no hop attempts starting with G, and T remains problematic.
+        var disabledProxyConfig = new ManagerConfig();
+        var disabledProxy = new BaseProxy { Id = Guid.NewGuid(), Name = "DisabledJH", Enabled = false };
+        disabledProxyConfig.BaseProxies.Add(disabledProxy);
+        var disabledUpstream = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Disabled Upstream",
+            Host = "10.89.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "pwU"
+        };
+        disabledProxyConfig.UngroupedServers.Add(disabledUpstream);
+        var disabledGatewayId = Guid.NewGuid();
+        var disabledGateway = new ManagedServer
+        {
+            Id = disabledGatewayId,
+            Name = "Disabled Gateway",
+            Host = "10.89.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "pwG",
+            RequiredPreviousServerId = disabledUpstream.Id,
+            PreferredProxyId = disabledProxy.Id,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = disabledProxy.Id,
+                ServerIds = [disabledUpstream.Id, disabledGatewayId],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        disabledProxyConfig.UngroupedServers.Add(disabledGateway);
+        disabledProxyConfig.Links.Add(new ServerLink
+        {
+            FromServerId = disabledUpstream.Id,
+            ToServerId = disabledGateway.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        });
+
+        var disabledProbe = new TestSmartDiscoveryProbe();
+        disabledProbe.DirectlyReachable.Add("10.89.0.2");
+        disabledProbe.ValidCredentials["10.89.0.2"] = [("root", "pwG")];
+        disabledProbe.HopReachability.Add(("10.89.0.2", "10.89.0.3"));
+        disabledProbe.ValidCredentials["10.89.0.3"] = [("root", "pwT")];
+
+        var disabledOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.89.0.2", "10.89.0.3"],
+            Usernames = ["root"],
+            Passwords = ["pwG", "pwT"],
+            MaxParallelConnections = 1,
+            MaxAttemptsPerHost = 3
+        };
+
+        var disabledEngine = new SmartDiscoveryEngine(disabledProxyConfig, disabledOptions, disabledProbe);
+        var disabledResult = disabledEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, disabledResult.Discovered.Count);
+        Equal("10.89.0.2", disabledResult.Discovered[0].Host);
+        Equal(true, disabledResult.Discovered[0].IsDuplicate);
+        Equal(1, disabledResult.Problematic.Count);
+        Equal("10.89.0.3", disabledResult.Problematic[0].Host);
+        Equal(false, disabledProbe.HopChains.Any(chain => chain.Count > 0 && chain[0].Host == "10.89.0.2"));
+
+        // 7d. Stale cache scenario: saved gateway G has PreferredRoute through an enabled proxy,
+        // but the link U -> G is unconfirmed (LastSuccessUtc is null) and no other routes exist.
+        // RoutePlanner.CandidateFromCached rejects unconfirmed links. G must NOT be used as gateway for T,
+        // no hop attempts starting with G, and T remains problematic.
+        var staleCacheConfig = new ManagerConfig();
+        var staleProxy = new BaseProxy { Id = Guid.NewGuid(), Name = "StaleJH", Enabled = true };
+        staleCacheConfig.BaseProxies.Add(staleProxy);
+        var staleUpstream = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Stale Upstream",
+            Host = "10.90.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "pwU"
+        };
+        staleCacheConfig.UngroupedServers.Add(staleUpstream);
+        var staleGatewayId = Guid.NewGuid();
+        var staleGateway = new ManagedServer
+        {
+            Id = staleGatewayId,
+            Name = "Stale Gateway",
+            Host = "10.90.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "pwG",
+            RequiredPreviousServerId = staleUpstream.Id,
+            PreferredProxyId = staleProxy.Id,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = staleProxy.Id,
+                ServerIds = [staleUpstream.Id, staleGatewayId],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        staleCacheConfig.UngroupedServers.Add(staleGateway);
+        staleCacheConfig.Links.Add(new ServerLink
+        {
+            FromServerId = staleUpstream.Id,
+            ToServerId = staleGateway.Id,
+            LastSuccessUtc = null // Unconfirmed link!
+        });
+
+        var staleProbe = new TestSmartDiscoveryProbe();
+        staleProbe.DirectlyReachable.Add("10.90.0.2");
+        staleProbe.ValidCredentials["10.90.0.2"] = [("root", "pwG")];
+        staleProbe.HopReachability.Add(("10.90.0.2", "10.90.0.3"));
+        staleProbe.ValidCredentials["10.90.0.3"] = [("root", "pwT")];
+
+        var staleOptions = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.90.0.2", "10.90.0.3"],
+            Usernames = ["root"],
+            Passwords = ["pwG", "pwT"],
+            MaxParallelConnections = 1,
+            MaxAttemptsPerHost = 3
+        };
+
+        var staleEngine = new SmartDiscoveryEngine(staleCacheConfig, staleOptions, staleProbe);
+        var staleResult = staleEngine.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, staleResult.Discovered.Count);
+        Equal("10.90.0.2", staleResult.Discovered[0].Host);
+        Equal(true, staleResult.Discovered[0].IsDuplicate);
+        Equal(1, staleResult.Problematic.Count);
+        Equal("10.90.0.3", staleResult.Problematic[0].Host);
+        Equal(false, staleProbe.HopChains.Any(chain => chain.Count > 0 && chain[0].Host == "10.90.0.2"));
 
         // 8. Reused duplicate in the middle: verified incoming link is registered and a route can be planned.
         var middleDuplicateConfig = new ManagerConfig();
@@ -1779,7 +2009,7 @@ internal sealed partial class SelfTestRunner
 
         // 6. Duplicate detection: a host already present in the config is marked as a duplicate
         var duplicateConfig = new ManagerConfig();
-        duplicateConfig.UngroupedServers.Add(new ManagedServer { Name = "Existing", Host = "10.9.6.1", Port = 22 });
+        duplicateConfig.UngroupedServers.Add(new ManagedServer { Name = "Existing", Host = "10.9.6.1", Port = 22, Username = "root" });
 
         var duplicateProbe = new TestSmartDiscoveryProbe();
         duplicateProbe.DirectlyReachable.Add("10.9.6.1");
@@ -2227,5 +2457,701 @@ internal sealed partial class SelfTestRunner
         Equal(new string('•', 6), rootPasswordCandidate.DisplayRootPassword);
         rootPasswordCandidate.ShowRootPassword = true;
         Equal("rootpw", rootPasswordCandidate.DisplayRootPassword);
+    }
+
+    private static void SmartDiscoveryIssue26EnhancementsTests()
+    {
+        // 1. Fast duplicate detection by (Host, Username):
+        // Zero network attempts for hosts with matching (Host, Username) in config
+        var config1 = new ManagerConfig();
+        var existing1 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Existing Server 1",
+            Host = "192.168.10.5",
+            Port = 22,
+            Username = "admin",
+            Password = "pw1"
+        };
+        config1.UngroupedServers.Add(existing1);
+
+        var probe1 = new TestSmartDiscoveryProbe();
+        // probe1 has NO directly reachable hosts or credentials configured
+
+        var options1 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["192.168.10.5"],
+            Usernames = ["admin"],
+            Passwords = ["anyPass"]
+        };
+
+        var engine1 = new SmartDiscoveryEngine(config1, options1, probe1);
+        var result1 = engine1.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result1.Discovered.Count);
+        Equal(0, result1.Problematic.Count);
+        var cand1 = result1.Discovered[0];
+        Equal(true, cand1.IsDuplicate);
+        Equal(false, cand1.IsSelected);
+        Equal(existing1.Name, cand1.ProposedName);
+        Equal(existing1.Id, cand1.ExistingServerId);
+        Equal("Дубль: сессия уже сохранена в программе", cand1.StatusMessage);
+        Equal(0, probe1.ReachabilityAttempts.Count);
+        Equal(0, probe1.AttemptedLogins.Count);
+
+        // 2. Mixed usernames: duplicate username skipped without probe, new username probed over network
+        var config2 = new ManagerConfig();
+        var existing2 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Existing Server 2",
+            Host = "192.168.10.6",
+            Port = 22,
+            Username = "admin",
+            Password = "pw2"
+        };
+        config2.UngroupedServers.Add(existing2);
+
+        var probe2 = new TestSmartDiscoveryProbe();
+        probe2.DirectlyReachable.Add("192.168.10.6");
+        probe2.ValidCredentials["192.168.10.6"] = [("deployer", "pwDeploy")];
+
+        var options2 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["192.168.10.6"],
+            Usernames = ["admin", "deployer"],
+            Passwords = ["pwDeploy"]
+        };
+
+        var engine2 = new SmartDiscoveryEngine(config2, options2, probe2);
+        var result2 = engine2.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(2, result2.Discovered.Count);
+        var dupCand = result2.Discovered.Single(c => c.IsDuplicate);
+        var newCand = result2.Discovered.Single(c => !c.IsDuplicate);
+
+        Equal("admin", dupCand.Username);
+        Equal(existing2.Name, dupCand.ProposedName);
+        Equal(existing2.Id, dupCand.ExistingServerId);
+        Equal("Дубль: сессия уже сохранена в программе", dupCand.StatusMessage);
+        Equal(false, dupCand.IsSelected);
+
+        Equal("deployer", newCand.Username);
+        Equal(true, newCand.IsSelected);
+        Equal(false, newCand.IsDuplicate);
+        Equal(null, newCand.ExistingServerId);
+
+        // probe2 attempted logins only for deployer, never for admin!
+        Equal(true, probe2.AttemptedLogins.All(l => l.user == "deployer"));
+        Equal(false, probe2.AttemptedLogins.Any(l => l.user == "admin"));
+
+        // 3. PreferGroupGateways option:
+        // When enabled with TargetGroupId: gateways probed first!
+        var config3 = new ManagerConfig();
+        var group3 = new ServerGroup { Name = "Branch" };
+        var gateway3 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Branch Gateway",
+            Host = "10.20.0.1",
+            Port = 22,
+            Username = "gwuser",
+            Password = "gwpw",
+            TryDirectWithoutJumphost = true
+        };
+        group3.Servers.Add(gateway3);
+        config3.Groups.Add(group3);
+
+        var probe3 = new TestSmartDiscoveryProbe();
+        // 10.20.0.50 is reachable via gateway3
+        probe3.HopReachability.Add(("10.20.0.1", "10.20.0.50"));
+        probe3.ValidCredentials["10.20.0.50"] = [("root", "pw50")];
+
+        var options3 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.20.0.50"],
+            Usernames = ["root"],
+            Passwords = ["pw50"],
+            TargetGroupId = group3.Id,
+            PreferGroupGateways = true
+        };
+
+        var engine3 = new SmartDiscoveryEngine(config3, options3, probe3);
+        var result3 = engine3.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result3.Discovered.Count);
+        var foundThroughGw = result3.Discovered[0];
+        Equal(gateway3.Id, foundThroughGw.RequiredPreviousServerId);
+        Equal(true, foundThroughGw.StatusMessage.Contains("Обнаружен через шлюз"));
+        // Direct reachability was never attempted because gateway succeeded first!
+        Equal(0, probe3.ReachabilityAttempts.Count);
+
+        // 4. PreferGroupGateways fallback:
+        // Host unreachable through gateway probes direct second!
+        var config4 = new ManagerConfig();
+        var group4 = new ServerGroup { Name = "Branch4" };
+        var gateway4 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Branch4 Gateway",
+            Host = "10.20.0.2",
+            Port = 22,
+            Username = "gwuser",
+            Password = "gwpw",
+            TryDirectWithoutJumphost = true
+        };
+        group4.Servers.Add(gateway4);
+        config4.Groups.Add(group4);
+
+        var probe4 = new TestSmartDiscoveryProbe();
+        // 10.20.0.60 is NOT reachable via gateway, but IS directly reachable
+        probe4.DirectlyReachable.Add("10.20.0.60");
+        probe4.ValidCredentials["10.20.0.60"] = [("root", "pw60")];
+
+        var options4 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.20.0.60"],
+            Usernames = ["root"],
+            Passwords = ["pw60"],
+            TargetGroupId = group4.Id,
+            PreferGroupGateways = true
+        };
+
+        var engine4 = new SmartDiscoveryEngine(config4, options4, probe4);
+        var result4 = engine4.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result4.Discovered.Count);
+        var fallbackCand = result4.Discovered[0];
+        Equal("10.20.0.60", fallbackCand.Host);
+        Equal(null, fallbackCand.RequiredPreviousServerId);
+        // Gateway was attempted first, then direct reachability
+        Equal(true, probe4.BatchHopAttempts.Any(b => b.TargetHosts.Contains("10.20.0.60")));
+        Equal(true, probe4.ReachabilityAttempts.Any(r => r.host == "10.20.0.60"));
+
+        // 5. InitialGatewayServerId priority:
+        // When InitialGatewayServerId is set, it is tested first with distance -1
+        var config5 = new ManagerConfig();
+        var group5 = new ServerGroup { Name = "Branch5" };
+        var serverA = new ManagedServer { Id = Guid.NewGuid(), Name = "Server A", Host = "10.30.0.1", Port = 22, TryDirectWithoutJumphost = true };
+        var serverB = new ManagedServer { Id = Guid.NewGuid(), Name = "Server B", Host = "10.30.0.2", Port = 22, TryDirectWithoutJumphost = true };
+        var serverC = new ManagedServer { Id = Guid.NewGuid(), Name = "Server C", Host = "10.30.0.3", Port = 22, TryDirectWithoutJumphost = true };
+        group5.Servers.AddRange([serverA, serverB, serverC]);
+        config5.Groups.Add(group5);
+
+        var probe5 = new TestSmartDiscoveryProbe();
+        probe5.HopReachability.Add(("10.30.0.3", "10.30.0.99"));
+        probe5.ValidCredentials["10.30.0.99"] = [("root", "pw99")];
+
+        var options5 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.30.0.99"],
+            Usernames = ["root"],
+            Passwords = ["pw99"],
+            TargetGroupId = group5.Id,
+            PreferGroupGateways = true,
+            InitialGatewayServerId = serverC.Id
+        };
+
+        var engine5 = new SmartDiscoveryEngine(config5, options5, probe5);
+        var result5 = engine5.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result5.Discovered.Count);
+        Equal(serverC.Id, result5.Discovered[0].RequiredPreviousServerId);
+        // Verify serverC was tried first
+        Equal("10.30.0.3", probe5.HopChains[0][0].Host);
+
+        // 6. Persistent gateway session probe:
+        // Verify that OpenGatewaySessionAsync is used and held during batch probing and auth
+        var sessionCreated = 0;
+        var sessionDisposed = 0;
+        var persistentProbe = new PersistentSessionMockProbe
+        {
+            OnSessionCreate = () => sessionCreated++,
+            OnSessionDispose = () => sessionDisposed++
+        };
+        persistentProbe.HopReachability.Add(("10.40.0.1", "10.40.0.10"));
+        persistentProbe.ValidCredentials["10.40.0.10"] = [("root", "pw10")];
+
+        var config6 = new ManagerConfig();
+        var group6 = new ServerGroup { Name = "Branch6" };
+        var gw6 = new ManagedServer { Id = Guid.NewGuid(), Name = "GW6", Host = "10.40.0.1", Port = 22, TryDirectWithoutJumphost = true };
+        group6.Servers.Add(gw6);
+        config6.Groups.Add(group6);
+
+        var options6 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.40.0.10"],
+            Usernames = ["root"],
+            Passwords = ["pw10"],
+            TargetGroupId = group6.Id,
+            PreferGroupGateways = true
+        };
+
+        var engine6 = new SmartDiscoveryEngine(config6, options6, persistentProbe);
+        var result6 = engine6.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result6.Discovered.Count);
+        Equal(1, sessionCreated);
+        Equal(1, sessionDisposed);
+
+        // 7. Duplicate uses saved ID and does not bypass RoutePlanner:
+        var config7 = new ManagerConfig();
+        var proxy7 = new BaseProxy { Name = "Proxy7", Host = "10.55.0.1", Port = 22 };
+        config7.BaseProxies.Add(proxy7);
+        var server7 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Server7",
+            Host = "10.55.0.10",
+            Port = 22,
+            Username = "root",
+            Password = "pw7",
+            TryDirectWithoutJumphost = false
+        };
+        server7.PreferredRoute = new CachedRoute
+        {
+            ProxyId = proxy7.Id,
+            ServerIds = [server7.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        config7.UngroupedServers.Add(server7);
+
+        var probe7 = new TestSmartDiscoveryProbe();
+        var options7 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.55.0.10"],
+            Usernames = ["root"],
+            Passwords = ["pw7"]
+        };
+        var engine7 = new SmartDiscoveryEngine(config7, options7, probe7);
+        var result7 = engine7.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result7.Discovered.Count);
+        var dup7 = result7.Discovered[0];
+        Equal(true, dup7.IsDuplicate);
+        Equal(server7.Id, dup7.Id); // Uses saved ID!
+        Equal(server7.Id, dup7.ExistingServerId);
+        Equal(proxy7.Id, dup7.VerifiedProxyId); // Validated route from RoutePlanner!
+        Equal(0, probe7.AttemptedLogins.Count); // 0 network attempts!
+
+        // 8. Host B discovered through host A found during direct probe in PreferGroupGateways:
+        var config8 = new ManagerConfig();
+        var group8 = new ServerGroup { Name = "Branch8" };
+        var initialGw8 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "InitialGw8",
+            Host = "10.60.0.1",
+            Port = 22,
+            Username = "gw",
+            Password = "pw",
+            TryDirectWithoutJumphost = true
+        };
+        group8.Servers.Add(initialGw8);
+        config8.Groups.Add(group8);
+
+        var probe8 = new TestSmartDiscoveryProbe();
+        // Initial gateway cannot reach either Host A or Host B
+        // Host A is directly reachable
+        probe8.DirectlyReachable.Add("10.60.0.10");
+        probe8.ValidCredentials["10.60.0.10"] = [("root", "pwA")];
+        // Host B is reachable ONLY through Host A
+        probe8.HopReachability.Add(("10.60.0.10", "10.60.0.20"));
+        probe8.ValidCredentials["10.60.0.20"] = [("root", "pwB")];
+
+        var options8 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.60.0.10", "10.60.0.20"],
+            Usernames = ["root"],
+            Passwords = ["pwA", "pwB"],
+            TargetGroupId = group8.Id,
+            PreferGroupGateways = true
+        };
+        var engine8 = new SmartDiscoveryEngine(config8, options8, probe8);
+        var result8 = engine8.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(2, result8.Discovered.Count);
+        Equal(0, result8.Problematic.Count);
+        var candA = result8.Discovered.Single(c => c.Host == "10.60.0.10");
+        var candB = result8.Discovered.Single(c => c.Host == "10.60.0.20");
+        Equal(null, candA.RequiredPreviousServerId);
+        Equal(candA.Id, candB.RequiredPreviousServerId); // B discovered through newly direct A!
+
+        // 9. Confirmed credentials do not reintroduce excluded duplicate username:
+        var config9 = new ManagerConfig();
+        var existingOnHost2 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Host2-Root",
+            Host = "10.70.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "pwRoot"
+        };
+        config9.UngroupedServers.Add(existingOnHost2);
+
+        var probe9 = new TestSmartDiscoveryProbe();
+        probe9.DirectlyReachable.Add("10.70.0.1");
+        probe9.DirectlyReachable.Add("10.70.0.2");
+        probe9.ValidCredentials["10.70.0.1"] = [("root", "pwRoot")];
+        probe9.ValidCredentials["10.70.0.2"] = [("user2", "pwUser2")];
+
+        var options9 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.70.0.1", "10.70.0.2"],
+            Usernames = ["root", "user2"],
+            Passwords = ["pwRoot", "pwUser2"]
+        };
+        var engine9 = new SmartDiscoveryEngine(config9, options9, probe9);
+        var result9 = engine9.DiscoverAsync().GetAwaiter().GetResult();
+
+        // Host 2 must NEVER have been probed with root (root was excluded by fast duplicate check)
+        Equal(false, probe9.AttemptedLogins.Any(l => l.host == "10.70.0.2" && l.user == "root"));
+        Equal(true, probe9.AttemptedLogins.Any(l => l.host == "10.70.0.2" && l.user == "user2"));
+
+        // 10. New username on existing host creates a new candidate (IsDuplicate = false):
+        var config10 = new ManagerConfig();
+        var existing10 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Existing10",
+            Host = "10.80.0.5",
+            Port = 22,
+            Username = "admin",
+            Password = "pwAdmin"
+        };
+        config10.UngroupedServers.Add(existing10);
+
+        var probe10 = new TestSmartDiscoveryProbe();
+        probe10.DirectlyReachable.Add("10.80.0.5");
+        probe10.ValidCredentials["10.80.0.5"] = [("deployer", "pwDeploy")];
+
+        var options10 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.80.0.5"],
+            Usernames = ["deployer"],
+            Passwords = ["pwDeploy"]
+        };
+        var engine10 = new SmartDiscoveryEngine(config10, options10, probe10);
+        var result10 = engine10.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result10.Discovered.Count);
+        var cand10 = result10.Discovered[0];
+        Equal("deployer", cand10.Username);
+        Equal(false, cand10.IsDuplicate); // NOT a duplicate!
+        Equal(null, cand10.ExistingServerId);
+        Equal(true, cand10.IsSelected);
+
+        // 11. AutoSelectGatewayForGroup selects independent server in parent group when child group has no independent server:
+        var config11 = new ManagerConfig();
+        var rootGroup = new ServerGroup { Name = "RootGroup" };
+        var subGroup = new ServerGroup { Name = "SubGroup" };
+        rootGroup.Groups.Add(subGroup);
+        config11.Groups.Add(rootGroup);
+
+        var rootGw = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "RootGW",
+            Host = "10.90.0.1",
+            Port = 22,
+            TryDirectWithoutJumphost = true
+        };
+        rootGw.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [rootGw.Id],
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        rootGroup.Servers.Add(rootGw);
+
+        var subServer = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "SubServer",
+            Host = "10.90.0.2",
+            Port = 22,
+            RequiredPreviousServerId = rootGw.Id
+        };
+        subGroup.Servers.Add(subServer);
+
+        var selectedId = SmartDiscoveryEngine.ResolveAutoSelectGatewayId(config11, subGroup.Id);
+        Equal(rootGw.Id, selectedId); // Must select independent server from parent group!
+
+        // 12. Saved session with empty login does not make new login 'deployer' a duplicate:
+        var config12 = new ManagerConfig();
+        var existingEmptyUser = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "EmptyUserHost",
+            Host = "10.85.0.5",
+            Port = 22,
+            Username = "", // Empty login in saved session
+            Password = ""
+        };
+        config12.UngroupedServers.Add(existingEmptyUser);
+
+        var probe12 = new TestSmartDiscoveryProbe();
+        probe12.DirectlyReachable.Add("10.85.0.5");
+        probe12.ValidCredentials["10.85.0.5"] = [("deployer", "pwDeploy")];
+
+        var options12 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.85.0.5"],
+            Usernames = ["deployer"],
+            Passwords = ["pwDeploy"]
+        };
+        var engine12 = new SmartDiscoveryEngine(config12, options12, probe12);
+        var result12 = engine12.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result12.Discovered.Count);
+        Equal(0, result12.Problematic.Count);
+        var cand12 = result12.Discovered[0];
+        Equal("deployer", cand12.Username);
+        Equal(false, cand12.IsDuplicate); // Must NOT be treated as duplicate of empty-login session
+        Equal(null, cand12.ExistingServerId);
+        Equal(true, cand12.IsSelected);
+
+        // 13. Strict case-sensitive separation between logins 'admin' and 'Admin':
+        // Two hosts with logins 'admin' and 'Admin' must not cause conflicts or false credential matching.
+        var config13 = new ManagerConfig();
+        var existingAdmin = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Existing-admin-server",
+            Host = "10.86.0.1",
+            Port = 22,
+            Username = "admin",
+            Password = "pw1"
+        };
+        config13.UngroupedServers.Add(existingAdmin);
+
+        var probe13 = new TestSmartDiscoveryProbe();
+        probe13.DirectlyReachable.Add("10.86.0.1");
+        probe13.DirectlyReachable.Add("10.86.0.2");
+        probe13.ValidCredentials["10.86.0.1"] = [("admin", "pw1")];
+        probe13.ValidCredentials["10.86.0.2"] = [("Admin", "pw2")];
+
+        // 13a: 10.86.0.1 with "Admin" (different case) is NOT treated as duplicate of existing "admin"
+        var options13a = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.86.0.1"],
+            Usernames = ["Admin"],
+            Passwords = ["pw1"]
+        };
+        var engine13a = new SmartDiscoveryEngine(config13, options13a, probe13);
+        var result13a = engine13a.DiscoverAsync().GetAwaiter().GetResult();
+        Equal(true, probe13.AttemptedLogins.Any(l => l.host == "10.86.0.1" && l.user == "Admin"));
+
+        // 13b: Multi-host discovery with both 'admin' and 'Admin':
+        // Both hosts discovered with their exact case-sensitive usernames without conflicts.
+        var probe13b = new TestSmartDiscoveryProbe();
+        probe13b.DirectlyReachable.Add("10.86.0.1");
+        probe13b.DirectlyReachable.Add("10.86.0.2");
+        probe13b.ValidCredentials["10.86.0.1"] = [("admin", "pw1")];
+        probe13b.ValidCredentials["10.86.0.2"] = [("Admin", "pw2")];
+
+        var options13b = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.86.0.1", "10.86.0.2"],
+            Usernames = ["admin", "Admin"],
+            Passwords = ["pw1", "pw2"],
+            MaxParallelConnections = 1
+        };
+        var engine13b = new SmartDiscoveryEngine(new ManagerConfig(), options13b, probe13b);
+        var result13b = engine13b.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(2, result13b.Discovered.Count);
+        Equal(0, result13b.Problematic.Count);
+        var candLower = result13b.Discovered.Single(c => c.Host == "10.86.0.1");
+        var candUpper = result13b.Discovered.Single(c => c.Host == "10.86.0.2");
+        Equal("admin", candLower.Username);
+        Equal("Admin", candUpper.Username);
+        Equal(false, candLower.IsDuplicate);
+        Equal(false, candUpper.IsDuplicate);
+
+        // 13c: Prioritized credentials test for case-sensitivity:
+        // Host with only 'Admin' allowed must NOT attempt confirmed credentials with 'admin'
+        var probe13c = new TestSmartDiscoveryProbe();
+        probe13c.DirectlyReachable.Add("10.86.0.1");
+        probe13c.DirectlyReachable.Add("10.86.0.2");
+        probe13c.ValidCredentials["10.86.0.1"] = [("admin", "pw1")];
+        probe13c.ValidCredentials["10.86.0.2"] = [("Admin", "pw2")];
+
+        var engine13c1 = new SmartDiscoveryEngine(new ManagerConfig(), new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.86.0.1"],
+            Usernames = ["admin"],
+            Passwords = ["pw1"]
+        }, probe13c);
+        engine13c1.DiscoverAsync().GetAwaiter().GetResult();
+
+        var engine13c2 = new SmartDiscoveryEngine(new ManagerConfig(), new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.86.0.2"],
+            Usernames = ["Admin"],
+            Passwords = ["pw2"]
+        }, probe13c);
+        var result13c2 = engine13c2.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result13c2.Discovered.Count);
+        Equal("Admin", result13c2.Discovered[0].Username);
+        Equal(false, probe13c.AttemptedLogins.Any(l => l.host == "10.86.0.2" && l.user == "admin"));
+
+        // 14. Explicit initial gateway within group with valid cached route [U, G]:
+        // When InitialGatewayServerId = G.Id and G requires U (both in target group),
+        // G must be accepted as seed with priority -1 despite U being in group scope,
+        // and target reachable only via G must be discovered through U -> G.
+        var config14 = new ManagerConfig();
+        var proxy14 = new BaseProxy { Id = Guid.NewGuid(), Name = "JH14", Host = "127.0.0.1", Port = 2222, Enabled = true };
+        config14.BaseProxies.Add(proxy14);
+        var testGroup14 = new ServerGroup { Name = "TestGroup14" };
+        var serverU = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Server U",
+            Host = "10.95.0.1",
+            Port = 22,
+            Username = "root",
+            Password = "pwU",
+            TryDirectWithoutJumphost = true,
+            PreferredProxyId = proxy14.Id,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = proxy14.Id,
+                ServerIds = [Guid.Empty],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        serverU.PreferredRoute.ServerIds[0] = serverU.Id;
+        var serverG = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Server G",
+            Host = "10.95.0.2",
+            Port = 22,
+            Username = "root",
+            Password = "pwG",
+            RequiredPreviousServerId = serverU.Id,
+            PreferredProxyId = proxy14.Id,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = proxy14.Id,
+                ServerIds = [serverU.Id, Guid.Empty],
+                LastSuccessUtc = DateTimeOffset.UtcNow
+            }
+        };
+        serverG.PreferredRoute.ServerIds[1] = serverG.Id;
+        testGroup14.Servers.AddRange([serverU, serverG]);
+        config14.Groups.Add(testGroup14);
+        config14.Links.Add(new ServerLink
+        {
+            FromServerId = serverU.Id,
+            ToServerId = serverG.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow,
+            LastSuccessfulProxyId = proxy14.Id
+        });
+
+        var probe14 = new TestSmartDiscoveryProbe();
+        probe14.HopReachability.Add((serverG.Host, "10.95.0.99"));
+        probe14.ValidCredentials["10.95.0.99"] = [("root", "pw99")];
+
+        var options14 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.95.0.99"],
+            Usernames = ["root"],
+            Passwords = ["pw99"],
+            TargetGroupId = testGroup14.Id,
+            PreferGroupGateways = true,
+            InitialGatewayServerId = serverG.Id,
+            MaxParallelConnections = 1
+        };
+
+        var engine14 = new SmartDiscoveryEngine(config14, options14, probe14);
+        var result14 = engine14.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result14.Discovered.Count);
+        Equal(0, result14.Problematic.Count);
+        Equal("10.95.0.99", result14.Discovered[0].Host);
+        Equal(serverG.Id, result14.Discovered[0].RequiredPreviousServerId);
+        Equal(true, probe14.HopChains.Count > 0);
+        Equal(2, probe14.HopChains[0].Count);
+        Equal(serverU.Host, probe14.HopChains[0][0].Host);
+        Equal(serverG.Host, probe14.HopChains[0][1].Host);
+        Equal(string.Join('/', serverU.Host, serverG.Host, "10.95.0.99"), string.Join('/', result14.Discovered[0].RouteHops.Select(h => h.Host)));
+    }
+
+    private sealed class PersistentSessionMockProbe : ISmartDiscoveryProbe
+    {
+        public HashSet<string> DirectlyReachable { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, List<(string user, string pass)>> ValidCredentials { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<(string gateway, string target)> HopReachability { get; } = [];
+        public Action? OnSessionCreate { get; set; }
+        public Action? OnSessionDispose { get; set; }
+
+        public Task<bool> ProbeReachabilityAsync(
+            BaseProxy? jumpHost, string host, int port, TimeSpan timeout, CancellationToken cancellationToken) =>
+            Task.FromResult(DirectlyReachable.Contains(host));
+
+        public Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
+            BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+            ManagedServer target, IReadOnlyList<string> candidatePasswords,
+            TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            if (ValidCredentials.TryGetValue(target.Host, out var valid) && valid.Any(v => v.user == target.Username && v.pass == target.Password))
+                return Task.FromResult(SmartDiscoveryAuthResult.Succeeded(target.Host, new PrivilegeEscalationResult { Method = "Root", Success = true }));
+            return Task.FromResult(SmartDiscoveryAuthResult.FailedAuth("Bad credentials"));
+        }
+
+        public Task<bool> ProbeHopReachabilityAsync(
+            BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+            string targetHost, int targetPort, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var last = intermediateGateways.Count > 0 ? intermediateGateways[^1].Host : "";
+            return Task.FromResult(HopReachability.Contains((last, targetHost)));
+        }
+
+        public Task<IDiscoveryGatewaySession?> OpenGatewaySessionAsync(
+            BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
+            TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            OnSessionCreate?.Invoke();
+            var last = intermediateGateways.Count > 0 ? intermediateGateways[^1].Host : "";
+            return Task.FromResult<IDiscoveryGatewaySession?>(new MockGatewaySession(this, last, OnSessionDispose));
+        }
+
+        private sealed class MockGatewaySession : IDiscoveryGatewaySession
+        {
+            private readonly PersistentSessionMockProbe parent;
+            private readonly string gatewayHost;
+            private readonly Action? onDispose;
+
+            public MockGatewaySession(PersistentSessionMockProbe parent, string gatewayHost, Action? onDispose)
+            {
+                this.parent = parent;
+                this.gatewayHost = gatewayHost;
+                this.onDispose = onDispose;
+            }
+
+            public Task<bool> ProbeReachabilityAsync(string host, int port, TimeSpan timeout, CancellationToken cancellationToken) =>
+                Task.FromResult(parent.HopReachability.Contains((gatewayHost, host)));
+
+            public Task<IReadOnlyDictionary<string, bool>> ProbeBatchReachabilityAsync(
+                IReadOnlyList<string> hosts, int port, TimeSpan timeout, CancellationToken cancellationToken)
+            {
+                var dict = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                foreach (var h in hosts)
+                    dict[h] = parent.HopReachability.Contains((gatewayHost, h));
+                return Task.FromResult<IReadOnlyDictionary<string, bool>>(dict);
+            }
+
+            public Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
+                ManagedServer target, IReadOnlyList<string> candidatePasswords,
+                TimeSpan timeout, CancellationToken cancellationToken) =>
+                parent.AuthenticateAndProbeAsync(null, [], target, candidatePasswords, timeout, cancellationToken);
+
+            public void Dispose() => onDispose?.Invoke();
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
     }
 }
