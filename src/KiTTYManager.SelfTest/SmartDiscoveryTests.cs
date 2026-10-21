@@ -3079,6 +3079,114 @@ internal sealed partial class SelfTestRunner
         Equal(serverU.Host, probe14.HopChains[0][0].Host);
         Equal(serverG.Host, probe14.HopChains[0][1].Host);
         Equal(string.Join('/', serverU.Host, serverG.Host, "10.95.0.99"), string.Join('/', result14.Discovered[0].RouteHops.Select(h => h.Host)));
+
+        // Test 15: CandidateLinks draft config & LinkMapLayout handle duplicates safely without crashing
+        var config15 = new ManagerConfig();
+        var group15 = new ServerGroup { Id = Guid.NewGuid(), Name = "Group 15" };
+        var s15A = new ManagedServer { Id = Guid.NewGuid(), Name = "Server 15A", Host = "10.15.0.1", Port = 22, Username = "admin" };
+        var s15B = new ManagedServer { Id = Guid.NewGuid(), Name = "Server 15B", Host = "10.15.0.2", Port = 22, Username = "admin" };
+        group15.Servers.Add(s15A);
+        group15.Servers.Add(s15B);
+        config15.Groups.Add(group15);
+        config15.Links.Add(new ServerLink { FromServerId = s15A.Id, ToServerId = s15B.Id, Discovered = true, LastSuccessUtc = DateTimeOffset.UtcNow });
+
+        var newCandId = Guid.NewGuid();
+        var candidates15 = new List<DiscoveredServerCandidate>
+        {
+            new()
+            {
+                Id = s15A.Id,
+                ExistingServerId = s15A.Id,
+                ProposedName = s15A.Name,
+                Host = s15A.Host,
+                Port = 22,
+                Username = s15A.Username,
+                IsDuplicate = true,
+                IsSelected = false
+            },
+            new()
+            {
+                Id = newCandId,
+                ProposedName = "New Server 15C",
+                Host = "10.15.0.3",
+                Port = 22,
+                Username = "admin",
+                IsDuplicate = false,
+                IsSelected = true,
+                DiscoveredLinksFrom = [s15A.Id]
+            }
+        };
+
+        var previewConfig15 = SmartDiscoverySessionCreator.CreatePreviewConfig(config15, candidates15);
+        var allIds15 = previewConfig15.AllServers().Select(s => s.Id).ToList();
+        Equal(allIds15.Count, allIds15.Distinct().Count()); // No duplicate server IDs across groups and ungrouped
+        True(previewConfig15.FindServer(s15A.Id) is not null);
+        True(previewConfig15.FindServer(newCandId) is not null);
+
+        // LinkMapLayout.Build must succeed without ArgumentException
+        var mapModel15 = LinkMapLayout.Build(previewConfig15);
+        True(mapModel15.Nodes.Count > 0);
+
+        // Deletion scenario (Astra review finding): deleting outgoing link A -> C in preview config
+        // must sync back to candidate C so reopening preview does not restore the deleted link
+        Equal(true, previewConfig15.Links.Any(l => l.FromServerId == s15A.Id && l.ToServerId == newCandId));
+        candidates15[1].RequiredPreviousServerId = s15A.Id;
+        var snapshotPairs15 = previewConfig15.Links.Select(l => (l.FromServerId, l.ToServerId)).ToHashSet();
+        previewConfig15.Links.RemoveAll(l => l.FromServerId == s15A.Id && l.ToServerId == newCandId);
+        SmartDiscoverySessionCreator.SyncDiscoveredLinks(snapshotPairs15, previewConfig15, candidates15, config15);
+
+        // Candidate C's DiscoveredLinksFrom must no longer contain s15A.Id, and RequiredPreviousServerId cleared
+        Equal(0, candidates15[1].DiscoveredLinksFrom.Count);
+        Equal(null, candidates15[1].RequiredPreviousServerId);
+
+        // Reopening / rebuilding preview config must NOT restore the deleted link
+        var reopenedPreview = SmartDiscoverySessionCreator.CreatePreviewConfig(config15, candidates15);
+        Equal(false, reopenedPreview.Links.Any(l => l.FromServerId == s15A.Id && l.ToServerId == newCandId));
+
+        // Regression check (Astra review finding P1): closing an unchanged links preview
+        // must NOT discard post-snapshot state (new candidates or concurrent live links)
+        // Preview opened and snapshot taken BEFORE new candidate and concurrent link arrive:
+        var postSnapshotPreview = SmartDiscoverySessionCreator.CreatePreviewConfig(config15, candidates15);
+        var postSnapshotPairs = postSnapshotPreview.Links.Select(l => (l.FromServerId, l.ToServerId)).ToHashSet();
+
+        // New candidate arrives and concurrent live link added AFTER snapshot was taken:
+        var postSnapshotCandId = Guid.NewGuid();
+        var candPost = new DiscoveredServerCandidate
+        {
+            Id = postSnapshotCandId,
+            ProposedName = "Post-snapshot Candidate D",
+            Host = "10.15.0.4",
+            Port = 22,
+            Username = "admin",
+            DiscoveredLinksFrom = [s15B.Id],
+            RequiredPreviousServerId = s15B.Id
+        };
+        candidates15.Add(candPost);
+        var concurrentLiveLink = new ServerLink
+        {
+            FromServerId = s15B.Id,
+            ToServerId = Guid.NewGuid(),
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        config15.Links.Add(concurrentLiveLink);
+
+        // Preview closed without deletions:
+        SmartDiscoverySessionCreator.SyncDiscoveredLinks(postSnapshotPairs, postSnapshotPreview, candidates15, config15);
+
+        // CandPost must retain its incoming links and gateway
+        Equal(1, candPost.DiscoveredLinksFrom.Count);
+        Equal(s15B.Id, candPost.DiscoveredLinksFrom[0]);
+        Equal(s15B.Id, candPost.RequiredPreviousServerId);
+        True(config15.Links.Contains(concurrentLiveLink));
+
+        // Defensive test: LinkMapLayout.Build handles config with duplicate server IDs gracefully
+        var duplicateConfig = new ManagerConfig
+        {
+            Groups = [new ServerGroup { Servers = [s15A] }],
+            UngroupedServers = [new ManagedServer { Id = s15A.Id, Name = "Duplicate Copy", Host = s15A.Host, Port = 22 }]
+        };
+        var defensiveMap = LinkMapLayout.Build(duplicateConfig);
+        True(defensiveMap != null);
     }
 
     private sealed class PersistentSessionMockProbe : ISmartDiscoveryProbe

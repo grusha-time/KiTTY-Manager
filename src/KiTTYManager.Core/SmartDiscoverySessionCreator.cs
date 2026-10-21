@@ -440,15 +440,16 @@ public static class SmartDiscoverySessionCreator
 
         foreach (var c in candidates)
         {
+            var targetId = c.ExistingServerId ?? c.Id;
             foreach (var fromId in c.DiscoveredLinksFrom)
             {
-                if (fromId == c.Id || !knownIds.Contains(fromId)) continue;
-                if (snapshot.Links.Any(l => l.FromServerId == fromId && l.ToServerId == c.Id)) continue;
+                if (fromId == targetId || !knownIds.Contains(fromId)) continue;
+                if (snapshot.Links.Any(l => l.FromServerId == fromId && l.ToServerId == targetId)) continue;
 
                 snapshot.Links.Add(new ServerLink
                 {
                     FromServerId = fromId,
-                    ToServerId = c.Id,
+                    ToServerId = targetId,
                     Discovered = true,
                     LastSuccessUtc = DateTimeOffset.UtcNow,
                     LastStrategy = "DirectTcpIp",
@@ -458,5 +459,38 @@ public static class SmartDiscoverySessionCreator
         }
 
         return snapshot;
+    }
+
+    public static void SyncDiscoveredLinks(
+        IReadOnlyCollection<(Guid FromServerId, Guid ToServerId)> snapshotPairs,
+        ManagerConfig draftConfig,
+        IEnumerable<DiscoveredServerCandidate> candidates,
+        ManagerConfig? liveConfig = null)
+    {
+        var remainingDraftPairs = draftConfig.Links
+            .Select(l => (l.FromServerId, l.ToServerId))
+            .ToHashSet();
+
+        var deletedPairs = snapshotPairs
+            .Where(pair => !remainingDraftPairs.Contains(pair))
+            .ToHashSet();
+
+        if (deletedPairs.Count == 0) return;
+
+        if (liveConfig != null)
+        {
+            liveConfig.Links.RemoveAll(l => deletedPairs.Contains((l.FromServerId, l.ToServerId)));
+        }
+
+        foreach (var c in candidates)
+        {
+            var cTargetId = c.ExistingServerId ?? c.Id;
+            c.DiscoveredLinksFrom.RemoveAll(fromId => deletedPairs.Contains((fromId, cTargetId)));
+
+            if (c.RequiredPreviousServerId.HasValue && deletedPairs.Contains((c.RequiredPreviousServerId.Value, cTargetId)))
+            {
+                c.RequiredPreviousServerId = null;
+            }
+        }
     }
 }

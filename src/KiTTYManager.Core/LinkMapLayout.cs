@@ -39,7 +39,7 @@ public static class LinkMapLayout
 
     public static LinkMapModel Build(ManagerConfig config, IEnumerable<ServerLink>? links = null)
     {
-        var servers = config.AllServers().ToDictionary(server => server.Id);
+        var servers = config.AllServers().DistinctBy(server => server.Id).ToDictionary(server => server.Id);
         var edges = (links ?? config.Links)
             .Where(link => link.FromServerId != link.ToServerId &&
                            servers.ContainsKey(link.FromServerId) &&

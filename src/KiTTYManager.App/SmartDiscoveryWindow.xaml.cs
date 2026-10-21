@@ -637,56 +637,31 @@ public partial class SmartDiscoveryWindow : Window
 
     private void CandidateLinks_Click(object sender, RoutedEventArgs e)
     {
+        if (isScanning) return;
         if ((sender as FrameworkElement)?.DataContext is not DiscoveredServerCandidate candidate) return;
 
-        var draftUngrouped = new List<ManagedServer>(LiveConfig.UngroupedServers);
-        foreach (var c in discoveredCandidates)
+        try
         {
-            if (!draftUngrouped.Any(s => s.Id == c.Id))
-            {
-                draftUngrouped.Add(new ManagedServer
-                {
-                    Id = c.Id,
-                    Name = c.ProposedName,
-                    Host = c.Host,
-                    Port = c.Port
-                });
-            }
+            var draftConfig = SmartDiscoverySessionCreator.CreatePreviewConfig(LiveConfig, discoveredCandidates.ToList());
+            var targetId = candidate.ExistingServerId ?? candidate.Id;
+            var draftServer = draftConfig.FindServer(targetId);
+            if (draftServer == null) return;
+
+            var snapshotPairs = draftConfig.Links
+                .Select(l => (l.FromServerId, l.ToServerId))
+                .ToHashSet();
+
+            var dialog = new SavedLinksDialog(draftConfig, draftServer) { Owner = this };
+            dialog.ShowDialog();
+
+            // Sync back only explicitly deleted links across all candidates and live config
+            SmartDiscoverySessionCreator.SyncDiscoveredLinks(snapshotPairs, draftConfig, discoveredCandidates, LiveConfig);
         }
-
-        var draftConfig = new ManagerConfig
+        catch (Exception ex)
         {
-            Groups = LiveConfig.Groups,
-            UngroupedServers = draftUngrouped,
-            Links = new List<ServerLink>(LiveConfig.Links)
-        };
-
-        var draftServer = draftUngrouped.First(s => s.Id == candidate.Id);
-
-        foreach (var fromId in candidate.DiscoveredLinksFrom)
-        {
-            if (!draftConfig.Links.Any(l => l.FromServerId == fromId && l.ToServerId == candidate.Id))
-            {
-                draftConfig.Links.Add(new ServerLink
-                {
-                    FromServerId = fromId,
-                    ToServerId = candidate.Id,
-                    Discovered = true,
-                    LastSuccessUtc = DateTimeOffset.UtcNow,
-                    LastStrategy = "DirectTcpIp"
-                });
-            }
+            ThemedMessageDialog.Show(this, $"Не удалось открыть связи: {ex.Message}",
+                "Связи", MessageBoxButton.OK, MessageBoxImage.Error);
         }
-
-        var dialog = new SavedLinksDialog(draftConfig, draftServer) { Owner = this };
-        dialog.ShowDialog();
-
-        // Sync back remaining links
-        candidate.DiscoveredLinksFrom = draftConfig.Links
-            .Where(l => l.ToServerId == candidate.Id && l.LastSuccessUtc != null)
-            .Select(l => l.FromServerId)
-            .Distinct()
-            .ToList();
     }
 
     private async void CandidatesGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)

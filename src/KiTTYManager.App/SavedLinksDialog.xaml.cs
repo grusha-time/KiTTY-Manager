@@ -224,7 +224,8 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
         var byId = normalized.ToDictionary(node => node.ServerId);
         foreach (var edge in edges)
         {
-            var from = byId[edge.ServerAId]; var to = byId[edge.ServerBId];
+            if (!byId.TryGetValue(edge.ServerAId, out var from) || !byId.TryGetValue(edge.ServerBId, out var to))
+                continue;
             var tooltip = LinkMapWindow.EdgeTooltip(edge, from.Name, to.Name);
             var x1 = from.X + LinkMapWindow.NodeWidth / 2;
             var y1 = from.Y + LinkMapWindow.NodeHeight / 2;
