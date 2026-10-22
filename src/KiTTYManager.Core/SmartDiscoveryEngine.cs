@@ -14,7 +14,7 @@ public interface IDiscoveryGatewaySession : IAsyncDisposable, IDisposable
 {
     Task<bool> ProbeReachabilityAsync(string host, int port, TimeSpan timeout, CancellationToken cancellationToken);
     Task<IReadOnlyDictionary<string, bool>> ProbeBatchReachabilityAsync(IReadOnlyList<string> hosts, int port, TimeSpan timeout, CancellationToken cancellationToken);
-    Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(ManagedServer target, IReadOnlyList<string> candidatePasswords, TimeSpan timeout, CancellationToken cancellationToken);
+    Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(ManagedServer target, IReadOnlyList<string> candidatePasswords, TimeSpan timeout, CancellationToken cancellationToken, int attemptsPerPassword = 1);
 }
 
 public interface ISmartDiscoveryProbe
@@ -25,7 +25,8 @@ public interface ISmartDiscoveryProbe
     Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
         BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
         ManagedServer target, IReadOnlyList<string> candidatePasswords,
-        TimeSpan timeout, CancellationToken cancellationToken);
+        TimeSpan timeout, CancellationToken cancellationToken,
+        int attemptsPerPassword = 1);
 
     Task<bool> ProbeHopReachabilityAsync(
         BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
@@ -315,7 +316,8 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
     public virtual async Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
         BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
         ManagedServer target, IReadOnlyList<string> candidatePasswords,
-        TimeSpan timeout, CancellationToken cancellationToken)
+        TimeSpan timeout, CancellationToken cancellationToken,
+        int attemptsPerPassword = 1)
     {
         var hostKeyRejected = false;
         string? rejectedFingerprint = null;
@@ -361,7 +363,8 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
 
             // Probe privilege escalation asynchronously
             var escalation = await ProbePrivilegeEscalationAsync(
-                route.Client, target.Username, target.Password, candidatePasswords, timeout, cancellationToken).ConfigureAwait(false);
+                route.Client, target.Username, target.Password, candidatePasswords, timeout, cancellationToken,
+                attemptsPerPassword).ConfigureAwait(false);
 
             return SmartDiscoveryAuthResult.Succeeded(
                 firstLine,
@@ -508,11 +511,13 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
 
         public async Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
             ManagedServer target, IReadOnlyList<string> candidatePasswords,
-            TimeSpan timeout, CancellationToken cancellationToken)
+            TimeSpan timeout, CancellationToken cancellationToken,
+            int attemptsPerPassword = 1)
         {
             var probe = new DefaultSmartDiscoveryProbe(autoConfirmHostKeys, hostKeyVerifier);
             return await probe.AuthenticateAndProbeAsync(
-                socksProxy, [], target, candidatePasswords, timeout, cancellationToken).ConfigureAwait(false);
+                socksProxy, [], target, candidatePasswords, timeout, cancellationToken,
+                attemptsPerPassword).ConfigureAwait(false);
         }
 
         public void Dispose()
@@ -535,8 +540,11 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
         Func<string, TimeSpan, CancellationToken, Task<(int ExitStatus, string Result)>> runCommand,
         Func<string, string, string, TimeSpan, CancellationToken, Task<(bool Success, string Method, string Command, string Password)>> tryPasswordEscalation,
         string username, string loginPassword, IReadOnlyList<string> candidatePasswords,
-        TimeSpan timeout, CancellationToken cancellationToken)
+        TimeSpan timeout, CancellationToken cancellationToken,
+        int attemptsPerPassword = 1)
     {
+        var attempts = Math.Max(1, attemptsPerPassword);
+
         // 1. Check existing root
         var (idExit, idRes) = await runCommand("id -u 2>/dev/null", timeout, cancellationToken).ConfigureAwait(false);
         if (idExit == 0 && idRes.Trim() == "0")
@@ -556,35 +564,41 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
         // 2. First priority: su - (su -c 'id') password guessing (other passwords first, login password second)
         foreach (var pw in otherPasswords)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var (success, method, cmd, pass) = await tryPasswordEscalation("su", pw, "root", timeout, cancellationToken).ConfigureAwait(false);
-            if (success)
+            for (var attempt = 0; attempt < attempts; attempt++)
             {
-                return new PrivilegeEscalationResult
+                cancellationToken.ThrowIfCancellationRequested();
+                var (success, method, cmd, pass) = await tryPasswordEscalation("su", pw, "root", timeout, cancellationToken).ConfigureAwait(false);
+                if (success)
                 {
-                    Method = method,
-                    RootCommand = cmd,
-                    RootPassword = pass,
-                    StatusDescription = $"Повышение через {method} (пароль root) подтверждено",
-                    Success = true
-                };
+                    return new PrivilegeEscalationResult
+                    {
+                        Method = method,
+                        RootCommand = cmd,
+                        RootPassword = pass,
+                        StatusDescription = $"Повышение через {method} (пароль root) подтверждено",
+                        Success = true
+                    };
+                }
             }
         }
 
         if (!string.IsNullOrEmpty(loginPassword))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var (success, method, cmd, pass) = await tryPasswordEscalation("su", loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
-            if (success)
+            for (var attempt = 0; attempt < attempts; attempt++)
             {
-                return new PrivilegeEscalationResult
+                cancellationToken.ThrowIfCancellationRequested();
+                var (success, method, cmd, pass) = await tryPasswordEscalation("su", loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
+                if (success)
                 {
-                    Method = method,
-                    RootCommand = cmd,
-                    RootPassword = pass,
-                    StatusDescription = $"Повышение через {method} (пароль пользователя) подтверждено",
-                    Success = true
-                };
+                    return new PrivilegeEscalationResult
+                    {
+                        Method = method,
+                        RootCommand = cmd,
+                        RootPassword = pass,
+                        StatusDescription = $"Повышение через {method} (пароль пользователя) подтверждено",
+                        Success = true
+                    };
+                }
             }
         }
 
@@ -606,35 +620,41 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
         // 3b. sudo -i password guessing (other passwords first, login password second)
         foreach (var pw in otherPasswords)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var (success, method, cmd, pass) = await tryPasswordEscalation("sudo", pw, "root", timeout, cancellationToken).ConfigureAwait(false);
-            if (success)
+            for (var attempt = 0; attempt < attempts; attempt++)
             {
-                return new PrivilegeEscalationResult
+                cancellationToken.ThrowIfCancellationRequested();
+                var (success, method, cmd, pass) = await tryPasswordEscalation("sudo", pw, "root", timeout, cancellationToken).ConfigureAwait(false);
+                if (success)
                 {
-                    Method = method,
-                    RootCommand = cmd,
-                    RootPassword = pass,
-                    StatusDescription = $"Повышение через {method} (пароль root) подтверждено",
-                    Success = true
-                };
+                    return new PrivilegeEscalationResult
+                    {
+                        Method = method,
+                        RootCommand = cmd,
+                        RootPassword = pass,
+                        StatusDescription = $"Повышение через {method} (пароль root) подтверждено",
+                        Success = true
+                    };
+                }
             }
         }
 
         if (!string.IsNullOrEmpty(loginPassword))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var (success, method, cmd, pass) = await tryPasswordEscalation("sudo", loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
-            if (success)
+            for (var attempt = 0; attempt < attempts; attempt++)
             {
-                return new PrivilegeEscalationResult
+                cancellationToken.ThrowIfCancellationRequested();
+                var (success, method, cmd, pass) = await tryPasswordEscalation("sudo", loginPassword, "пользователя", timeout, cancellationToken).ConfigureAwait(false);
+                if (success)
                 {
-                    Method = method,
-                    RootCommand = cmd,
-                    RootPassword = pass,
-                    StatusDescription = $"Повышение через {method} (пароль пользователя) подтверждено",
-                    Success = true
-                };
+                    return new PrivilegeEscalationResult
+                    {
+                        Method = method,
+                        RootCommand = cmd,
+                        RootPassword = pass,
+                        StatusDescription = $"Повышение через {method} (пароль пользователя) подтверждено",
+                        Success = true
+                    };
+                }
             }
         }
 
@@ -651,7 +671,8 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
 
     private static async Task<PrivilegeEscalationResult> ProbePrivilegeEscalationAsync(
         SshClient client, string username, string loginPassword,
-        IReadOnlyList<string> candidatePasswords, TimeSpan timeout, CancellationToken cancellationToken)
+        IReadOnlyList<string> candidatePasswords, TimeSpan timeout, CancellationToken cancellationToken,
+        int attemptsPerPassword = 1)
     {
         return await ProbePrivilegeEscalationCoreAsync(
             (cmd, to, ct) => RunCommandAsync(client, cmd, to, ct),
@@ -660,7 +681,8 @@ public class DefaultSmartDiscoveryProbe : ISmartDiscoveryProbe
                 var res = await TryPasswordEscalationAsync(client, method, pw, label, to, ct).ConfigureAwait(false);
                 return (res.Success, res.Method, res.RootCommand, res.RootPassword);
             },
-            username, loginPassword, candidatePasswords, timeout, cancellationToken).ConfigureAwait(false);
+            username, loginPassword, candidatePasswords, timeout, cancellationToken,
+            attemptsPerPassword).ConfigureAwait(false);
     }
 
     private static async Task<PrivilegeEscalationResult> TryPasswordEscalationAsync(
@@ -808,6 +830,8 @@ public sealed class SmartDiscoveryEngine
     private readonly IReadOnlyList<DiscoveredServerCandidate>? initialGateways;
     private readonly Func<ManagedServer, string, bool>? hostKeyVerifier;
     private readonly Action<string>? log;
+    private readonly IProgress<DiscoveredServerCandidate>? candidateProgress;
+    private readonly IProgress<ProblematicServerCandidate>? problemProgress;
     private readonly Func<BaseProxy, CancellationToken, Task<bool>>? ensureEntryPoint;
     private readonly object entryPointReadinessLock = new();
     private readonly Dictionary<Guid, Task<bool>> entryPointReadiness = [];
@@ -820,16 +844,20 @@ public sealed class SmartDiscoveryEngine
         IReadOnlyList<DiscoveredServerCandidate>? initialGateways = null,
         Func<ManagedServer, string, bool>? hostKeyVerifier = null,
         Action<string>? log = null,
-        Func<BaseProxy, CancellationToken, Task<bool>>? ensureEntryPoint = null)
+        Func<BaseProxy, CancellationToken, Task<bool>>? ensureEntryPoint = null,
+        IProgress<DiscoveredServerCandidate>? candidateProgress = null,
+        IProgress<ProblematicServerCandidate>? problemProgress = null)
     {
         this.config = config;
         this.options = options;
         this.hostKeyVerifier = hostKeyVerifier;
         this.probe = probe ?? new DefaultSmartDiscoveryProbe(config.AutoConfirmHostKeys, hostKeyVerifier);
         this.progress = progress;
-        this.initialGateways = initialGateways;
+        this.initialGateways = initialGateways?.Select(CloneCandidate).ToList();
         this.log = log;
         this.ensureEntryPoint = ensureEntryPoint;
+        this.candidateProgress = candidateProgress;
+        this.problemProgress = problemProgress;
     }
 
     public async Task<SmartDiscoveryResult> DiscoverAsync(CancellationToken cancellationToken = default)
@@ -911,6 +939,7 @@ public sealed class SmartDiscoveryEngine
                     };
 
                     discovered.Add(dupCandidate);
+                    candidateProgress?.Report(CloneCandidate(dupCandidate));
                     reservedNames.Add(existingServer.Name);
                     Log($"Хост {host}: найден дубль существующей сессии \"{existingServer.Name}\" (пользователь {u}).");
                 }
@@ -1001,6 +1030,7 @@ public sealed class SmartDiscoveryEngine
                         if (candidate != null)
                         {
                             discovered.Add(candidate);
+                            candidateProgress?.Report(CloneCandidate(candidate));
                             reservedNames.Add(candidate.ProposedName);
                             // Prioritize confirmed credential
                             confirmedCredentials.RemoveAll(c => c.User == candidate.Username && c.Pass == candidate.Password);
@@ -1018,6 +1048,7 @@ public sealed class SmartDiscoveryEngine
                             else
                             {
                                 problematic.Add(problem);
+                                problemProgress?.Report(problem);
                                 ReportProgress(SmartDiscoveryProgressKind.HostFailed, host, $"Ошибка: {problem.Reason}", discovered.Count, problematic.Count, totalCount, CalculatePercentage(discovered.Count, problematic.Count, totalCount));
                                 Log($"Хост {host}: ошибка на этапе \"{problem.Stage}\".");
                             }
@@ -1073,7 +1104,7 @@ public sealed class SmartDiscoveryEngine
                             {
                                 if (nonRetryableOnThisGateway.Contains(targetHost))
                                     continue;
-                                if (hostAttempts.TryGetValue(targetHost, out var att) && att >= options.MaxAttemptsPerHost)
+                                if (options.MaxAttemptsPerHost > 0 && hostAttempts.TryGetValue(targetHost, out var att) && att >= options.MaxAttemptsPerHost)
                                     continue;
                                 if (gateway.RouteHops.Any(h => string.Equals(h.Host, targetHost, StringComparison.OrdinalIgnoreCase)))
                                     continue;
@@ -1117,7 +1148,7 @@ public sealed class SmartDiscoveryEngine
                                 {
                                     if (!hostsToProbe.Contains(targetHost, StringComparer.OrdinalIgnoreCase))
                                         continue;
-                                    if (hostAttempts.TryGetValue(targetHost, out var used) && used >= options.MaxAttemptsPerHost)
+                                    if (options.MaxAttemptsPerHost > 0 && hostAttempts.TryGetValue(targetHost, out var used) && used >= options.MaxAttemptsPerHost)
                                         continue;
                                 }
 
@@ -1151,6 +1182,7 @@ public sealed class SmartDiscoveryEngine
                                     lock (syncLock)
                                     {
                                         discovered.Add(candidate);
+                                        candidateProgress?.Report(CloneCandidate(candidate));
                                         reservedNames.Add(candidate.ProposedName);
                                         if (!candidate.IsDuplicate || routeMap.ContainsKey(candidate.Id))
                                         {
@@ -1265,6 +1297,7 @@ public sealed class SmartDiscoveryEngine
                         }
                     }
                     problematic.Add(prob);
+                    problemProgress?.Report(prob);
                 }
             }
             else
@@ -1327,6 +1360,7 @@ public sealed class SmartDiscoveryEngine
                         }
                     }
                     problematic.Add(prob);
+                    problemProgress?.Report(prob);
                 }
             }
 
@@ -1374,7 +1408,8 @@ public sealed class SmartDiscoveryEngine
             }
             var targetUsers = (overrideUsernames != null && overrideUsernames.Count > 0) ? overrideUsernames : usernames;
             var orderedCredentials = GetPrioritizedCredentials(targetUsers, passwords, confirmedSnapshot);
-            var maxAttempts = Math.Max(1, options.MaxAttemptsPerHost);
+            var maxAttempts = options.MaxAttemptsPerHost;
+            var attemptsPerPassword = Math.Max(1, options.AttemptsPerPassword);
             string lastReason = "Не удалось подобрать учётные данные";
             string currentStage = "Аутентификация";
 
@@ -1382,148 +1417,163 @@ public sealed class SmartDiscoveryEngine
             {
                 ct.ThrowIfCancellationRequested();
                 var stopAll = false;
-                var allUnreachable = true;
+                var allUnreachable = false;
 
-                IReadOnlyList<BaseProxy?> attemptEntryPoints = lockEntryPoint
-                    ? new BaseProxy?[] { entryPoint }
-                    : ResolveAttemptEntryPoints(entryPoint);
-                foreach (var attemptEntryPoint in attemptEntryPoints)
+                for (var attemptIndex = 0; attemptIndex < attemptsPerPassword; attemptIndex++)
                 {
-                    if (attemptEntryPoint != null && !await EnsureEntryPointReadyAsync(attemptEntryPoint, ct).ConfigureAwait(false))
-                        continue;
+                    ct.ThrowIfCancellationRequested();
+                    var reachedAny = false;
 
-                    lock (syncLock)
+                    IReadOnlyList<BaseProxy?> attemptEntryPoints = lockEntryPoint
+                        ? new BaseProxy?[] { entryPoint }
+                        : ResolveAttemptEntryPoints(entryPoint);
+                    foreach (var attemptEntryPoint in attemptEntryPoints)
                     {
-                        if (hostAttempts.TryGetValue(host, out var currentAttempts) && currentAttempts >= maxAttempts)
+                        if (attemptEntryPoint != null && !await EnsureEntryPointReadyAsync(attemptEntryPoint, ct).ConfigureAwait(false))
+                            continue;
+
+                        lock (syncLock)
                         {
-                            lastReason = $"Превышен лимит попыток подбора ({maxAttempts}) для узла {host}";
+                            if (maxAttempts > 0 && hostAttempts.TryGetValue(host, out var currentAttempts) && currentAttempts >= maxAttempts)
+                            {
+                                lastReason = $"Превышен лимит попыток подбора ({maxAttempts}) для узла {host}";
+                                stopAll = true;
+                                break;
+                            }
+                        }
+
+                        var targetServer = new ManagedServer
+                        {
+                            Host = host,
+                            Port = 22,
+                            Username = u,
+                            Password = p,
+                            UseKeyboardInteractive = true
+                        };
+
+                        var result = gatewaySession != null
+                            ? await gatewaySession.AuthenticateAndProbeAsync(
+                                targetServer, options.Passwords, options.Timeout, ct,
+                                attemptsPerPassword).ConfigureAwait(false)
+                            : await probe.AuthenticateAndProbeAsync(
+                                attemptEntryPoint, intermediateGateways, targetServer, options.Passwords, options.Timeout, ct,
+                                attemptsPerPassword).ConfigureAwait(false);
+
+                        if (result.Success)
+                        {
+                            reachedAny = true;
+                            lock (syncLock)
+                            {
+                                hostAttempts.TryGetValue(host, out var used);
+                                hostAttempts[host] = used + 1;
+                            }
+
+                            var candidateId = Guid.NewGuid();
+                            string proposedName;
+                            lock (syncLock)
+                            {
+                                proposedName = SmartSessionNameGenerator.ProposeName(
+                                    result.Hostname, host, config, options.TargetGroupId, options.TargetSubgroupName, reservedNames);
+                                reservedNames.Add(proposedName);
+                            }
+
+                            var hops = new List<RouteHop>(hopHops)
+                            {
+                                new RouteHop(Guid.NewGuid(), proposedName, host, 22)
+                            };
+
+                            var existingServer = config.AllServers().FirstOrDefault(s =>
+                                (s.Port <= 0 || s.Port == 22) &&
+                                string.Equals((s.Host ?? "").Trim(), host, StringComparison.OrdinalIgnoreCase) &&
+                                string.Equals(s.Username, u, StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(s.Username));
+                            var isDuplicate = existingServer is not null;
+
+                            var (rootGroupName, subgroupPath) =
+                                SmartDiscoverySessionCreator.ResolveGroupAssignment(config, options.TargetGroupId, options.TargetSubgroupName);
+
+                            var discoveredLinksFrom = new List<Guid>();
+                            if (previousServerId.HasValue)
+                            {
+                                discoveredLinksFrom.Add(previousServerId.Value);
+                            }
+                            else if (attemptEntryPoint?.StartupServerId is Guid startupId &&
+                                     startupId != candidateId && config.FindServer(startupId) is not null)
+                            {
+                                discoveredLinksFrom.Add(startupId);
+                            }
+
+                            var candidate = new DiscoveredServerCandidate
+                            {
+                                Id = isDuplicate ? existingServer!.Id : candidateId,
+                                Host = host,
+                                Port = 22,
+                                Hostname = result.Hostname,
+                                ProposedName = proposedName,
+                                GroupId = options.TargetGroupId,
+                                GroupName = rootGroupName,
+                                SubgroupName = subgroupPath,
+                                Username = u,
+                                Password = p,
+                                PrivilegeEscalation = result.Escalation ?? new(),
+                                RouteHops = hops,
+                                DiscoveredLinksFrom = discoveredLinksFrom,
+                                RequiredPreviousServerId = previousServerId,
+                                ExistingServerId = existingServer?.Id,
+                                VerifiedProxyId = attemptEntryPoint?.Id,
+                                HostKeyFingerprint = result.HostKeyFingerprint,
+                                HostKeyAlgorithm = result.HostKeyAlgorithm,
+                                HostKeyBits = result.HostKeyBits,
+                                StatusMessage = isDuplicate
+                                    ? "Дубль: сессия с таким хостом уже существует"
+                                    : intermediateGateways.Count > 0 ? "Обнаружен через шлюз" : "Готов к созданию",
+                                IsDuplicate = isDuplicate,
+                                IsSelected = !isDuplicate
+                            };
+
+                            Log($"Хост {host}: вход выполнен (пользователь {u}) через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}; повышение прав: {result.Escalation?.StatusDescription ?? "не подтверждено"}.");
+                            return (candidate, null);
+                        }
+
+                        if (result.IsHostKeyRejected)
+                        {
+                            reachedAny = true;
+                            lock (syncLock)
+                            {
+                                hostAttempts.TryGetValue(host, out var used);
+                                hostAttempts[host] = used + 1;
+                            }
+                            Log($"Хост {host}: host key отклонён через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
+                            currentStage = "HostKey";
+                            lastReason = result.ErrorMessage;
                             stopAll = true;
                             break;
                         }
+                        else if (result.IsAuthFailure)
+                        {
+                            reachedAny = true;
+                            lock (syncLock)
+                            {
+                                hostAttempts.TryGetValue(host, out var used);
+                                hostAttempts[host] = used + 1;
+                            }
+                            Log($"Хост {host}: вход (пользователь {u}) не удался через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)} (аутентификация).");
+                            currentStage = "Аутентификация";
+                            lastReason = $"Неверный логин или пароль: {result.ErrorMessage}";
+                            break;
+                        }
+                        else if (result.IsUnreachable)
+                        {
+                            Log($"Хост {host}: соединение (пользователь {u}) недоступно через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
+                            currentStage = "Доступность";
+                            lastReason = $"Сбой соединения: {result.ErrorMessage}";
+                        }
                     }
 
-                    var targetServer = new ManagedServer
+                    if (stopAll) break;
+                    if (!reachedAny)
                     {
-                        Host = host,
-                        Port = 22,
-                        Username = u,
-                        Password = p,
-                        UseKeyboardInteractive = true
-                    };
-
-                    var result = gatewaySession != null
-                        ? await gatewaySession.AuthenticateAndProbeAsync(
-                            targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false)
-                        : await probe.AuthenticateAndProbeAsync(
-                            attemptEntryPoint, intermediateGateways, targetServer, options.Passwords, options.Timeout, ct).ConfigureAwait(false);
-
-                    if (result.Success)
-                    {
-                        allUnreachable = false;
-                        lock (syncLock)
-                        {
-                            hostAttempts.TryGetValue(host, out var used);
-                            hostAttempts[host] = used + 1;
-                        }
-
-                        var candidateId = Guid.NewGuid();
-                        string proposedName;
-                        lock (syncLock)
-                        {
-                            proposedName = SmartSessionNameGenerator.ProposeName(
-                                result.Hostname, host, config, options.TargetGroupId, options.TargetSubgroupName, reservedNames);
-                            reservedNames.Add(proposedName);
-                        }
-
-                        var hops = new List<RouteHop>(hopHops)
-                        {
-                            new RouteHop(Guid.NewGuid(), proposedName, host, 22)
-                        };
-
-                        var existingServer = config.AllServers().FirstOrDefault(s =>
-                            (s.Port <= 0 || s.Port == 22) &&
-                            string.Equals((s.Host ?? "").Trim(), host, StringComparison.OrdinalIgnoreCase) &&
-                            string.Equals(s.Username, u, StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(s.Username));
-                        var isDuplicate = existingServer is not null;
-
-                        var (rootGroupName, subgroupPath) =
-                            SmartDiscoverySessionCreator.ResolveGroupAssignment(config, options.TargetGroupId, options.TargetSubgroupName);
-
-                        var discoveredLinksFrom = new List<Guid>();
-                        if (previousServerId.HasValue)
-                        {
-                            discoveredLinksFrom.Add(previousServerId.Value);
-                        }
-                        else if (attemptEntryPoint?.StartupServerId is Guid startupId &&
-                                 startupId != candidateId && config.FindServer(startupId) is not null)
-                        {
-                            discoveredLinksFrom.Add(startupId);
-                        }
-
-                        var candidate = new DiscoveredServerCandidate
-                        {
-                            Id = isDuplicate ? existingServer!.Id : candidateId,
-                            Host = host,
-                            Port = 22,
-                            Hostname = result.Hostname,
-                            ProposedName = proposedName,
-                            GroupId = options.TargetGroupId,
-                            GroupName = rootGroupName,
-                            SubgroupName = subgroupPath,
-                            Username = u,
-                            Password = p,
-                            PrivilegeEscalation = result.Escalation ?? new(),
-                            RouteHops = hops,
-                            DiscoveredLinksFrom = discoveredLinksFrom,
-                            RequiredPreviousServerId = previousServerId,
-                            ExistingServerId = existingServer?.Id,
-                            VerifiedProxyId = attemptEntryPoint?.Id,
-                            HostKeyFingerprint = result.HostKeyFingerprint,
-                            HostKeyAlgorithm = result.HostKeyAlgorithm,
-                            HostKeyBits = result.HostKeyBits,
-                            StatusMessage = isDuplicate
-                                ? "Дубль: сессия с таким хостом уже существует"
-                                : intermediateGateways.Count > 0 ? "Обнаружен через шлюз" : "Готов к созданию",
-                            IsDuplicate = isDuplicate,
-                            IsSelected = !isDuplicate
-                        };
-
-                        Log($"Хост {host}: вход выполнен (пользователь {u}) через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}; повышение прав: {result.Escalation?.StatusDescription ?? "не подтверждено"}.");
-                        return (candidate, null);
-                    }
-
-                    if (result.IsHostKeyRejected)
-                    {
-                        allUnreachable = false;
-                        lock (syncLock)
-                        {
-                            hostAttempts.TryGetValue(host, out var used);
-                            hostAttempts[host] = used + 1;
-                        }
-                        Log($"Хост {host}: host key отклонён через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
-                        currentStage = "HostKey";
-                        lastReason = result.ErrorMessage;
-                        stopAll = true;
+                        allUnreachable = true;
                         break;
-                    }
-                    else if (result.IsAuthFailure)
-                    {
-                        allUnreachable = false;
-                        lock (syncLock)
-                        {
-                            hostAttempts.TryGetValue(host, out var used);
-                            hostAttempts[host] = used + 1;
-                        }
-                        Log($"Хост {host}: вход (пользователь {u}) не удался через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)} (аутентификация).");
-                        currentStage = "Аутентификация";
-                        lastReason = $"Неверный логин или пароль: {result.ErrorMessage}";
-                        break;
-                    }
-                    else if (result.IsUnreachable)
-                    {
-                        Log($"Хост {host}: соединение (пользователь {u}) недоступно через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
-                        currentStage = "Доступность";
-                        lastReason = $"Сбой соединения: {result.ErrorMessage}";
                     }
                 }
 
@@ -1571,11 +1621,13 @@ public sealed class SmartDiscoveryEngine
             Timeout = updatedOptions.Timeout,
             EndpointProbeTimeout = updatedOptions.EndpointProbeTimeout,
             PreferGroupGateways = updatedOptions.PreferGroupGateways,
-            InitialGatewayServerId = updatedOptions.InitialGatewayServerId
+            InitialGatewayServerId = updatedOptions.InitialGatewayServerId,
+            AttemptsPerPassword = updatedOptions.AttemptsPerPassword
         };
 
         var retryEngine = new SmartDiscoveryEngine(
-            config, retryOptions, probe, progress, existingGateways, hostKeyVerifier, log, ensureEntryPoint);
+            config, retryOptions, probe, progress, existingGateways, hostKeyVerifier, log, ensureEntryPoint,
+            candidateProgress, problemProgress);
         Log($"Повтор проверки: {retryHosts.Count} хостов.");
         var result = await retryEngine.DiscoverAsync(cancellationToken).ConfigureAwait(false);
         Log($"Повтор проверки завершён: найдено {result.Discovered.Count}, проблемных {result.Problematic.Count}.");
@@ -1733,6 +1785,42 @@ public sealed class SmartDiscoveryEngine
 
         return result;
     }
+
+    public static DiscoveredServerCandidate CloneCandidate(DiscoveredServerCandidate c) =>
+        new()
+        {
+            Id = c.Id,
+            Host = c.Host,
+            Port = c.Port,
+            Hostname = c.Hostname,
+            ProposedName = c.ProposedName,
+            GroupId = c.GroupId,
+            GroupName = c.GroupName,
+            SubgroupName = c.SubgroupName,
+            Username = c.Username,
+            Password = c.Password,
+            ShowPassword = c.ShowPassword,
+            ShowRootPassword = c.ShowRootPassword,
+            PrivilegeEscalation = new PrivilegeEscalationResult
+            {
+                Method = c.PrivilegeEscalation.Method,
+                RootCommand = c.PrivilegeEscalation.RootCommand,
+                RootPassword = c.PrivilegeEscalation.RootPassword,
+                StatusDescription = c.PrivilegeEscalation.StatusDescription,
+                Success = c.PrivilegeEscalation.Success
+            },
+            RouteHops = [.. c.RouteHops],
+            DiscoveredLinksFrom = [.. c.DiscoveredLinksFrom],
+            RequiredPreviousServerId = c.RequiredPreviousServerId,
+            ExistingServerId = c.ExistingServerId,
+            VerifiedProxyId = c.VerifiedProxyId,
+            StatusMessage = c.StatusMessage,
+            IsSelected = c.IsSelected,
+            IsDuplicate = c.IsDuplicate,
+            HostKeyFingerprint = c.HostKeyFingerprint,
+            HostKeyAlgorithm = c.HostKeyAlgorithm,
+            HostKeyBits = c.HostKeyBits
+        };
 
     private static ManagedServer CandidateToServer(DiscoveredServerCandidate candidate) =>
         new()
@@ -1973,9 +2061,10 @@ public sealed class SmartDiscoveryEngine
             }
 
             chain.Insert(0, CandidateToServer(current));
-            if (current.RequiredPreviousServerId.HasValue)
+            var reqPrev = current.RequiredPreviousServerId;
+            if (reqPrev.HasValue)
             {
-                var previousId = current.RequiredPreviousServerId.Value;
+                var previousId = reqPrev.Value;
                 if (savedRouteByGatewayId.TryGetValue(previousId, out var savedDependency))
                 {
                     chain.InsertRange(0, savedDependency.Servers);

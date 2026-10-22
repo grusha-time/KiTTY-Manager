@@ -181,20 +181,30 @@
 
         <!-- Secondary options row -->
         <Grid Margin="0,10,0,0">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="*"/>
           </Grid.ColumnDefinitions>
 
-          <CheckBox x:Name="PreferGroupGatewaysCheckBox" Grid.Column="0"
+          <CheckBox x:Name="PreferGroupGatewaysCheckBox" Grid.Row="0" Grid.Column="0"
                     Content="Сначала через независимые серверы группы"
                     IsChecked="True" VerticalAlignment="Center" Margin="0,0,24,0"
                     ToolTip="При указании целевой группы сначала пробовать подключение через её независимые серверы-шлюзы"/>
 
-          <TextBlock Grid.Column="1" Text="Стартовая сессия:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <ComboBox x:Name="InitialGatewaySessionComboBox" Grid.Column="2"
+          <TextBlock Grid.Row="0" Grid.Column="1" Text="Стартовая сессия:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+          <ComboBox x:Name="InitialGatewaySessionComboBox" Grid.Row="0" Grid.Column="2"
                     ToolTip="Сессия, которая будет опробована в качестве первого шлюза с наивысшим приоритетом"/>
+
+          <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,8,24,0" VerticalAlignment="Center">
+            <TextBlock Text="Попыток на 1 пароль:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox x:Name="AttemptsPerPasswordBox" Text="1" Width="50" VerticalAlignment="Center"
+                     ToolTip="Количество попыток ввода для каждого пароля перед переходом к следующему (минимум 1)"/>
+          </StackPanel>
         </Grid>
 
         <!-- Scan action buttons -->

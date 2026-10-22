@@ -28,6 +28,7 @@ public partial class SmartDiscoveryWindow : Window
     private CancellationTokenSource? scanCts;
     private bool isScanning;
     private bool isCreatingSessions;
+    private bool sessionsCreated;
     private bool passwordsMasked;
     private bool groupPickerCloseOnMouseUp;
     private string rawPasswords = "";
@@ -51,8 +52,19 @@ public partial class SmartDiscoveryWindow : Window
         this.previewCandidate = previewCandidate;
         this.buildLinksToExistingGroupServers = buildLinksToExistingGroupServers;
 
-        Closing += (_, _) =>
+        Closing += (sender, e) =>
         {
+            if (SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated, discoveredCandidates))
+            {
+                var result = ThemedMessageDialog.Show(this,
+                    SmartDiscoveryClosingPolicy.ConfirmationMessage,
+                    "Подтверждение", MessageBoxButton.YesNo, MessageBoxImage.Question);
+                if (result != MessageBoxResult.Yes)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+            }
             try { scanCts?.Cancel(); } catch { }
         };
 
@@ -341,6 +353,9 @@ public partial class SmartDiscoveryWindow : Window
 
     private void AddCandidateInOrder(DiscoveredServerCandidate candidate)
     {
+        if (discoveredCandidates.Any(c => c.Id == candidate.Id))
+            return;
+
         if (candidate.IsDuplicate)
         {
             discoveredCandidates.Add(candidate);
@@ -396,23 +411,50 @@ public partial class SmartDiscoveryWindow : Window
                 Timeout = TimeSpan.FromSeconds(LiveConfig.ConnectionTimeoutSeconds),
                 EndpointProbeTimeout = TimeSpan.FromSeconds(LiveConfig.EndpointProbeTimeoutSeconds),
                 PreferGroupGateways = PreferGroupGatewaysCheckBox.IsChecked == true,
-                InitialGatewayServerId = (InitialGatewaySessionComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?
+                InitialGatewayServerId = (InitialGatewaySessionComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?,
+                AttemptsPerPassword = ParseAttemptsPerPassword()
             };
 
             var progress = new Progress<SmartDiscoveryProgress>(UpdateProgressUi);
+            var candidateProgress = new Progress<DiscoveredServerCandidate>(cand =>
+            {
+                AddCandidateInOrder(cand);
+                UpdateCounts();
+            });
+            var problemProgress = new Progress<ProblematicServerCandidate>(prob =>
+            {
+                var existing = problematicCandidates.FirstOrDefault(p => string.Equals(p.Host, prob.Host, StringComparison.OrdinalIgnoreCase));
+                if (existing == null)
+                {
+                    problematicCandidates.Add(prob);
+                    UpdateCounts();
+                }
+                else
+                {
+                    var idx = problematicCandidates.IndexOf(existing);
+                    problematicCandidates[idx] = prob;
+                }
+            });
+
+            var engineConfig = ConfigTransfer.CloneSnapshot(LiveConfig);
             var engine = new SmartDiscoveryEngine(
-                LiveConfig, options, progress: progress, hostKeyVerifier: hostKeyVerifier,
-                log: ReportLog, ensureEntryPoint: ensureJumphost);
+                engineConfig, options, progress: progress, hostKeyVerifier: hostKeyVerifier,
+                log: ReportLog, ensureEntryPoint: ensureJumphost,
+                candidateProgress: candidateProgress, problemProgress: problemProgress);
 
             var result = await engine.DiscoverAsync(scanCts.Token).ConfigureAwait(true);
 
-            discoveredCandidates.Clear();
             foreach (var cand in result.Discovered)
-                AddCandidateInOrder(cand);
+            {
+                if (!discoveredCandidates.Any(c => c.Id == cand.Id))
+                    AddCandidateInOrder(SmartDiscoveryEngine.CloneCandidate(cand));
+            }
 
-            problematicCandidates.Clear();
             foreach (var prob in result.Problematic)
-                problematicCandidates.Add(prob);
+            {
+                if (!problematicCandidates.Any(p => string.Equals(p.Host, prob.Host, StringComparison.OrdinalIgnoreCase)))
+                    problematicCandidates.Add(prob);
+            }
 
             UpdateCounts();
             if (discoveredCandidates.Count > 0)
@@ -432,6 +474,7 @@ public partial class SmartDiscoveryWindow : Window
         finally
         {
             SetScanningState(false);
+            UpdateCounts();
         }
     }
 
@@ -476,20 +519,47 @@ public partial class SmartDiscoveryWindow : Window
                 Timeout = TimeSpan.FromSeconds(LiveConfig.ConnectionTimeoutSeconds),
                 EndpointProbeTimeout = TimeSpan.FromSeconds(LiveConfig.EndpointProbeTimeoutSeconds),
                 PreferGroupGateways = PreferGroupGatewaysCheckBox.IsChecked == true,
-                InitialGatewayServerId = (InitialGatewaySessionComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?
+                InitialGatewayServerId = (InitialGatewaySessionComboBox.SelectedItem as ComboBoxItem)?.Tag as Guid?,
+                AttemptsPerPassword = ParseAttemptsPerPassword()
             };
 
             var progress = new Progress<SmartDiscoveryProgress>(UpdateProgressUi);
+            var candidateProgress = new Progress<DiscoveredServerCandidate>(cand =>
+            {
+                AddCandidateInOrder(cand);
+                var existingProb = problematicCandidates.FirstOrDefault(p => string.Equals(p.Host, cand.Host, StringComparison.OrdinalIgnoreCase));
+                if (existingProb != null)
+                    problematicCandidates.Remove(existingProb);
+                UpdateCounts();
+            });
+            var problemProgress = new Progress<ProblematicServerCandidate>(stillProblem =>
+            {
+                var existingProb = problematicCandidates.FirstOrDefault(p => string.Equals(p.Host, stillProblem.Host, StringComparison.OrdinalIgnoreCase));
+                if (existingProb != null)
+                {
+                    var index = problematicCandidates.IndexOf(existingProb);
+                    problematicCandidates[index] = stillProblem;
+                }
+                else
+                {
+                    problematicCandidates.Add(stillProblem);
+                }
+                UpdateCounts();
+            });
+
+            var engineConfig = ConfigTransfer.CloneSnapshot(LiveConfig);
             var engine = new SmartDiscoveryEngine(
-                LiveConfig, options, progress: progress, initialGateways: discoveredCandidates.ToList(),
-                hostKeyVerifier: hostKeyVerifier, log: ReportLog, ensureEntryPoint: ensureJumphost);
+                engineConfig, options, progress: progress, initialGateways: discoveredCandidates.ToList(),
+                hostKeyVerifier: hostKeyVerifier, log: ReportLog, ensureEntryPoint: ensureJumphost,
+                candidateProgress: candidateProgress, problemProgress: problemProgress);
 
             var retryResult = await engine.RetryProblematicAsync(
                 selectedProblems, options, existingGateways: discoveredCandidates.ToList(), scanCts.Token).ConfigureAwait(true);
 
             foreach (var newlyFound in retryResult.Discovered)
             {
-                AddCandidateInOrder(newlyFound);
+                if (!discoveredCandidates.Any(c => c.Id == newlyFound.Id))
+                    AddCandidateInOrder(SmartDiscoveryEngine.CloneCandidate(newlyFound));
                 var existingProb = problematicCandidates.FirstOrDefault(p => string.Equals(p.Host, newlyFound.Host, StringComparison.OrdinalIgnoreCase));
                 if (existingProb != null)
                     problematicCandidates.Remove(existingProb);
@@ -503,7 +573,7 @@ public partial class SmartDiscoveryWindow : Window
                     var index = problematicCandidates.IndexOf(existingProb);
                     problematicCandidates[index] = stillProblem;
                 }
-                else
+                else if (!problematicCandidates.Any(p => string.Equals(p.Host, stillProblem.Host, StringComparison.OrdinalIgnoreCase)))
                 {
                     problematicCandidates.Add(stillProblem);
                 }
@@ -523,6 +593,7 @@ public partial class SmartDiscoveryWindow : Window
         finally
         {
             SetScanningState(false);
+            UpdateCounts();
         }
     }
 
@@ -542,8 +613,22 @@ public partial class SmartDiscoveryWindow : Window
         CreateSessionsButton.IsEnabled = !scanning && discoveredCandidates.Count > 0;
         HostsInputBox.IsEnabled = !scanning;
         LoginsInputBox.IsEnabled = !scanning;
+        PasswordsInputBox.IsEnabled = !scanning;
         JumpHostComboBox.IsEnabled = !scanning;
         TargetGroupBox.IsEnabled = !scanning;
+        TargetSubgroupBox.IsEnabled = !scanning;
+        ParallelismComboBox.IsEnabled = !scanning;
+        PreferGroupGatewaysCheckBox.IsEnabled = !scanning;
+        InitialGatewaySessionComboBox.IsEnabled = !scanning;
+        AttemptsPerPasswordBox.IsEnabled = !scanning;
+        LinkExistingIndependentServersCheckBox.IsEnabled = !scanning;
+    }
+
+    private int ParseAttemptsPerPassword()
+    {
+        if (int.TryParse(AttemptsPerPasswordBox.Text?.Trim(), out var val) && val >= 1)
+            return val;
+        return 1;
     }
 
     private void UpdateCounts()
@@ -637,7 +722,6 @@ public partial class SmartDiscoveryWindow : Window
 
     private void CandidateLinks_Click(object sender, RoutedEventArgs e)
     {
-        if (isScanning) return;
         if ((sender as FrameworkElement)?.DataContext is not DiscoveredServerCandidate candidate) return;
 
         try
@@ -771,6 +855,7 @@ public partial class SmartDiscoveryWindow : Window
                 }
             }
 
+            sessionsCreated = true;
             ThemedMessageDialog.Show(this, $"Успешно создано сессий: {created.Count}",
                 "Создание сессий", MessageBoxButton.OK, MessageBoxImage.Information);
 
@@ -790,8 +875,6 @@ public partial class SmartDiscoveryWindow : Window
 
     private void Close_Click(object sender, RoutedEventArgs e)
     {
-        if (isScanning)
-            scanCts?.Cancel();
         Close();
     }
 }

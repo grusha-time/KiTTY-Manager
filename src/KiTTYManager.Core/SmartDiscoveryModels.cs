@@ -14,11 +14,23 @@ public sealed class SmartDiscoveryOptions
     public BaseProxy? JumpHost { get; set; }
     public bool AutoSelectJumpHost { get; set; }
     public int MaxParallelConnections { get; set; } = 4;
-    public int MaxAttemptsPerHost { get; set; } = 5;
+    public int MaxAttemptsPerHost { get; set; } = 0;
+    public int AttemptsPerPassword { get; set; } = 1;
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan EndpointProbeTimeout { get; set; } = TimeSpan.FromSeconds(4);
     public bool PreferGroupGateways { get; set; } = true;
     public Guid? InitialGatewayServerId { get; set; }
+}
+
+public static class SmartDiscoveryClosingPolicy
+{
+    public const string ConfirmationMessage =
+        "У вас есть найденные сессии, которые не были сохранены. Вы уверены, что хотите закрыть окно без сохранения?";
+
+    public static bool ShouldConfirmClosing(bool sessionsCreated, IEnumerable<DiscoveredServerCandidate> candidates)
+    {
+        return !sessionsCreated && candidates.Any(c => !c.IsDuplicate);
+    }
 }
 
 public sealed class PrivilegeEscalationResult

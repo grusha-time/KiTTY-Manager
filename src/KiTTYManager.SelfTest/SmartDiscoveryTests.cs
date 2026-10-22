@@ -17,6 +17,7 @@ internal sealed partial class SelfTestRunner
         public HashSet<string> HostKeyRejectedHosts { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<Guid, HashSet<string>> ProxyReachable { get; } = [];
         public HashSet<string> DirectAuthUnreachable { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, int> FailUntilAttempt { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Action<string>? OnHostProbed { get; set; }
         public string AuthErrorMessage { get; set; } = "Неверные учетные данные";
 
@@ -104,7 +105,8 @@ internal sealed partial class SelfTestRunner
         public Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
             BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
             ManagedServer target, IReadOnlyList<string> candidatePasswords,
-            TimeSpan timeout, CancellationToken cancellationToken)
+            TimeSpan timeout, CancellationToken cancellationToken,
+            int attemptsPerPassword = 1)
         {
             AttemptedLogins.Add((target.Host, target.Username, target.Password));
 
@@ -120,6 +122,15 @@ internal sealed partial class SelfTestRunner
 
             if (jumpHost != null && ProxyAuthUnreachable.Contains((jumpHost.Id, target.Host)))
                 return Task.FromResult(SmartDiscoveryAuthResult.FailedReachability("Сбой соединения через точку входа"));
+
+            if (FailUntilAttempt.TryGetValue(target.Host, out var failCount))
+            {
+                var attemptsSoFar = AttemptedLogins.Count(a => string.Equals(a.host, target.Host, StringComparison.OrdinalIgnoreCase));
+                if (attemptsSoFar < failCount)
+                {
+                    return Task.FromResult(SmartDiscoveryAuthResult.FailedAuth(AuthErrorMessage));
+                }
+            }
 
             if (ValidCredentials.TryGetValue(target.Host, out var validList))
             {
@@ -3187,6 +3198,329 @@ internal sealed partial class SelfTestRunner
         };
         var defensiveMap = LinkMapLayout.Build(duplicateConfig);
         True(defensiveMap != null);
+
+        // 16. Unlimited attempts by default (MaxAttemptsPerHost <= 0):
+        // Provide 8 passwords, the 8th is valid. All 8 must be attempted and host discovered.
+        var config16 = new ManagerConfig();
+        var probe16 = new TestSmartDiscoveryProbe();
+        probe16.DirectlyReachable.Add("10.16.0.1");
+        probe16.ValidCredentials["10.16.0.1"] = [("admin", "pw8")];
+
+        var passwords16 = new[] { "pw1", "pw2", "pw3", "pw4", "pw5", "pw6", "pw7", "pw8" };
+        var options16 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.16.0.1"],
+            Usernames = ["admin"],
+            Passwords = [.. passwords16]
+        };
+        // Verify default options.MaxAttemptsPerHost is 0 and AttemptsPerPassword is 1
+        Equal(0, options16.MaxAttemptsPerHost);
+        Equal(1, options16.AttemptsPerPassword);
+
+        var engine16 = new SmartDiscoveryEngine(config16, options16, probe16);
+        var result16 = engine16.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result16.Discovered.Count);
+        Equal(0, result16.Problematic.Count);
+        Equal("pw8", result16.Discovered[0].Password);
+        Equal(8, probe16.AttemptedLogins.Count);
+
+        // In contrast, when MaxAttemptsPerHost = 4, it stops after 4 attempts
+        var probe16Limited = new TestSmartDiscoveryProbe();
+        probe16Limited.DirectlyReachable.Add("10.16.0.1");
+        probe16Limited.ValidCredentials["10.16.0.1"] = [("admin", "pw8")];
+        var options16Limited = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.16.0.1"],
+            Usernames = ["admin"],
+            Passwords = [.. passwords16],
+            MaxAttemptsPerHost = 4
+        };
+        var engine16Limited = new SmartDiscoveryEngine(config16, options16Limited, probe16Limited);
+        var result16Limited = engine16Limited.DiscoverAsync().GetAwaiter().GetResult();
+        Equal(0, result16Limited.Discovered.Count);
+        Equal(1, result16Limited.Problematic.Count);
+        Equal(4, probe16Limited.AttemptedLogins.Count);
+        True(result16Limited.Problematic[0].Reason.Contains("Превышен лимит попыток"));
+
+        // 17. AttemptsPerPassword = 2:
+        // 17a: Host with invalid passwords tries each password twice before advancing.
+        var config17 = new ManagerConfig();
+        var probe17 = new TestSmartDiscoveryProbe();
+        probe17.DirectlyReachable.Add("10.17.0.1");
+        var options17 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.17.0.1"],
+            Usernames = ["user1"],
+            Passwords = ["passA", "passB"],
+            AttemptsPerPassword = 2
+        };
+        var engine17 = new SmartDiscoveryEngine(config17, options17, probe17);
+        var result17 = engine17.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(0, result17.Discovered.Count);
+        Equal(1, result17.Problematic.Count);
+        Equal(4, probe17.AttemptedLogins.Count);
+        Equal("passA", probe17.AttemptedLogins[0].pass);
+        Equal("passA", probe17.AttemptedLogins[1].pass);
+        Equal("passB", probe17.AttemptedLogins[2].pass);
+        Equal("passB", probe17.AttemptedLogins[3].pass);
+
+        // 17b: Host succeeds on 2nd attempt of first password
+        var probe17Success = new TestSmartDiscoveryProbe();
+        probe17Success.DirectlyReachable.Add("10.17.0.2");
+        probe17Success.ValidCredentials["10.17.0.2"] = [("user1", "passA")];
+        probe17Success.FailUntilAttempt["10.17.0.2"] = 2; // Fails 1st, succeeds 2nd
+        var options17Success = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.17.0.2"],
+            Usernames = ["user1"],
+            Passwords = ["passA", "passB"],
+            AttemptsPerPassword = 2
+        };
+        var engine17Success = new SmartDiscoveryEngine(config17, options17Success, probe17Success);
+        var result17Success = engine17Success.DiscoverAsync().GetAwaiter().GetResult();
+        Equal(1, result17Success.Discovered.Count);
+        Equal("passA", result17Success.Discovered[0].Password);
+        Equal(2, probe17Success.AttemptedLogins.Count); // Tried passA twice, never tried passB!
+
+        // 18. Privilege escalation probing with attemptsPerPassword = 2:
+        // Scenario 18a: su with root password succeeds on 2nd attempt
+        var suAttempt = 0;
+        var escResult18a = DefaultSmartDiscoveryProbe.ProbePrivilegeEscalationCoreAsync(
+            runCommand: (cmd, to, ct) => Task.FromResult((1, "uid=1000")),
+            tryPasswordEscalation: (method, pass, label, to, ct) =>
+            {
+                if (method == "su" && pass == "rootpw")
+                {
+                    suAttempt++;
+                    if (suAttempt == 2)
+                        return Task.FromResult((true, "su", "su -", pass));
+                }
+                return Task.FromResult((false, method, "", ""));
+            },
+            username: "user",
+            loginPassword: "userpw",
+            candidatePasswords: ["rootpw"],
+            timeout: TimeSpan.FromSeconds(5),
+            cancellationToken: CancellationToken.None,
+            attemptsPerPassword: 2).GetAwaiter().GetResult();
+
+        Equal(true, escResult18a.Success);
+        Equal("su", escResult18a.Method);
+        Equal(2, suAttempt);
+
+        // Scenario 18b: sudo with user password succeeds on 2nd attempt
+        var sudoAttempt = 0;
+        var escResult18b = DefaultSmartDiscoveryProbe.ProbePrivilegeEscalationCoreAsync(
+            runCommand: (cmd, to, ct) => Task.FromResult((1, "uid=1000")),
+            tryPasswordEscalation: (method, pass, label, to, ct) =>
+            {
+                if (method == "sudo" && pass == "userpw")
+                {
+                    sudoAttempt++;
+                    if (sudoAttempt == 2)
+                        return Task.FromResult((true, "sudo", "sudo -i", pass));
+                }
+                return Task.FromResult((false, method, "", ""));
+            },
+            username: "user",
+            loginPassword: "userpw",
+            candidatePasswords: [],
+            timeout: TimeSpan.FromSeconds(5),
+            cancellationToken: CancellationToken.None,
+            attemptsPerPassword: 2).GetAwaiter().GetResult();
+
+        Equal(true, escResult18b.Success);
+        Equal("sudo", escResult18b.Method);
+        Equal(2, sudoAttempt);
+
+        // 19. SmartDiscoveryClosingPolicy:
+        // Exact confirmation message required by Issue #26:
+        Equal("У вас есть найденные сессии, которые не были сохранены. Вы уверены, что хотите закрыть окно без сохранения?", SmartDiscoveryClosingPolicy.ConfirmationMessage);
+
+        // When sessionsCreated = true -> false
+        Equal(false, SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated: true, candidates: [new DiscoveredServerCandidate { IsDuplicate = false }]));
+
+        // When candidates empty -> false
+        Equal(false, SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated: false, candidates: []));
+
+        // When only duplicates exist -> false
+        Equal(false, SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated: false, candidates: [new DiscoveredServerCandidate { IsDuplicate = true }]));
+
+        // When unsaved new (non-duplicate) candidate exists -> true
+        Equal(true, SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated: false, candidates: [new DiscoveredServerCandidate { IsDuplicate = false }]));
+
+        // Mixed: 1 duplicate, 1 new -> true
+        Equal(true, SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated: false, candidates: [
+            new DiscoveredServerCandidate { IsDuplicate = true },
+            new DiscoveredServerCandidate { IsDuplicate = false }
+        ]));
+
+        // 20. Streaming candidate progress & closing confirmation on cancelled/interrupted scan:
+        // Host 1 is discovered and reported via candidateProgress before cancellation token cancels scan.
+        // The partially populated candidate list triggers ShouldConfirmClosing = true.
+        var config20 = new ManagerConfig();
+        var probe20 = new TestSmartDiscoveryProbe();
+        probe20.DirectlyReachable.Add("10.20.0.1");
+        probe20.DirectlyReachable.Add("10.20.0.2");
+        probe20.ValidCredentials["10.20.0.1"] = [("admin", "pw1")];
+        probe20.ValidCredentials["10.20.0.2"] = [("admin", "pw2")];
+
+        var streamedCandidates = new List<DiscoveredServerCandidate>();
+        var streamProgress = new SyncProgress<DiscoveredServerCandidate>(c => streamedCandidates.Add(c));
+        var cts20 = new CancellationTokenSource();
+
+        // When 10.20.0.1 is probed, cancel CTS so subsequent operations cancel
+        probe20.OnHostProbed = host =>
+        {
+            if (host == "10.20.0.1")
+                cts20.Cancel();
+        };
+
+        var options20 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.20.0.1", "10.20.0.2"],
+            Usernames = ["admin"],
+            Passwords = ["pw1", "pw2"],
+            MaxParallelConnections = 1 // sequential to deterministically cancel after host 1
+        };
+
+        // Cloned snapshot isolates engine from live config mutations
+        var clonedConfig20 = ConfigTransfer.CloneSnapshot(config20);
+        config20.Links.Add(new ServerLink { FromServerId = Guid.NewGuid(), ToServerId = Guid.NewGuid() });
+
+        var engine20 = new SmartDiscoveryEngine(
+            clonedConfig20, options20, probe20, candidateProgress: streamProgress);
+
+        try
+        {
+            engine20.DiscoverAsync(cts20.Token).GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException) { }
+
+        // Host 1 must have been streamed via candidateProgress before cancellation
+        True(streamedCandidates.Count >= 1);
+        Equal("10.20.0.1", streamedCandidates[0].Host);
+        Equal(false, streamedCandidates[0].IsDuplicate);
+
+        // Closing policy must require confirmation for the partially discovered results
+        var shouldConfirm = SmartDiscoveryClosingPolicy.ShouldConfirmClosing(sessionsCreated: false, streamedCandidates);
+        Equal(true, shouldConfirm);
+
+        // 21. Deferred progress callbacks deduplication and candidate state isolation:
+        // Simulates async message queue (SynchronizationContext.Post) where candidate progress
+        // callbacks arrive after DiscoverAsync has already returned and merged results.
+        var config21 = new ManagerConfig();
+        var probe21 = new TestSmartDiscoveryProbe();
+        probe21.DirectlyReachable.Add("10.21.0.1");
+        probe21.DirectlyReachable.Add("10.21.0.2");
+        probe21.ValidCredentials["10.21.0.1"] = [("admin", "pw1")];
+        probe21.ValidCredentials["10.21.0.2"] = [("admin", "pw2")];
+
+        var deferredQueue = new Queue<DiscoveredServerCandidate>();
+        var deferredProgress = new SyncProgress<DiscoveredServerCandidate>(c => deferredQueue.Enqueue(c));
+        var deferredProblemQueue = new Queue<ProblematicServerCandidate>();
+        var deferredProblemProgress = new SyncProgress<ProblematicServerCandidate>(p => deferredProblemQueue.Enqueue(p));
+
+        var options21 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.21.0.1", "10.21.0.2", "10.21.0.3"],
+            Usernames = ["admin"],
+            Passwords = ["pw1", "pw2"]
+        };
+
+        var engine21 = new SmartDiscoveryEngine(
+            config21, options21, probe21,
+            candidateProgress: deferredProgress, problemProgress: deferredProblemProgress);
+
+        var result21 = engine21.DiscoverAsync().GetAwaiter().GetResult();
+        Equal(2, result21.Discovered.Count);
+        Equal(1, result21.Problematic.Count);
+        Equal("10.21.0.3", result21.Problematic[0].Host);
+
+        // UI simulated collection for discovered candidates
+        var uiCandidates = new List<DiscoveredServerCandidate>();
+        void SimulatedAddInOrder(DiscoveredServerCandidate cand)
+        {
+            if (uiCandidates.Any(c => c.Id == cand.Id))
+                return;
+            uiCandidates.Add(cand);
+        }
+
+        // UI simulated collection for problematic candidates
+        var uiProblematic = new List<ProblematicServerCandidate>();
+        void SimulatedAddProblemInOrder(ProblematicServerCandidate prob)
+        {
+            var existing = uiProblematic.FirstOrDefault(p => string.Equals(p.Host, prob.Host, StringComparison.OrdinalIgnoreCase));
+            if (existing == null)
+            {
+                uiProblematic.Add(prob);
+            }
+            else
+            {
+                var idx = uiProblematic.IndexOf(existing);
+                uiProblematic[idx] = prob;
+            }
+        }
+
+        // Completion block runs FIRST (before queued callbacks are dispatched)
+        foreach (var cand in result21.Discovered)
+        {
+            if (!uiCandidates.Any(c => c.Id == cand.Id))
+                SimulatedAddInOrder(SmartDiscoveryEngine.CloneCandidate(cand));
+        }
+        foreach (var prob in result21.Problematic)
+        {
+            if (!uiProblematic.Any(p => string.Equals(p.Host, prob.Host, StringComparison.OrdinalIgnoreCase)))
+                SimulatedAddProblemInOrder(prob);
+        }
+        Equal(2, uiCandidates.Count);
+        Equal(1, uiProblematic.Count);
+
+        // Now delayed progress callbacks arrive from UI queue (both candidate and problem)
+        while (deferredQueue.Count > 0)
+        {
+            var delayedCand = deferredQueue.Dequeue();
+            SimulatedAddInOrder(delayedCand);
+        }
+        while (deferredProblemQueue.Count > 0)
+        {
+            var delayedProb = deferredProblemQueue.Dequeue();
+            SimulatedAddProblemInOrder(delayedProb);
+        }
+
+        // Deduplication must ensure exactly 2 candidates and 1 problematic candidate remain without duplicates
+        Equal(2, uiCandidates.Count);
+        Equal(1, uiCandidates.Count(c => c.Host == "10.21.0.1"));
+        Equal(1, uiCandidates.Count(c => c.Host == "10.21.0.2"));
+        Equal(1, uiProblematic.Count);
+        Equal("10.21.0.3", uiProblematic[0].Host);
+
+        // Candidate state isolation: modifying candidate in UI must not affect engine's candidate
+        var uiCand1 = uiCandidates.First(c => c.Host == "10.21.0.1");
+        uiCand1.RequiredPreviousServerId = Guid.NewGuid();
+        uiCand1.DiscoveredLinksFrom.Add(Guid.NewGuid());
+        var engineCand1 = result21.Discovered.First(c => c.Host == "10.21.0.1");
+        Equal(null, engineCand1.RequiredPreviousServerId);
+        Equal(0, engineCand1.DiscoveredLinksFrom.Count);
+
+        // Initial gateways isolation: modifying candidate passed as initialGateway does not affect engine
+        var initGw = new DiscoveredServerCandidate
+        {
+            Id = Guid.NewGuid(),
+            Host = "10.21.0.99",
+            RequiredPreviousServerId = null
+        };
+        var engineWithGw = new SmartDiscoveryEngine(
+            config21, options21, probe21, initialGateways: [initGw]);
+        initGw.RequiredPreviousServerId = Guid.NewGuid();
+        initGw.DiscoveredLinksFrom.Add(Guid.NewGuid());
+    }
+
+    private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
     }
 
     private sealed class PersistentSessionMockProbe : ISmartDiscoveryProbe
@@ -3204,7 +3538,8 @@ internal sealed partial class SelfTestRunner
         public Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
             BaseProxy? jumpHost, IReadOnlyList<ManagedServer> intermediateGateways,
             ManagedServer target, IReadOnlyList<string> candidatePasswords,
-            TimeSpan timeout, CancellationToken cancellationToken)
+            TimeSpan timeout, CancellationToken cancellationToken,
+            int attemptsPerPassword = 1)
         {
             if (ValidCredentials.TryGetValue(target.Host, out var valid) && valid.Any(v => v.user == target.Username && v.pass == target.Password))
                 return Task.FromResult(SmartDiscoveryAuthResult.Succeeded(target.Host, new PrivilegeEscalationResult { Method = "Root", Success = true }));
@@ -3255,8 +3590,9 @@ internal sealed partial class SelfTestRunner
 
             public Task<SmartDiscoveryAuthResult> AuthenticateAndProbeAsync(
                 ManagedServer target, IReadOnlyList<string> candidatePasswords,
-                TimeSpan timeout, CancellationToken cancellationToken) =>
-                parent.AuthenticateAndProbeAsync(null, [], target, candidatePasswords, timeout, cancellationToken);
+                TimeSpan timeout, CancellationToken cancellationToken,
+                int attemptsPerPassword = 1) =>
+                parent.AuthenticateAndProbeAsync(null, [], target, candidatePasswords, timeout, cancellationToken, attemptsPerPassword);
 
             public void Dispose() => onDispose?.Invoke();
             public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
