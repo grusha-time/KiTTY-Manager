@@ -93,6 +93,9 @@ public sealed class ManagedServer
     public string PamTotpPrompt { get; set; } = "OTP: ";
     public bool PamAutoConfirm { get; set; }
     public string PamConfirmPrompt { get; set; } = "[Y/n]";
+    [JsonIgnore] public bool HasExplicitUsePam { get; set; } = true;
+    [JsonIgnore] public bool HasExplicitPamAutoConfirm { get; set; } = true;
+    [JsonIgnore] public bool HasAllPamPropertiesPresentInImport { get; set; } = true;
     private int _keepaliveIntervalSeconds = 15;
     private bool _enableTcpKeepalives = true;
     private bool _reconnectOnConnectionFailure = true;
@@ -367,4 +370,109 @@ public sealed class EndpointPreference
     public Guid? PreviousServerId { get; set; }
     public ServerEndpoint Endpoint { get; set; } = new();
     public DateTimeOffset LastSuccessUtc { get; set; }
+}
+
+public static class ManagedServerPamExtensions
+{
+    public static bool IsFullUnconfiguredPamExport(this ManagedServer? s)
+    {
+        if (s is null) return false;
+        return s.HasAllPamPropertiesPresentInImport &&
+               s.HasExplicitUsePam && !s.UsePam &&
+               s.HasExplicitPamAutoConfirm && !s.PamAutoConfirm &&
+               string.IsNullOrWhiteSpace(s.PamSshCommand) &&
+               string.IsNullOrEmpty(s.PamPassword) &&
+               string.IsNullOrEmpty(s.PamTotpSecret) &&
+               s.PamTotpAlgorithm == "SHA1" &&
+               s.PamTotpDigits == 6 &&
+               s.PamTotpPeriodSeconds == 30 &&
+               s.PamTotpPrompt == "OTP: " &&
+               s.PamConfirmPrompt == "[Y/n]";
+    }
+
+    public static bool IsUnconfiguredPam(this ManagedServer? s)
+    {
+        if (s is null) return true;
+        return !s.HasAnyPamFieldPresent() || s.IsFullUnconfiguredPamExport();
+    }
+
+    public static bool HasPamConfigured(this ManagedServer? s) =>
+        s is not null && !s.IsUnconfiguredPam();
+
+    public static bool HasAnyPamFieldPresent(this ManagedServer? s) =>
+        s is not null &&
+        (s.HasExplicitUsePam ||
+         s.HasExplicitPamAutoConfirm ||
+         !string.IsNullOrWhiteSpace(s.PamSshCommand) ||
+         !string.IsNullOrEmpty(s.PamPassword) ||
+         !string.IsNullOrEmpty(s.PamTotpSecret) ||
+         !string.IsNullOrWhiteSpace(s.PamTotpAlgorithm) ||
+         s.PamTotpDigits > 0 ||
+         s.PamTotpPeriodSeconds > 0 ||
+         !string.IsNullOrWhiteSpace(s.PamTotpPrompt) ||
+         !string.IsNullOrWhiteSpace(s.PamConfirmPrompt));
+
+    public static void CopyPamSettingsFrom(this ManagedServer target, ManagedServer source)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+        ArgumentNullException.ThrowIfNull(source);
+
+        target.UsePam = source.UsePam;
+        target.HasExplicitUsePam = source.HasExplicitUsePam;
+        target.PamSshCommand = source.PamSshCommand;
+        target.PamPassword = source.PamPassword;
+        target.PamTotpSecret = source.PamTotpSecret;
+        target.PamTotpAlgorithm = source.PamTotpAlgorithm;
+        target.PamTotpDigits = source.PamTotpDigits;
+        target.PamTotpPeriodSeconds = source.PamTotpPeriodSeconds;
+        target.PamTotpPrompt = source.PamTotpPrompt;
+        target.PamAutoConfirm = source.PamAutoConfirm;
+        target.HasExplicitPamAutoConfirm = source.HasExplicitPamAutoConfirm;
+        target.PamConfirmPrompt = source.PamConfirmPrompt;
+        target.HasAllPamPropertiesPresentInImport = source.HasAllPamPropertiesPresentInImport;
+    }
+
+    public static void MergePamPreservingPopulated(this ManagedServer replacement, ManagedServer existing)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        if (existing is null || !existing.HasPamConfigured()) return;
+
+        if (!replacement.HasPamConfigured())
+        {
+            // Входной PAM не настроен (включая штатный экспорт сессии без PAM): сохраняем ВСЕ 10 полей из existing
+            replacement.CopyPamSettingsFrom(existing);
+            return;
+        }
+
+        // Входной PAM настроен: сохраняем из existing только незаполненные поля
+        if (!replacement.HasExplicitUsePam)
+            replacement.UsePam = existing.UsePam;
+
+        if (!replacement.HasExplicitPamAutoConfirm)
+            replacement.PamAutoConfirm = existing.PamAutoConfirm;
+
+        if (string.IsNullOrWhiteSpace(replacement.PamSshCommand))
+            replacement.PamSshCommand = existing.PamSshCommand;
+
+        if (string.IsNullOrEmpty(replacement.PamPassword))
+            replacement.PamPassword = existing.PamPassword;
+
+        if (string.IsNullOrEmpty(replacement.PamTotpSecret))
+            replacement.PamTotpSecret = existing.PamTotpSecret;
+
+        if (string.IsNullOrWhiteSpace(replacement.PamTotpAlgorithm))
+            replacement.PamTotpAlgorithm = existing.PamTotpAlgorithm;
+
+        if (replacement.PamTotpDigits <= 0)
+            replacement.PamTotpDigits = existing.PamTotpDigits;
+
+        if (replacement.PamTotpPeriodSeconds <= 0)
+            replacement.PamTotpPeriodSeconds = existing.PamTotpPeriodSeconds;
+
+        if (string.IsNullOrWhiteSpace(replacement.PamTotpPrompt))
+            replacement.PamTotpPrompt = existing.PamTotpPrompt;
+
+        if (string.IsNullOrWhiteSpace(replacement.PamConfirmPrompt))
+            replacement.PamConfirmPrompt = existing.PamConfirmPrompt;
+    }
 }

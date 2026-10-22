@@ -58,6 +58,38 @@ internal static class KittyWindowInput
         return activeLine.Contains(prompt.Trim(), StringComparison.OrdinalIgnoreCase);
     }
 
+    public static bool IsActiveShellPrompt(string logContent, string? customShellPrompt = null)
+    {
+        if (string.IsNullOrWhiteSpace(logContent))
+            return false;
+
+        // Strip ANSI terminal escape sequences (OSC, DCS/APC/PM, CSI, 2-char escapes, BEL)
+        var clean = System.Text.RegularExpressions.Regex.Replace(
+            logContent,
+            @"\x1B\][\s\S]*?(?:\x07|\x1B\\|\x9C|$)|" +
+            @"\x1B[P^_][\s\S]*?(?:\x07|\x1B\\|\x9C|$)|" +
+            @"\x1B\[[0-?]*[ -/]*[@-~]|" +
+            @"\x1B[@-Z\\-_]|\x07",
+            "");
+
+        if (clean.EndsWith('\n') || clean.EndsWith('\r'))
+            return false;
+
+        var lastNewline = Math.Max(clean.LastIndexOf('\n'), clean.LastIndexOf('\r'));
+        var activeLine = (lastNewline >= 0 ? clean[(lastNewline + 1)..] : clean).TrimEnd();
+        if (activeLine.Length == 0)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(customShellPrompt) &&
+            activeLine.EndsWith(customShellPrompt.Trim(), StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (activeLine.EndsWith('$') || activeLine.EndsWith('#') || activeLine.EndsWith('>') || activeLine.EndsWith('%'))
+            return true;
+
+        return false;
+    }
+
     public static Task<int> SendLineAfterPromptAsync(
         Process process, string logPath, string prompt, string value,
         TimeSpan timeout, CancellationToken cancellationToken,
@@ -73,13 +105,42 @@ internal static class KittyWindowInput
         int minOffset = 0,
         Func<string, bool>? progressionCheck = null)
     {
+        var result = await SendLineAfterPromptAsync(
+            process, logPath, prompt, valueFactory, timeout, cancellationToken,
+            optional: false, sendLine: sendLine, minOffset: minOffset,
+            progressionCheck: progressionCheck, completionCheck: null);
+        return result.Offset;
+    }
+
+    public static Task<(int Offset, bool Sent)> SendLineAfterPromptAsync(
+        Process process, string logPath, string prompt, string value,
+        TimeSpan timeout, CancellationToken cancellationToken,
+        bool optional,
+        Func<Process, string, CancellationToken, Task>? sendLine = null,
+        int minOffset = 0,
+        Func<string, bool>? progressionCheck = null,
+        Func<string, bool>? completionCheck = null) =>
+        SendLineAfterPromptAsync(process, logPath, prompt, () => value, timeout, cancellationToken, optional, sendLine, minOffset, progressionCheck, completionCheck);
+
+    public static async Task<(int Offset, bool Sent)> SendLineAfterPromptAsync(
+        Process process, string logPath, string prompt, Func<string> valueFactory,
+        TimeSpan timeout, CancellationToken cancellationToken,
+        bool optional,
+        Func<Process, string, CancellationToken, Task>? sendLine = null,
+        int minOffset = 0,
+        Func<string, bool>? progressionCheck = null,
+        Func<string, bool>? completionCheck = null)
+    {
         var send = sendLine ?? SendLineAction;
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (process.HasExited)
+            {
+                if (optional) return (minOffset, false);
                 throw new InvalidOperationException("Окно KiTTY закрылось до подтверждения запроса OTP.");
+            }
 
             if (File.Exists(logPath))
             {
@@ -96,8 +157,19 @@ internal static class KittyWindowInput
                             if (IsActivePrompt(unconsumed, prompt))
                             {
                                 var value = valueFactory();
-                                await send(process, value, cancellationToken);
-                                return content.Length;
+                                try
+                                {
+                                    await send(process, value, cancellationToken);
+                                    return (content.Length, true);
+                                }
+                                catch (Exception) when (optional && process.HasExited)
+                                {
+                                    return (minOffset, false);
+                                }
+                            }
+                            if (completionCheck != null && completionCheck(unconsumed))
+                            {
+                                return (content.Length, false);
                             }
                         }
                     }
@@ -106,6 +178,7 @@ internal static class KittyWindowInput
             }
             await Task.Delay(50, cancellationToken);
         }
+        if (optional) return (minOffset, false);
         throw new TimeoutException($"Таймаут ожидания запроса OTP «{prompt}» в сессии KiTTY.");
     }
 

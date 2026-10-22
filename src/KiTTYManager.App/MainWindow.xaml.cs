@@ -1538,13 +1538,21 @@ public partial class MainWindow : Window
                         {
                             var pamPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP" : server.PamTotpPrompt.Trim();
                             var pamCommand = server.PamSshCommand.Trim();
-                            await KittyWindowInput.SendLineAfterPromptAsync(
+                            var pamResult = await KittyWindowInput.SendLineAfterPromptAsync(
                                 process, sessionLogPath, pamPrompt,
                                 () => TotpGenerator.Generate(server.PamTotpSecret, DateTimeOffset.UtcNow,
                                     server.PamTotpDigits, server.PamTotpPeriodSeconds, server.PamTotpAlgorithm),
                                 TimeSpan.FromSeconds(30), cancellationToken,
+                                optional: true,
                                 minOffset: consumedOffset,
-                                progressionCheck: text => text.Contains("exec sh -c", StringComparison.OrdinalIgnoreCase) || text.Contains(pamCommand, StringComparison.OrdinalIgnoreCase));
+                                progressionCheck: text => text.Contains(pamCommand, StringComparison.OrdinalIgnoreCase)
+                                    || text.Contains("exec sh -c", StringComparison.OrdinalIgnoreCase),
+                                completionCheck: text => KittyWindowInput.IsActiveShellPrompt(text, server.ShellPrompt));
+
+                            if (pamResult.Sent)
+                                RouteLog("PAM OTP: код подтверждения успешно передан.");
+                            else
+                                RouteLog("PAM OTP: запрос OTP не поступил от сервера; продолжено без ввода OTP.");
                         }
                     }
 

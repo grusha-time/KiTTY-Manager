@@ -96,6 +96,9 @@ internal sealed partial class SelfTestRunner
         Test("Очистка временного лога сессии привязана к жизненному циклу процесса KiTTY", SessionLogCleanupTiedToProcessLifetimeTests);
         Test("Умный импорт поддерживает построчный выбор и отклонение полей PAM", PamSmartImportFieldAcceptRejectTests);
         Test("Полный round-trip экспорта и импорта сессий с параметрами PAM", PamExportImportRoundTripTests);
+        Test("Детекция активного приглашения шелла IsActiveShellPrompt", ActiveShellPromptDetectionTests);
+        Test("Опциональное ожидание OTP с завершением по шеллу, выходу и таймауту", OptionalOtpWaitLifecycleTests);
+        Test("Защита настроенного PAM от затирания пустыми полями при импорте", PamImportProtectionTests);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);

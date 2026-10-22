@@ -2,6 +2,8 @@ namespace KiTTYManager.Core;
 
 public static class PamLoginPlan
 {
+    public static string FormatPamSshCommand(string rawCommand) => (rawCommand ?? "").Trim();
+
     public static string WrapExecCommand(string rawCommand)
     {
         var trimmed = rawCommand.Trim();
@@ -39,10 +41,11 @@ public static class PamLoginPlan
             }
         }
 
-        // PAM SSH command on JumpHost wrapped to guarantee process replacement
-        // and immediate shell termination on syntax/parse errors or command failures.
-        var sshCommand = WrapExecCommand(target.PamSshCommand);
-        steps.Add(new JumphostPromptResponse(jumpHostPrompt, sshCommand));
+        // 1. Isolate JumpHost shell by launching a POSIX shell with fixed prompt
+        steps.Add(new JumphostPromptResponse(jumpHostPrompt, "ENV= PS1='[pam-isolated] ' PROMPT='[pam-isolated] ' exec sh"));
+
+        // 2. Send PAM SSH command directly upon seeing the isolated prompt marker
+        steps.Add(new JumphostPromptResponse("[pam-isolated] ", target.PamSshCommand.Trim()));
 
         if (!string.IsNullOrEmpty(target.PamPassword))
         {

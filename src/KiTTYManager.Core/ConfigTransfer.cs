@@ -218,10 +218,11 @@ public static class ConfigTransfer
         IReadOnlyDictionary<(TransferConflictKind Kind, Guid IncomingId), bool> useIncoming)
     {
         var result = Clone(current);
+        var safeIncoming = Clone(incoming);
         var importedServerIds = new HashSet<Guid>();
         var serverIdMap = new Dictionary<Guid, Guid>();
 
-        foreach (var incomingServer in incoming.AllServers())
+        foreach (var incomingServer in safeIncoming.AllServers())
         {
             var existing = FindMatchingServer(result, incomingServer);
             if (existing is not null)
@@ -231,6 +232,10 @@ public static class ConfigTransfer
                     serverIdMap[incomingServer.Id] = existing.Id;
                     continue;
                 }
+                if (existing.HasPamConfigured())
+                {
+                    incomingServer.MergePamPreservingPopulated(existing);
+                }
                 result.RemoveServer(existing.Id);
             }
 
@@ -238,12 +243,12 @@ public static class ConfigTransfer
             serverIdMap[incomingServer.Id] = incomingServer.Id;
         }
 
-        MergeGroups(result.Groups, incoming.Groups, importedServerIds);
-        foreach (var server in incoming.UngroupedServers.Where(server => importedServerIds.Contains(server.Id)))
+        MergeGroups(result.Groups, safeIncoming.Groups, importedServerIds);
+        foreach (var server in safeIncoming.UngroupedServers.Where(server => importedServerIds.Contains(server.Id)))
             result.UngroupedServers.Add(Clone(server));
 
         var proxyIdMap = new Dictionary<Guid, Guid>();
-        foreach (var incomingProxy in incoming.BaseProxies)
+        foreach (var incomingProxy in safeIncoming.BaseProxies)
         {
             var existing = FindMatchingProxy(result, incomingProxy);
             if (existing is not null)
@@ -269,7 +274,7 @@ public static class ConfigTransfer
         }
 
         var validServerIds = result.AllServers().Select(server => server.Id).ToHashSet();
-        foreach (var incomingLink in incoming.Links)
+        foreach (var incomingLink in safeIncoming.Links)
         {
             var link = Clone(incomingLink);
             if (serverIdMap.TryGetValue(link.FromServerId, out var fromId)) link.FromServerId = fromId;
@@ -295,7 +300,7 @@ public static class ConfigTransfer
             result.Links.Add(link);
         }
 
-        if (incoming.PreferredProxyId is Guid preferred &&
+        if (safeIncoming.PreferredProxyId is Guid preferred &&
             proxyIdMap.TryGetValue(preferred, out var mappedPreferred))
             result.PreferredProxyId = mappedPreferred;
 
@@ -334,6 +339,7 @@ public static class ConfigTransfer
                 .ToList();
         }
         SanitizePreferredRoutes(result);
+        foreach (var server in result.AllServers()) ConfigStore.NormalizePamDefaults(server);
 
         return result;
     }
@@ -429,6 +435,35 @@ public static class ConfigTransfer
         }
     }
 
-    private static T Clone<T>(T value) =>
-        JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(value, JsonOptions), JsonOptions)!;
+    private static T Clone<T>(T value)
+    {
+        var cloned = JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(value, JsonOptions), JsonOptions)!;
+        CopyExplicitPamFlags(value, cloned);
+        return cloned;
+    }
+
+    private static void CopyExplicitPamFlags(object? source, object? target)
+    {
+        if (source is null || target is null) return;
+        if (source is ManagedServer s && target is ManagedServer t)
+        {
+            t.HasExplicitUsePam = s.HasExplicitUsePam;
+            t.HasExplicitPamAutoConfirm = s.HasExplicitPamAutoConfirm;
+            t.HasAllPamPropertiesPresentInImport = s.HasAllPamPropertiesPresentInImport;
+            return;
+        }
+        if (source is ManagerConfig sc && target is ManagerConfig tc)
+        {
+            var sourceServers = sc.AllServers().ToDictionary(x => x.Id);
+            foreach (var ts in tc.AllServers())
+            {
+                if (sourceServers.TryGetValue(ts.Id, out var ss))
+                {
+                    ts.HasExplicitUsePam = ss.HasExplicitUsePam;
+                    ts.HasExplicitPamAutoConfirm = ss.HasExplicitPamAutoConfirm;
+                    ts.HasAllPamPropertiesPresentInImport = ss.HasAllPamPropertiesPresentInImport;
+                }
+            }
+        }
+    }
 }
