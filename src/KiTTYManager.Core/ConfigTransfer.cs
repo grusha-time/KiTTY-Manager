@@ -166,6 +166,8 @@ public static class ConfigTransfer
             server.Password = "";
             server.PrivateKeyPassphrase = "";
             server.RootPassword = "";
+            server.PamPassword = "";
+            server.PamTotpSecret = "";
         }
     }
 

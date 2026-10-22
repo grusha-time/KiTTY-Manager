@@ -341,6 +341,14 @@ public static class ConfigStore
         if (server.KittyBaseline is not null) server.KittyBaseline.Host = server.KittyBaseline.Host.Trim();
         server.ShellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
         server.ImportedCommand ??= "";
+        server.PamSshCommand = (server.PamSshCommand ?? "").Trim();
+        server.PamPassword ??= "";
+        server.PamTotpSecret = (server.PamTotpSecret ?? "").Trim();
+        server.PamTotpAlgorithm = server.PamTotpAlgorithm is "SHA1" or "SHA256" or "SHA512" ? server.PamTotpAlgorithm : "SHA1";
+        server.PamTotpDigits = Math.Clamp(server.PamTotpDigits, 6, 8);
+        server.PamTotpPeriodSeconds = Math.Max(1, server.PamTotpPeriodSeconds);
+        server.PamTotpPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP: " : server.PamTotpPrompt;
+        server.PamConfirmPrompt = string.IsNullOrWhiteSpace(server.PamConfirmPrompt) ? "[Y/n]" : server.PamConfirmPrompt;
         MigrateKeepaliveFromSourceSession(server);
         if (server.KeepaliveIntervalSeconds < 0) server.KeepaliveIntervalSeconds = 15;
         server.WebInterfaces ??= [];

@@ -83,6 +83,17 @@ internal sealed partial class SelfTestRunner
         Test("Служба туннелей корректно очищает ресурсы при остановке во время запуска", TunnelServiceStopDuringStartupCleansUpProperly);
         Test("Статус ошибки туннеля сохраняет защиту активных ресурсов и позволяет их освободить", TunnelServiceErrorStatusRetainsActiveResourceProtection);
         Test("Синхронная остановка всех туннелей освобождает ресурсы без блокировки", TunnelServiceSynchronousStopAllReleasesResourcesWithoutBlocking);
+        Test("Последовательность prompt-response для PAM-авторизации", PamLoginPlanSequenceTests);
+        Test("Изоляция учётных данных PAM от пароля сессии и root", PamCredentialIndependenceTests);
+        Test("Защита и маскирование секретов PAM", PamSecretProtectionAndRedactionTests);
+        Test("Очистка секретов PAM при экспорте точек входа", PamExportSanitizationTests);
+        Test("Отслеживание изменений полей PAM в карточке сессии", PamServerEditorDirtyTrackerTests);
+        Test("Поиск справки находит параметры PAM-авторизации", PamHelpContentSearchTests);
+        Test("Расчёт безопасного окна TOTP для коротких и длинных периодов", PamSafeMarginCalculationTests);
+        Test("Экранирование ответов loginscript для SendKeyboardPlus", KittyLoginScriptEscapeResponseTests);
+        Test("Завершение сессии JumpHost при сбое PAM SSH и защита от повышения прав", PamFailedLoginTranscriptTests);
+        Test("Раздельная обработка первичного JumpHost SSH OTP и вложенного PAM OTP", InitialSshOtpVsNestedPamOtpTests);
+        Test("Очистка временного лога сессии привязана к жизненному циклу процесса KiTTY", SessionLogCleanupTiedToProcessLifetimeTests);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);
@@ -6254,7 +6265,7 @@ internal sealed partial class SelfTestRunner
         {
             path = script.Path;
             Equal(true, File.Exists(path));
-            Equal(true, new[] { "support@server-k>", "sudo su -", "assword", @"root\secret" }
+            Equal(true, new[] { "support@server-k>", "sudo su -", "assword", @"root\\secret" }
                 .SequenceEqual(File.ReadAllLines(path)));
         }
         Equal(false, File.Exists(path));

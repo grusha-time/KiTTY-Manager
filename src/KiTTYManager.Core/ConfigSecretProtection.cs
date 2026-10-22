@@ -111,6 +111,8 @@ internal static class ConfigSecrets
             server.PrivateKeyPassphrase = transform(server.PrivateKeyPassphrase ?? "");
             server.RootLogin = transform(server.RootLogin ?? "");
             server.RootPassword = transform(server.RootPassword ?? "");
+            server.PamPassword = transform(server.PamPassword ?? "");
+            server.PamTotpSecret = transform(server.PamTotpSecret ?? "");
             server.ImportedCommand = transform(server.ImportedCommand ?? "");
             server.SourceScriptContent = transform(server.SourceScriptContent ?? "");
 

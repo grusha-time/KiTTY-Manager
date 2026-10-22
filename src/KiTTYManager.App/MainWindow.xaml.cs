@@ -59,6 +59,8 @@ public partial class MainWindow : Window
     private bool refreshingGroups;
     private readonly DispatcherTimer accessScriptAlarm = new()
         { Interval = TimeSpan.FromSeconds(30) };
+    private readonly DispatcherTimer pamTotpTimer = new()
+        { Interval = TimeSpan.FromSeconds(1) };
     private readonly CancellationTokenSource accessScriptAlarmCancellation = new();
     private bool accessScriptAlarmRunning;
     private bool accessScriptAlarmRerunRequested;
@@ -71,6 +73,7 @@ public partial class MainWindow : Window
         KittyRoutedSession.CleanupStaleFiles(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
         KittySessionWriter.RelocateLegacyBackups(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
         WinScpCredentialFiles.CleanupStale(Path.Combine(dataDirectory, "Temp"), DateTime.UtcNow);
+        KittyWindowInput.CleanupStaleLogs();
         configPath = Path.Combine(dataDirectory, "config.json");
         config = LoadInitialConfig(configPath, out configAvailable);
         if (configAvailable) MigrateLegacyPrototypeConfig();
@@ -124,6 +127,8 @@ public partial class MainWindow : Window
             });
         RefreshAll();
         accessScriptAlarm.Tick += AccessScriptAlarm_Tick;
+        pamTotpTimer.Tick += (_, _) => UpdatePamCurrentTotp();
+        pamTotpTimer.Start();
         Loaded += async (_, _) =>
         {
             if (!configAvailable)
@@ -435,11 +440,37 @@ public partial class MainWindow : Window
             WebGrid.ItemsSource = null;
             BackupGrid.ItemsSource = null;
             LastRouteText.Visibility = Visibility.Collapsed;
+            UsePamBox.IsChecked = false;
+            PamSshCommandBox.Text = "";
+            PamPasswordBox.Value = "";
+            PamPasswordBox.ResetToHidden();
+            PamTotpSecretBox.Value = "";
+            PamTotpSecretBox.ResetToHidden();
+            SelectPamTotpAlgorithm("SHA1");
+            PamTotpDigitsBox.Text = "6";
+            PamTotpPeriodBox.Text = "30";
+            PamCurrentTotpBlock.Text = "—";
+            PamTotpPromptBox.Text = "OTP: ";
+            PamAutoConfirmBox.IsChecked = false;
+            PamConfirmPromptBox.Text = "[Y/n]";
             return;
         }
         PasswordBox.ResetToHidden();
         PrivateKeyPassphraseBox.ResetToHidden();
         RootPasswordBox.ResetToHidden();
+        PamPasswordBox.ResetToHidden();
+        PamTotpSecretBox.ResetToHidden();
+        UsePamBox.IsChecked = server.UsePam;
+        PamSshCommandBox.Text = server.PamSshCommand;
+        PamPasswordBox.Value = server.PamPassword;
+        PamTotpSecretBox.Value = server.PamTotpSecret;
+        SelectPamTotpAlgorithm(server.PamTotpAlgorithm);
+        PamTotpDigitsBox.Text = server.PamTotpDigits.ToString();
+        PamTotpPeriodBox.Text = server.PamTotpPeriodSeconds.ToString();
+        PamTotpPromptBox.Text = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP: " : server.PamTotpPrompt;
+        PamAutoConfirmBox.IsChecked = server.PamAutoConfirm;
+        PamConfirmPromptBox.Text = string.IsNullOrWhiteSpace(server.PamConfirmPrompt) ? "[Y/n]" : server.PamConfirmPrompt;
+        UpdatePamCurrentTotp();
         ServerNameBox.Text = server.Name; HostBox.Text = server.Host; PortBox.Text = server.Port.ToString();
         UsernameBox.Text = server.Username; PasswordBox.Value = server.Password;
         PrivateKeyPathBox.Text = server.PrivateKeyPath;
@@ -481,6 +512,59 @@ public partial class MainWindow : Window
             LastRouteText.Visibility = Visibility.Visible;
         }
         else LastRouteText.Visibility = Visibility.Collapsed;
+    }
+
+    private void SelectPamTotpAlgorithm(string? algorithm)
+    {
+        var target = string.IsNullOrWhiteSpace(algorithm) ? "SHA1" : algorithm.Trim().ToUpperInvariant();
+        foreach (var item in PamTotpAlgorithmBox.Items)
+        {
+            if (item is ComboBoxItem cbi && string.Equals(cbi.Content?.ToString(), target, StringComparison.OrdinalIgnoreCase))
+            {
+                PamTotpAlgorithmBox.SelectedItem = cbi;
+                return;
+            }
+        }
+        PamTotpAlgorithmBox.SelectedIndex = 0;
+    }
+
+    private string GetSelectedPamTotpAlgorithm() =>
+        (PamTotpAlgorithmBox.SelectedItem as ComboBoxItem)?.Content?.ToString()
+        ?? (string.IsNullOrWhiteSpace(PamTotpAlgorithmBox.Text) ? "SHA1" : PamTotpAlgorithmBox.Text.Trim().ToUpperInvariant());
+
+    private void UpdatePamCurrentTotp()
+    {
+        if (PamCurrentTotpBlock is null) return;
+        if (selectedServer is null || UsePamBox.IsChecked != true)
+        {
+            PamCurrentTotpBlock.Text = "—";
+            return;
+        }
+
+        var secret = PamTotpSecretBox.Value;
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            PamCurrentTotpBlock.Text = "—";
+            return;
+        }
+
+        var algorithm = GetSelectedPamTotpAlgorithm();
+        if (!int.TryParse(PamTotpDigitsBox.Text, out var digits) || digits is < 6 or > 8)
+            digits = 6;
+        if (!int.TryParse(PamTotpPeriodBox.Text, out var period) || period < 1)
+            period = 30;
+
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var code = TotpGenerator.Generate(secret, now, digits, period, algorithm);
+            var remaining = period - (now.ToUnixTimeSeconds() % period);
+            PamCurrentTotpBlock.Text = $"{code}  ({remaining} с)";
+        }
+        catch (Exception error) when (error is FormatException or ArgumentException)
+        {
+            PamCurrentTotpBlock.Text = "неверный secret";
+        }
     }
 
     private void GroupTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
@@ -841,6 +925,8 @@ public partial class MainWindow : Window
         if (!int.TryParse(PortBox.Text, out var port) || port is < 1 or > 65535) { Warn("SSH-порт должен быть от 1 до 65535."); return; }
         if (!int.TryParse(KeepaliveIntervalBox.Text, out var keepalive) || keepalive < 0) { Warn("Интервал keepalive должен быть неотрицательным числом секунд (0 — отключено)."); return; }
         if (string.IsNullOrWhiteSpace(HostBox.Text)) { Warn("Укажите адрес сервера."); return; }
+        if (!int.TryParse(PamTotpDigitsBox.Text, out var pamDigits) || pamDigits is < 6 or > 8) { Warn("Количество цифр TOTP должно быть от 6 до 8."); return; }
+        if (!int.TryParse(PamTotpPeriodBox.Text, out var pamPeriod) || pamPeriod < 1) { Warn("Период TOTP должен быть не менее 1 секунды."); return; }
         var before = ImportedSessionMerger.Snapshot(selectedServer);
         var beforeKeyPassphrase = selectedServer.PrivateKeyPassphrase;
         var beforeShellPrompt = selectedServer.ShellPrompt;
@@ -848,6 +934,16 @@ public partial class MainWindow : Window
         var beforeRequiredPreviousServerId = selectedServer.RequiredPreviousServerId;
         var beforeTryDirectWithoutJumphost = selectedServer.TryDirectWithoutJumphost;
         var beforeOverrides = selectedServer.ManagerOverrides.ToList();
+        var beforeUsePam = selectedServer.UsePam;
+        var beforePamSshCommand = selectedServer.PamSshCommand;
+        var beforePamPassword = selectedServer.PamPassword;
+        var beforePamTotpSecret = selectedServer.PamTotpSecret;
+        var beforePamTotpAlgorithm = selectedServer.PamTotpAlgorithm;
+        var beforePamTotpDigits = selectedServer.PamTotpDigits;
+        var beforePamTotpPeriodSeconds = selectedServer.PamTotpPeriodSeconds;
+        var beforePamTotpPrompt = selectedServer.PamTotpPrompt;
+        var beforePamAutoConfirm = selectedServer.PamAutoConfirm;
+        var beforePamConfirmPrompt = selectedServer.PamConfirmPrompt;
         SetManagerOverride(selectedServer, nameof(ManagedServer.Name), selectedServer.Name, ServerNameBox.Text.Trim(), value => selectedServer.Name = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.Host), selectedServer.Host, HostBox.Text.Trim(), value => selectedServer.Host = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.Port), selectedServer.Port, port, value => selectedServer.Port = value);
@@ -870,6 +966,16 @@ public partial class MainWindow : Window
             selectedServer.ReconnectOnConnectionFailure, ReconnectOnConnectionFailureBox.IsChecked == true, value => selectedServer.ReconnectOnConnectionFailure = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.ReconnectOnSystemWakeup),
             selectedServer.ReconnectOnSystemWakeup, ReconnectOnSystemWakeupBox.IsChecked == true, value => selectedServer.ReconnectOnSystemWakeup = value);
+        selectedServer.UsePam = UsePamBox.IsChecked == true;
+        selectedServer.PamSshCommand = PamSshCommandBox.Text.Trim();
+        selectedServer.PamPassword = PamPasswordBox.Value;
+        selectedServer.PamTotpSecret = PamTotpSecretBox.Value.Trim();
+        selectedServer.PamTotpAlgorithm = GetSelectedPamTotpAlgorithm();
+        selectedServer.PamTotpDigits = pamDigits;
+        selectedServer.PamTotpPeriodSeconds = pamPeriod;
+        selectedServer.PamTotpPrompt = string.IsNullOrWhiteSpace(PamTotpPromptBox.Text) ? "OTP: " : PamTotpPromptBox.Text;
+        selectedServer.PamAutoConfirm = PamAutoConfirmBox.IsChecked == true;
+        selectedServer.PamConfirmPrompt = string.IsNullOrWhiteSpace(PamConfirmPromptBox.Text) ? "[Y/n]" : PamConfirmPromptBox.Text;
         var requiredPreviousServerId = selectedRequiredRouteOption?.Id;
         try
         {
@@ -888,6 +994,16 @@ public partial class MainWindow : Window
             selectedServer.RequiredPreviousServerId = beforeRequiredPreviousServerId;
             selectedServer.TryDirectWithoutJumphost = beforeTryDirectWithoutJumphost;
             selectedServer.ManagerOverrides = beforeOverrides;
+            selectedServer.UsePam = beforeUsePam;
+            selectedServer.PamSshCommand = beforePamSshCommand;
+            selectedServer.PamPassword = beforePamPassword;
+            selectedServer.PamTotpSecret = beforePamTotpSecret;
+            selectedServer.PamTotpAlgorithm = beforePamTotpAlgorithm;
+            selectedServer.PamTotpDigits = beforePamTotpDigits;
+            selectedServer.PamTotpPeriodSeconds = beforePamTotpPeriodSeconds;
+            selectedServer.PamTotpPrompt = beforePamTotpPrompt;
+            selectedServer.PamAutoConfirm = beforePamAutoConfirm;
+            selectedServer.PamConfirmPrompt = beforePamConfirmPrompt;
             ShowServer(selectedServer);
             Error(ex);
             return;
@@ -923,7 +1039,17 @@ public partial class MainWindow : Window
         EnableTcpKeepalives = EnableTcpKeepalivesBox.IsChecked == true,
         ReconnectOnConnectionFailure = ReconnectOnConnectionFailureBox.IsChecked == true,
         ReconnectOnSystemWakeup = ReconnectOnSystemWakeupBox.IsChecked == true,
-        RequiredPreviousServerId = selectedRequiredRouteOption?.Id
+        RequiredPreviousServerId = selectedRequiredRouteOption?.Id,
+        UsePam = UsePamBox.IsChecked == true,
+        PamSshCommand = PamSshCommandBox.Text,
+        PamPassword = PamPasswordBox.Value,
+        PamTotpSecret = PamTotpSecretBox.Value,
+        PamTotpAlgorithm = GetSelectedPamTotpAlgorithm(),
+        PamTotpDigitsText = PamTotpDigitsBox.Text,
+        PamTotpPeriodText = PamTotpPeriodBox.Text,
+        PamTotpPrompt = PamTotpPromptBox.Text,
+        PamAutoConfirm = PamAutoConfirmBox.IsChecked == true,
+        PamConfirmPrompt = PamConfirmPromptBox.Text
     };
 
     private bool IsServerBeingEditedWithUnsavedChanges(Guid serverId)
@@ -1233,6 +1359,231 @@ public partial class MainWindow : Window
         CancellationToken externalCancellationToken = default)
     {
         if (BlockIfOperationRunning()) return;
+        if (server.UsePam && string.IsNullOrWhiteSpace(server.PamSshCommand))
+        {
+            Warn("Для сессии с PAM-авторизацией необходимо указать SSH-команду PAM.");
+            return;
+        }
+        if (server.UsePam)
+        {
+            ssh.ClearFailureCache();
+            await BusyAsync("Строю SSH-маршрут с PAM-авторизацией…", async cancellationToken =>
+            {
+                var jumpHostCandidates = ResolveJumpHostCandidates(server, forcedViaServerId);
+                ActiveRoute? route = null;
+                ManagedServer? connectedJumpHost = null;
+                BaseProxy? connectedProxy = null;
+                RouteCandidate? connectedCandidate = null;
+                Exception? lastException = null;
+
+                foreach (var item in jumpHostCandidates)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var jumpHostKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(item.JumpHost.PrivateKeyPath, "SSH-ключ");
+                    if (ManagerPathResolver.MissingConfiguredFileMessage(item.JumpHost.PrivateKeyPath, "SSH-ключ") is { } missingJumpHostKeyMessage)
+                    {
+                        RouteLog($"JumpHost {item.JumpHost.Name} skipped: {missingJumpHostKeyMessage}");
+                        continue;
+                    }
+                    var jumpHostKey = PrivateKeyInspector.Inspect(jumpHostKeyPath ?? "");
+                    if (jumpHostKey.Encrypted == true && item.JumpHost.PrivateKeyPassphrase.Length == 0)
+                    {
+                        RouteLog($"JumpHost {item.JumpHost.Name} skipped: required encrypted key passphrase is empty");
+                        continue;
+                    }
+
+                    try
+                    {
+                        Status($"Подключаюсь к JumpHost «{item.JumpHost.Name}»…");
+                        route = await Connect(item.JumpHost, cancellationToken, true);
+                        connectedJumpHost = item.JumpHost;
+                        connectedProxy = item.Proxy;
+                        connectedCandidate = item.Candidate;
+                        break;
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastException = ex;
+                        RouteLog($"Connect to JumpHost {item.JumpHost.Name} failed: {ex.Message}");
+                    }
+                }
+
+                if (route is null || connectedJumpHost is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Не удалось подключиться ни к одному JumpHost для PAM-авторизации сессии «{server.Name}».", lastException);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                // Synchronized safe TOTP window check for JumpHost proxy and PAM TOTP
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var now = DateTimeOffset.UtcNow;
+                    var needDelaySeconds = 0;
+
+                    if (connectedProxy is not null && connectedProxy.StartupServerId == connectedJumpHost.Id && connectedProxy.TotpSecret.Length > 0)
+                    {
+                        var jhPeriod = Math.Max(1, connectedProxy.TotpPeriodSeconds);
+                        var jhRemaining = jhPeriod - (now.ToUnixTimeSeconds() % jhPeriod);
+                        if (jhRemaining < PamLoginPlan.SafeMargin(jhPeriod))
+                            needDelaySeconds = Math.Max(needDelaySeconds, (int)jhRemaining + 1);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(server.PamTotpSecret))
+                    {
+                        var pamPeriod = server.PamTotpPeriodSeconds >= 1 ? server.PamTotpPeriodSeconds : 30;
+                        var pamRemaining = pamPeriod - (now.ToUnixTimeSeconds() % pamPeriod);
+                        if (pamRemaining < PamLoginPlan.SafeMargin(pamPeriod))
+                            needDelaySeconds = Math.Max(needDelaySeconds, (int)pamRemaining + 1);
+                    }
+
+                    if (needDelaySeconds == 0)
+                        break;
+
+                    Status($"Ожидание безопасного окна TOTP ({needDelaySeconds} с)…");
+                    await Task.Delay(TimeSpan.FromSeconds(needDelaySeconds), cancellationToken);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var loadSavedSession = !string.IsNullOrWhiteSpace(connectedJumpHost.SourceSessionPath) &&
+                                       File.Exists(connectedJumpHost.SourceSessionPath);
+                var kitty = loadSavedSession
+                    ? FindKittyNearSession(connectedJumpHost.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
+                    : ResolveProgram(config.KittyPath);
+                Process? process = null;
+                KittyRoutedSession? routedSession = null;
+                KittyLoginScript? loginScript = null;
+                string? sessionLogPath = null;
+                try
+                {
+                    var directEndpoint = route.CanDetachDirectConsole
+                        ? route.Hops.Single()
+                        : null;
+                    if (loadSavedSession)
+                        routedSession = directEndpoint is null
+                            ? KittyRoutedSession.Create(
+                                connectedJumpHost.SourceSessionPath!, route.LocalSshPort, null,
+                                true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost)
+                            : KittyRoutedSession.CreateDirect(
+                                connectedJumpHost.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
+                                null, true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost);
+                    else
+                        routedSession = directEndpoint is null
+                            ? KittyRoutedSession.CreateMinimal(
+                                "127.0.0.1", route.LocalSshPort, null,
+                                true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost)
+                            : KittyRoutedSession.CreateMinimal(
+                                directEndpoint.Host, directEndpoint.Port, null,
+                                true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost);
+
+                    var steps = PamLoginPlan.BuildPromptResponses(server, connectedJumpHost, DateTimeOffset.UtcNow, connectedProxy);
+                    loginScript = KittyLoginScript.Create(steps);
+
+                    var needsJhOtp = connectedProxy is not null && connectedProxy.StartupServerId == connectedJumpHost.Id && connectedProxy.TotpSecret.Length > 0;
+                    var needsPamOtp = server.UsePam && !string.IsNullOrWhiteSpace(server.PamTotpSecret);
+
+                    if (needsJhOtp || needsPamOtp)
+                    {
+                        sessionLogPath = Path.Combine(Path.GetTempPath(), $"kitty-manager-jh-otp-{Guid.NewGuid():N}.log");
+                    }
+
+                    var startInfo = new ProcessStartInfo(kitty)
+                    {
+                        WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                        WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
+                    };
+                    var shouldUseSavedSession = routedSession is not null;
+                    var arguments = directEndpoint is null
+                        ? KittyLaunchPlan.PamRoutedConsoleArguments(
+                            server, connectedJumpHost, route.LocalSshPort, shouldUseSavedSession,
+                            routedSession?.Path, loginScript?.Path)
+                        : KittyLaunchPlan.PamDirectConsoleArguments(
+                            server, connectedJumpHost, directEndpoint.Host, directEndpoint.Port,
+                            shouldUseSavedSession, routedSession?.Path, loginScript?.Path);
+                    foreach (var argument in arguments)
+                        startInfo.ArgumentList.Add(argument);
+                    if (sessionLogPath is not null)
+                    {
+                        startInfo.ArgumentList.Add("-sessionlog");
+                        startInfo.ArgumentList.Add(sessionLogPath);
+                    }
+                    RouteLog($"KiTTY PAM launch: target={server.Name}; via={connectedJumpHost.Name}; " +
+                             $"local=127.0.0.1:{route.LocalSshPort}; loghost={connectedJumpHost.Host}:{connectedJumpHost.Port}; " +
+                             $"saved-session={loadSavedSession}; login-script={(loginScript is not null ? "present" : "none")}; " +
+                             $"jh-otp-log={(sessionLogPath is not null ? "present" : "none")}");
+                    process = Process.Start(startInfo);
+                    if (process is not null && sessionLogPath is not null)
+                    {
+                        KittyWindowInput.SpawnDetachedLogCleanupWatcher(process, sessionLogPath);
+
+                        var consumedOffset = 0;
+                        if (needsJhOtp)
+                        {
+                            var jhPrompt = string.IsNullOrWhiteSpace(connectedProxy!.TotpPrompt) ? "OTP" : connectedProxy.TotpPrompt.Trim();
+                            consumedOffset = await KittyWindowInput.SendLineAfterPromptAsync(
+                                process, sessionLogPath, jhPrompt,
+                                () => TotpGenerator.Generate(connectedProxy.TotpSecret, DateTimeOffset.UtcNow,
+                                    connectedProxy.TotpDigits, connectedProxy.TotpPeriodSeconds, connectedProxy.TotpAlgorithm),
+                                TimeSpan.FromSeconds(20), cancellationToken);
+                        }
+
+                        if (needsPamOtp)
+                        {
+                            var pamPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP" : server.PamTotpPrompt.Trim();
+                            var pamCommand = server.PamSshCommand.Trim();
+                            await KittyWindowInput.SendLineAfterPromptAsync(
+                                process, sessionLogPath, pamPrompt,
+                                () => TotpGenerator.Generate(server.PamTotpSecret, DateTimeOffset.UtcNow,
+                                    server.PamTotpDigits, server.PamTotpPeriodSeconds, server.PamTotpAlgorithm),
+                                TimeSpan.FromSeconds(30), cancellationToken,
+                                minOffset: consumedOffset,
+                                progressionCheck: text => text.Contains("exec sh -c", StringComparison.OrdinalIgnoreCase) || text.Contains(pamCommand, StringComparison.OrdinalIgnoreCase));
+                        }
+                    }
+
+                    lastRouteDisplays[server.Id] = $"Использован маршрут: PAM через {connectedJumpHost.Name}";
+                    if (directEndpoint is not null)
+                    {
+                        ReleaseRoute(route);
+                        RouteLog($"Direct KiTTY console detached from manager: target={connectedJumpHost.Name}; " +
+                                 $"endpoint={directEndpoint.Host}:{directEndpoint.Port}");
+                    }
+                    if (routedSession is not null)
+                    {
+                        var cleanup = routedSession;
+                        routedSession = null;
+                        _ = Task.Run(async () =>
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(10));
+                            cleanup.Dispose();
+                        });
+                    }
+                    if (loginScript is not null)
+                    {
+                        PreserveTemporaryFile(loginScript.Path);
+                        loginScript = null;
+                    }
+                }
+                finally
+                {
+                    if (sessionLogPath is not null)
+                    {
+                        KittyWindowInput.CleanTemporaryLogOnExit(process, sessionLogPath);
+                    }
+                    routedSession?.Dispose();
+                    loginScript?.Dispose();
+                }
+                Log($"Открыта сессия «{server.Name}» с PAM-авторизацией через «{connectedJumpHost.Name}»");
+            }, externalCancellationToken);
+            return;
+        }
         var keyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
         if (ManagerPathResolver.MissingConfiguredFileMessage(
                 server.PrivateKeyPath, "SSH-ключ") is { } missingKeyMessage)
@@ -1365,6 +1716,76 @@ public partial class MainWindow : Window
             await Task.Delay(TimeSpan.FromSeconds(10));
             try { File.Delete(path); } catch { }
         });
+    }
+
+    private List<(ManagedServer JumpHost, BaseProxy? Proxy, RouteCandidate? Candidate)> ResolveJumpHostCandidates(
+        ManagedServer server, Guid? forcedViaServerId = null)
+    {
+        var result = new List<(ManagedServer JumpHost, BaseProxy? Proxy, RouteCandidate? Candidate)>();
+        var seen = new HashSet<(Guid ServerId, Guid? ProxyId)>();
+
+        void TryAdd(ManagedServer s, BaseProxy? p, RouteCandidate? c)
+        {
+            if (s.Id == server.Id) return;
+            if (seen.Add((s.Id, p?.Id)))
+                result.Add((s, p, c));
+        }
+
+        if (forcedViaServerId is Guid forcedId)
+        {
+            var forcedServer = config.FindServer(forcedId)
+                ?? throw new InvalidOperationException($"Сервер-посредник «{forcedId}» не найден.");
+            var proxy = config.BaseProxies.FirstOrDefault(p => p.StartupServerId == forcedId);
+            TryAdd(forcedServer, proxy, null);
+            return result;
+        }
+
+        if (server.RequiredPreviousServerId is Guid requiredId)
+        {
+            var requiredServer = config.FindServer(requiredId)
+                ?? throw new InvalidOperationException("Обязательный сервер-посредник для PAM не найден.");
+            var proxy = config.BaseProxies.FirstOrDefault(p => p.StartupServerId == requiredId);
+            TryAdd(requiredServer, proxy, null);
+            return result;
+        }
+
+        var candidates = RoutePlanner.Candidates(config, server.Id);
+        var ordered = server.PreferredRoute is not null
+            ? RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute)
+            : candidates;
+
+        foreach (var candidate in ordered)
+        {
+            if (candidate.Servers.Count > 1)
+            {
+                var jh = candidate.Servers[^2];
+                var proxy = config.BaseProxies.FirstOrDefault(p => p.StartupServerId == jh.Id);
+                TryAdd(jh, proxy, candidate);
+            }
+            else if (candidate.Proxy.StartupServerId is Guid startupServerId &&
+                     config.FindServer(startupServerId) is ManagedServer startupServer)
+            {
+                TryAdd(startupServer, candidate.Proxy, candidate);
+            }
+        }
+
+        if (result.Count == 0)
+        {
+            foreach (var proxy in config.BaseProxies.Where(p => p.Enabled && p.StartupServerId is not null && p.StartupServerId != server.Id))
+            {
+                var startupServer = config.FindServer(proxy.StartupServerId!.Value);
+                if (startupServer is not null)
+                    TryAdd(startupServer, proxy, null);
+            }
+        }
+
+        if (result.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Для сессии «{server.Name}» с PAM-авторизацией не удалось определить сервер JumpHost.");
+        }
+
+        return result;
     }
 
     private async void OpenWeb_Click(object sender, RoutedEventArgs e)
@@ -4045,6 +4466,7 @@ public partial class MainWindow : Window
         tunnelService.Dispose();
         foreach (var route in activeRoutes) route.Dispose();
         if (trayIcon is not null) { trayIcon.Visible = false; trayIcon.Dispose(); }
+        KittyWindowInput.CleanupStaleLogs();
         pendingUpdateSession?.Commit();
     }
 
@@ -4307,7 +4729,7 @@ public partial class MainWindow : Window
     {
         var result = text;
         foreach (var secret in config.AllServers()
-                     .SelectMany(server => new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword }
+                     .SelectMany(server => new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword, server.PamPassword, server.PamTotpSecret }
                          .Concat(server.WebInterfaces.Select(web => web.Password)))
                      .Where(secret => !string.IsNullOrEmpty(secret))
                      .Distinct(StringComparer.Ordinal)

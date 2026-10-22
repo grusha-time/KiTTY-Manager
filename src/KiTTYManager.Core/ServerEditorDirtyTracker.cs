@@ -20,6 +20,16 @@ public sealed class ServerEditorDraft
     public bool ReconnectOnConnectionFailure { get; set; } = true;
     public bool ReconnectOnSystemWakeup { get; set; } = true;
     public Guid? RequiredPreviousServerId { get; set; }
+    public bool UsePam { get; set; }
+    public string PamSshCommand { get; set; } = "";
+    public string PamPassword { get; set; } = "";
+    public string PamTotpSecret { get; set; } = "";
+    public string PamTotpAlgorithm { get; set; } = "SHA1";
+    public string PamTotpDigitsText { get; set; } = "6";
+    public string PamTotpPeriodText { get; set; } = "30";
+    public string PamTotpPrompt { get; set; } = "OTP: ";
+    public bool PamAutoConfirm { get; set; }
+    public string PamConfirmPrompt { get; set; } = "[Y/n]";
 }
 
 public static class ServerEditorDirtyTracker
@@ -52,6 +62,28 @@ public static class ServerEditorDirtyTracker
         if (draft.ReconnectOnConnectionFailure != server.ReconnectOnConnectionFailure) return true;
         if (draft.ReconnectOnSystemWakeup != server.ReconnectOnSystemWakeup) return true;
         if (draft.RequiredPreviousServerId != server.RequiredPreviousServerId) return true;
+
+        if (draft.UsePam != server.UsePam) return true;
+        if ((draft.PamSshCommand ?? "").Trim() != (server.PamSshCommand ?? "").Trim()) return true;
+        if ((draft.PamPassword ?? "") != (server.PamPassword ?? "")) return true;
+        if ((draft.PamTotpSecret ?? "").Trim() != (server.PamTotpSecret ?? "").Trim()) return true;
+
+        var draftAlgo = string.IsNullOrWhiteSpace(draft.PamTotpAlgorithm) ? "SHA1" : draft.PamTotpAlgorithm.Trim().ToUpperInvariant();
+        var serverAlgo = string.IsNullOrWhiteSpace(server.PamTotpAlgorithm) ? "SHA1" : server.PamTotpAlgorithm.Trim().ToUpperInvariant();
+        if (draftAlgo != serverAlgo) return true;
+
+        if (!int.TryParse(draft.PamTotpDigitsText, out var pamDigits) || pamDigits != server.PamTotpDigits) return true;
+        if (!int.TryParse(draft.PamTotpPeriodText, out var pamPeriod) || pamPeriod != server.PamTotpPeriodSeconds) return true;
+
+        var effectivePamTotpPrompt = string.IsNullOrWhiteSpace(draft.PamTotpPrompt) ? "OTP: " : draft.PamTotpPrompt;
+        var serverPamTotpPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP: " : server.PamTotpPrompt;
+        if (effectivePamTotpPrompt != serverPamTotpPrompt) return true;
+
+        if (draft.PamAutoConfirm != server.PamAutoConfirm) return true;
+
+        var effectivePamConfirmPrompt = string.IsNullOrWhiteSpace(draft.PamConfirmPrompt) ? "[Y/n]" : draft.PamConfirmPrompt;
+        var serverPamConfirmPrompt = string.IsNullOrWhiteSpace(server.PamConfirmPrompt) ? "[Y/n]" : server.PamConfirmPrompt;
+        if (effectivePamConfirmPrompt != serverPamConfirmPrompt) return true;
 
         return false;
     }

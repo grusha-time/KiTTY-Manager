@@ -417,6 +417,16 @@ public static class ImportWizardEngine
             Add("EnableTcpKeepalives", "TCP keepalive", before.EnableTcpKeepalives.ToString(), after.EnableTcpKeepalives.ToString());
             Add("ReconnectOnConnectionFailure", "Переподключение при сбое", before.ReconnectOnConnectionFailure.ToString(), after.ReconnectOnConnectionFailure.ToString());
             Add("ReconnectOnSystemWakeup", "Переподключение при выходе из сна", before.ReconnectOnSystemWakeup.ToString(), after.ReconnectOnSystemWakeup.ToString());
+            Add("UsePam", "Использовать PAM", before.UsePam.ToString(), after.UsePam.ToString());
+            Add("PamSshCommand", "SSH-команда PAM", before.PamSshCommand, after.PamSshCommand);
+            Add("PamPassword", "Пароль PAM", before.PamPassword, after.PamPassword, secret: true);
+            Add("PamTotpSecret", "TOTP-секрет PAM", before.PamTotpSecret, after.PamTotpSecret, secret: true);
+            Add("PamTotpAlgorithm", "Алгоритм TOTP PAM", before.PamTotpAlgorithm, after.PamTotpAlgorithm);
+            Add("PamTotpDigits", "Количество цифр TOTP PAM", before.PamTotpDigits.ToString(), after.PamTotpDigits.ToString());
+            Add("PamTotpPeriodSeconds", "Период TOTP PAM", before.PamTotpPeriodSeconds.ToString(), after.PamTotpPeriodSeconds.ToString());
+            Add("PamTotpPrompt", "Запрос OTP PAM", before.PamTotpPrompt, after.PamTotpPrompt);
+            Add("PamAutoConfirm", "Автоподтверждение PAM", before.PamAutoConfirm.ToString(), after.PamAutoConfirm.ToString());
+            Add("PamConfirmPrompt", "Запрос подтверждения PAM", before.PamConfirmPrompt, after.PamConfirmPrompt);
 
             void Add(string property, string label, string oldValue, string newValue, bool secret = false, bool keepCurrent = false)
             {
@@ -517,6 +527,16 @@ public static class ImportWizardEngine
                 case "EnableTcpKeepalives": target.EnableTcpKeepalives = source.EnableTcpKeepalives; break;
                 case "ReconnectOnConnectionFailure": target.ReconnectOnConnectionFailure = source.ReconnectOnConnectionFailure; break;
                 case "ReconnectOnSystemWakeup": target.ReconnectOnSystemWakeup = source.ReconnectOnSystemWakeup; break;
+                case "UsePam": target.UsePam = source.UsePam; break;
+                case "PamSshCommand": target.PamSshCommand = source.PamSshCommand; break;
+                case "PamPassword": target.PamPassword = source.PamPassword; break;
+                case "PamTotpSecret": target.PamTotpSecret = source.PamTotpSecret; break;
+                case "PamTotpAlgorithm": target.PamTotpAlgorithm = source.PamTotpAlgorithm; break;
+                case "PamTotpDigits": target.PamTotpDigits = source.PamTotpDigits; break;
+                case "PamTotpPeriodSeconds": target.PamTotpPeriodSeconds = source.PamTotpPeriodSeconds; break;
+                case "PamTotpPrompt": target.PamTotpPrompt = source.PamTotpPrompt; break;
+                case "PamAutoConfirm": target.PamAutoConfirm = source.PamAutoConfirm; break;
+                case "PamConfirmPrompt": target.PamConfirmPrompt = source.PamConfirmPrompt; break;
             }
     }
 

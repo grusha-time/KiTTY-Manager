@@ -83,6 +83,16 @@ public sealed class ManagedServer
     public string ShellPrompt { get; set; } = "$";
     public string ImportedCommand { get; set; } = "";
     public bool IgnoreImportedCommand { get; set; }
+    public bool UsePam { get; set; }
+    public string PamSshCommand { get; set; } = "";
+    public string PamPassword { get; set; } = "";
+    public string PamTotpSecret { get; set; } = "";
+    public string PamTotpAlgorithm { get; set; } = "SHA1";
+    public int PamTotpDigits { get; set; } = 6;
+    public int PamTotpPeriodSeconds { get; set; } = 30;
+    public string PamTotpPrompt { get; set; } = "OTP: ";
+    public bool PamAutoConfirm { get; set; }
+    public string PamConfirmPrompt { get; set; } = "[Y/n]";
     private int _keepaliveIntervalSeconds = 15;
     private bool _enableTcpKeepalives = true;
     private bool _reconnectOnConnectionFailure = true;
