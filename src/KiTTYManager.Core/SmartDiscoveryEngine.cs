@@ -1234,6 +1234,7 @@ public sealed class SmartDiscoveryEngine
         {
             var (savedGatewaySeeds, savedRouteByGatewayId) = ResolveSavedGateways();
             var allKnownGateways = savedGatewaySeeds
+                .Concat(discovered.Where(g => g.IsDuplicate && savedRouteByGatewayId.ContainsKey(g.Id)))
                 .Concat((initialGateways ?? []).Where(g => !g.IsDuplicate || savedRouteByGatewayId.ContainsKey(g.Id)))
                 .DistinctBy(gateway => gateway.Id)
                 .ToList();
@@ -1412,12 +1413,18 @@ public sealed class SmartDiscoveryEngine
             var attemptsPerPassword = Math.Max(1, options.AttemptsPerPassword);
             string lastReason = "Не удалось подобрать учётные данные";
             string currentStage = "Аутентификация";
+            var hadAuthFailure = false;
+            string? lastAuthReason = null;
+            string? lastUnreachableReason = null;
 
-            foreach (var (u, p) in orderedCredentials)
+            var credentialsQueue = new Queue<(string User, string Pass)>(orderedCredentials);
+            var retried = new HashSet<(string User, string Pass)>();
+            var stopAll = false;
+
+            while (credentialsQueue.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
-                var stopAll = false;
-                var allUnreachable = false;
+                var (u, p) = credentialsQueue.Dequeue();
 
                 for (var attemptIndex = 0; attemptIndex < attemptsPerPassword; attemptIndex++)
                 {
@@ -1551,33 +1558,50 @@ public sealed class SmartDiscoveryEngine
                         else if (result.IsAuthFailure)
                         {
                             reachedAny = true;
+                            hadAuthFailure = true;
+                            lastAuthReason = $"Неверный логин или пароль: {result.ErrorMessage}";
                             lock (syncLock)
                             {
                                 hostAttempts.TryGetValue(host, out var used);
                                 hostAttempts[host] = used + 1;
                             }
                             Log($"Хост {host}: вход (пользователь {u}) не удался через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)} (аутентификация).");
-                            currentStage = "Аутентификация";
-                            lastReason = $"Неверный логин или пароль: {result.ErrorMessage}";
                             break;
                         }
                         else if (result.IsUnreachable)
                         {
                             Log($"Хост {host}: соединение (пользователь {u}) недоступно через {DescribeVerifiedEntryPoint(attemptEntryPoint?.Id)}.");
-                            currentStage = "Доступность";
-                            lastReason = $"Сбой соединения: {result.ErrorMessage}";
+                            lastUnreachableReason = $"Сбой соединения: {result.ErrorMessage}";
                         }
                     }
 
                     if (stopAll) break;
                     if (!reachedAny)
                     {
-                        allUnreachable = true;
+                        if (retried.Add((u, p)))
+                        {
+                            credentialsQueue.Enqueue((u, p));
+                        }
                         break;
                     }
                 }
 
-                if (stopAll || allUnreachable) break;
+                if (stopAll) break;
+            }
+
+            if (currentStage != "HostKey" && !stopAll)
+            {
+                if (hadAuthFailure)
+                {
+                    currentStage = "Аутентификация";
+                    if (lastAuthReason != null)
+                        lastReason = lastAuthReason;
+                }
+                else if (lastUnreachableReason != null)
+                {
+                    currentStage = "Доступность";
+                    lastReason = lastUnreachableReason;
+                }
             }
 
             var problem = new ProblematicServerCandidate

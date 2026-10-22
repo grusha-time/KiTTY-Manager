@@ -20,6 +20,7 @@ internal sealed partial class SelfTestRunner
         public Dictionary<string, int> FailUntilAttempt { get; } = new(StringComparer.OrdinalIgnoreCase);
         public Action<string>? OnHostProbed { get; set; }
         public string AuthErrorMessage { get; set; } = "Неверные учетные данные";
+        public Func<ManagedServer, SmartDiscoveryAuthResult?>? CustomAuthHandler { get; set; }
 
         public List<(string host, string user, string pass)> AttemptedLogins { get; } = [];
         public List<(string host, Guid? proxyId)> ReachabilityAttempts { get; } = [];
@@ -109,6 +110,9 @@ internal sealed partial class SelfTestRunner
             int attemptsPerPassword = 1)
         {
             AttemptedLogins.Add((target.Host, target.Username, target.Password));
+
+            if (CustomAuthHandler?.Invoke(target) is { } customRes)
+                return Task.FromResult(customRes);
 
             if (intermediateGateways.Count == 0 && DirectAuthUnreachable.Contains(target.Host))
             {
@@ -326,7 +330,7 @@ internal sealed partial class SelfTestRunner
         Equal(4, host3Attempts.Count);
 
         // Network connection failure during authentication must NOT burn credential attempts,
-        // and must break early without trying remaining passwords.
+        // and deferred retry queue allows exactly one deferred retry for each unreachable pair (5 initial + 5 retries = 10 attempts).
         var unreachableProbe = new TestSmartDiscoveryProbe();
         unreachableProbe.DirectlyReachable.Add("10.0.0.5");
         unreachableProbe.DirectAuthUnreachable.Add("10.0.0.5");
@@ -348,9 +352,9 @@ internal sealed partial class SelfTestRunner
         var prob5 = unreachableResult.Problematic.Single(p => p.Host == "10.0.0.5");
         Equal("Доступность", prob5.Stage);
 
-        // Crucial: Only 1 attempt made (broke early after first password failed on network reachability)
+        // Crucial: 10 attempts made (5 passwords tried initially, each unreachable pair retried once)
         var host5Attempts = unreachableProbe.AttemptedLogins.Where(a => a.host == "10.0.0.5").ToList();
-        Equal(1, host5Attempts.Count);
+        Equal(10, host5Attempts.Count);
     }
 
     private static void PrivilegeEscalationOrderingTests()
@@ -3516,6 +3520,214 @@ internal sealed partial class SelfTestRunner
             config21, options21, probe21, initialGateways: [initGw]);
         initGw.RequiredPreviousServerId = Guid.NewGuid();
         initGw.DiscoveredLinksFrom.Add(Guid.NewGuid());
+
+        // 22. Deferred retry: first pair A returns unreachable, pair B returns auth failure,
+        // retried attempt of pair A succeeds (call order: A, B, A; result: success A)
+        var config22 = new ManagerConfig();
+        var probe22 = new TestSmartDiscoveryProbe();
+        probe22.DirectlyReachable.Add("10.22.0.1");
+
+        var attemptA = 0;
+        probe22.CustomAuthHandler = target =>
+        {
+            if (target.Password == "passA")
+            {
+                attemptA++;
+                if (attemptA == 1)
+                    return SmartDiscoveryAuthResult.FailedReachability("Network glitch on A");
+                return SmartDiscoveryAuthResult.Succeeded(target.Host, new PrivilegeEscalationResult { Method = "Root", Success = true });
+            }
+            if (target.Password == "passB")
+            {
+                return SmartDiscoveryAuthResult.FailedAuth("Bad credentials on B");
+            }
+            return null;
+        };
+
+        var options22 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.22.0.1"],
+            Usernames = ["admin"],
+            Passwords = ["passA", "passB"],
+            MaxParallelConnections = 1
+        };
+
+        var engine22 = new SmartDiscoveryEngine(config22, options22, probe22);
+        var result22 = engine22.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result22.Discovered.Count);
+        Equal(0, result22.Problematic.Count);
+        Equal("passA", result22.Discovered[0].Password);
+        Equal(3, probe22.AttemptedLogins.Count);
+        Equal("passA", probe22.AttemptedLogins[0].pass);
+        Equal("passB", probe22.AttemptedLogins[1].pass);
+        Equal("passA", probe22.AttemptedLogins[2].pass);
+
+        // 23. Unreachable does not block auth: pair A returns unreachable, pair B succeeds immediately (no waiting for deferred A)
+        var config23 = new ManagerConfig();
+        var probe23 = new TestSmartDiscoveryProbe();
+        probe23.DirectlyReachable.Add("10.23.0.1");
+
+        probe23.CustomAuthHandler = target =>
+        {
+            if (target.Password == "passA")
+                return SmartDiscoveryAuthResult.FailedReachability("Network timeout on A");
+            if (target.Password == "passB")
+                return SmartDiscoveryAuthResult.Succeeded(target.Host, new PrivilegeEscalationResult { Method = "Root", Success = true });
+            return null;
+        };
+
+        var options23 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.23.0.1"],
+            Usernames = ["admin"],
+            Passwords = ["passA", "passB"],
+            MaxParallelConnections = 1
+        };
+
+        var engine23 = new SmartDiscoveryEngine(config23, options23, probe23);
+        var result23 = engine23.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result23.Discovered.Count);
+        Equal(0, result23.Problematic.Count);
+        Equal("passB", result23.Discovered[0].Password);
+        Equal(2, probe23.AttemptedLogins.Count);
+        Equal("passA", probe23.AttemptedLogins[0].pass);
+        Equal("passB", probe23.AttemptedLogins[1].pass);
+
+        // 24. Auth failure followed by network failure: final stage remains "Аутентификация"
+        var config24 = new ManagerConfig();
+        var probe24 = new TestSmartDiscoveryProbe();
+        probe24.DirectlyReachable.Add("10.24.0.1");
+
+        probe24.CustomAuthHandler = target =>
+        {
+            if (target.Password == "passA")
+                return SmartDiscoveryAuthResult.FailedAuth("Wrong password on A");
+            if (target.Password == "passB")
+                return SmartDiscoveryAuthResult.FailedReachability("Network drop on B");
+            return null;
+        };
+
+        var options24 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.24.0.1"],
+            Usernames = ["admin"],
+            Passwords = ["passA", "passB"],
+            MaxParallelConnections = 1
+        };
+
+        var engine24 = new SmartDiscoveryEngine(config24, options24, probe24);
+        var result24 = engine24.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(0, result24.Discovered.Count);
+        Equal(1, result24.Problematic.Count);
+        var prob24 = result24.Problematic[0];
+        Equal("Аутентификация", prob24.Stage);
+        True(prob24.Reason.Contains("Неверный логин или пароль", StringComparison.Ordinal));
+        // Calls: passA (auth failure), passB (unreachable), passB (deferred retry unreachable) = 3 calls
+        Equal(3, probe24.AttemptedLogins.Count);
+        Equal("passA", probe24.AttemptedLogins[0].pass);
+        Equal("passB", probe24.AttemptedLogins[1].pass);
+        Equal("passB", probe24.AttemptedLogins[2].pass);
+
+        // 25. Duplicate gateway with saved route in Phase 1 discovers host behind it in a single pass
+        // gwServer25 is in otherGroup25 (outside ancestry of target targetGroup25), so savedGatewaySeeds is empty.
+        // It is only recognized as a gateway via discovered duplicates with saved routes (CR-3).
+        var config25 = new ManagerConfig();
+        var targetGroup25 = new ServerGroup { Id = Guid.NewGuid(), Name = "TargetGroup25" };
+        var otherGroup25 = new ServerGroup { Id = Guid.NewGuid(), Name = "OtherGroup25" };
+        config25.Groups.Add(targetGroup25);
+        config25.Groups.Add(otherGroup25);
+
+        var gwServer25 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "GW-Server",
+            Host = "10.25.0.1",
+            Port = 22,
+            Username = "admin",
+            Password = "gwPassword",
+            TryDirectWithoutJumphost = true
+        };
+        otherGroup25.Servers.Add(gwServer25);
+
+        var probe25 = new TestSmartDiscoveryProbe();
+        probe25.DirectlyReachable.Add("10.25.0.1");
+        probe25.ValidCredentials["10.25.0.1"] = [("admin", "gwPassword")];
+        // 10.25.0.2 is not directly reachable, but reachable via hop from 10.25.0.1
+        probe25.HopReachability.Add(("10.25.0.1", "10.25.0.2"));
+        probe25.ValidCredentials["10.25.0.2"] = [("admin", "targetPassword")];
+
+        var options25 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.25.0.1", "10.25.0.2"],
+            Usernames = ["admin"],
+            Passwords = ["gwPassword", "targetPassword"],
+            TargetGroupId = targetGroup25.Id,
+            PreferGroupGateways = true
+        };
+
+        var engine25 = new SmartDiscoveryEngine(config25, options25, probe25);
+        var result25 = engine25.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(0, probe25.ReachabilityAttempts.Count);
+        Equal(2, result25.Discovered.Count);
+        Equal(0, result25.Problematic.Count);
+        var dupCand25 = result25.Discovered.Single(c => c.Host == "10.25.0.1");
+        True(dupCand25.IsDuplicate);
+        var targetCand25 = result25.Discovered.Single(c => c.Host == "10.25.0.2");
+        Equal(false, targetCand25.IsDuplicate);
+        Equal(gwServer25.Id, targetCand25.RequiredPreviousServerId);
+
+        // 26. Late unreachable with AttemptsPerPassword = 2:
+        // Pair A attempt 1 -> auth failure, attempt 2 -> unreachable. Pair B -> always auth failure.
+        // Deferred pair A retries and succeeds.
+        // Call order: A, A, B, B, A.
+        var config26 = new ManagerConfig();
+        var probe26 = new TestSmartDiscoveryProbe();
+        probe26.DirectlyReachable.Add("10.26.0.1");
+
+        var attemptA26 = 0;
+        probe26.CustomAuthHandler = target =>
+        {
+            if (target.Password == "passA")
+            {
+                attemptA26++;
+                if (attemptA26 == 1)
+                    return SmartDiscoveryAuthResult.FailedAuth("First attempt auth failure on A");
+                if (attemptA26 == 2)
+                    return SmartDiscoveryAuthResult.FailedReachability("Second attempt network glitch on A");
+                return SmartDiscoveryAuthResult.Succeeded(target.Host, new PrivilegeEscalationResult { Method = "Root", Success = true });
+            }
+            if (target.Password == "passB")
+            {
+                return SmartDiscoveryAuthResult.FailedAuth("Always bad credentials on B");
+            }
+            return null;
+        };
+
+        var options26 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.26.0.1"],
+            Usernames = ["admin"],
+            Passwords = ["passA", "passB"],
+            AttemptsPerPassword = 2,
+            MaxParallelConnections = 1
+        };
+
+        var engine26 = new SmartDiscoveryEngine(config26, options26, probe26);
+        var result26 = engine26.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(1, result26.Discovered.Count);
+        Equal(0, result26.Problematic.Count);
+        Equal("passA", result26.Discovered[0].Password);
+        Equal(5, probe26.AttemptedLogins.Count);
+        Equal("passA", probe26.AttemptedLogins[0].pass);
+        Equal("passA", probe26.AttemptedLogins[1].pass);
+        Equal("passB", probe26.AttemptedLogins[2].pass);
+        Equal("passB", probe26.AttemptedLogins[3].pass);
+        Equal("passA", probe26.AttemptedLogins[4].pass);
     }
 
     private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
