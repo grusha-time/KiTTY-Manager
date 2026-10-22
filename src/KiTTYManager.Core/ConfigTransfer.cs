@@ -35,6 +35,10 @@ public static class ConfigTransfer
         bool includeEntryPoints)
     {
         var selected = selectedServerIds.ToHashSet();
+        var jumphostServerIds = source.BaseProxies
+            .Where(p => p.StartupServerId is not null)
+            .Select(p => p.StartupServerId!.Value)
+            .ToHashSet();
         var result = Clone(source);
         result.Groups = PruneGroups(result.Groups, selected);
         result.UngroupedServers.RemoveAll(server => !selected.Contains(server.Id));
@@ -86,7 +90,7 @@ public static class ConfigTransfer
         SanitizePreferredRoutes(result);
 
         ResetAppSettingsForExport(result);
-        SanitizeProxiesForExport(result);
+        SanitizeProxiesForExport(result, jumphostServerIds);
         DetachKittyPaths(result);
 
         return result;
@@ -137,13 +141,8 @@ public static class ConfigTransfer
         config.PendingFirefoxContainerCleanups = [];
     }
 
-    private static void SanitizeProxiesForExport(ManagerConfig config)
+    private static void SanitizeProxiesForExport(ManagerConfig config, IReadOnlySet<Guid> jumphostServerIds)
     {
-        var jumphostServerIds = config.BaseProxies
-            .Where(p => p.StartupServerId is not null)
-            .Select(p => p.StartupServerId!.Value)
-            .ToHashSet();
-
         foreach (var proxy in config.BaseProxies)
         {
             proxy.TotpSecret = "";

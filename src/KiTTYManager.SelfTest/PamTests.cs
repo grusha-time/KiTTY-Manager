@@ -320,7 +320,8 @@ internal sealed partial class SelfTestRunner
             Groups = [new ServerGroup { Servers = [jumpHost, target] }]
         };
 
-        var exported = ConfigTransfer.CreateExport(config, [jumpHost.Id, target.Id], true);
+        // 1. Экспорт с точками входа
+        var exported = ConfigTransfer.CreateExport(config, [jumpHost.Id, target.Id], includeEntryPoints: true);
 
         var exportedJh = exported.FindServer(jumpHost.Id);
         var exportedTarget = exported.FindServer(target.Id);
@@ -331,6 +332,19 @@ internal sealed partial class SelfTestRunner
         Equal("", exportedJh.PamTotpSecret);
         Equal("target-pam-secret-preserved", exportedTarget!.PamPassword);
         Equal("target-totp-secret-preserved", exportedTarget.PamTotpSecret);
+
+        // 2. Экспорт без точек входа (секреты PAM сервера-JumpHost всё равно должны очищаться)
+        var exportedWithoutEp = ConfigTransfer.CreateExport(config, [jumpHost.Id, target.Id], includeEntryPoints: false);
+
+        var exportedJhWithoutEp = exportedWithoutEp.FindServer(jumpHost.Id);
+        var exportedTargetWithoutEp = exportedWithoutEp.FindServer(target.Id);
+
+        Equal(true, exportedJhWithoutEp is not null);
+        Equal(true, exportedTargetWithoutEp is not null);
+        Equal("", exportedJhWithoutEp!.PamPassword);
+        Equal("", exportedJhWithoutEp.PamTotpSecret);
+        Equal("target-pam-secret-preserved", exportedTargetWithoutEp!.PamPassword);
+        Equal("target-totp-secret-preserved", exportedTargetWithoutEp.PamTotpSecret);
     }
 
     private static void PamServerEditorDirtyTrackerTests()
@@ -912,6 +926,167 @@ internal sealed partial class SelfTestRunner
         finally
         {
             try { Directory.Delete(staleDir, true); } catch { }
+        }
+    }
+
+    private static void PamSmartImportFieldAcceptRejectTests()
+    {
+        var local = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Server1",
+            Host = "10.0.0.1",
+            Port = 22,
+            Username = "user",
+            UsePam = false,
+            PamSshCommand = "",
+            PamPassword = "",
+            PamTotpSecret = "",
+            PamTotpAlgorithm = "SHA1",
+            PamTotpDigits = 6,
+            PamTotpPeriodSeconds = 30,
+            PamTotpPrompt = "OTP: ",
+            PamAutoConfirm = false,
+            PamConfirmPrompt = "[Y/n]"
+        };
+
+        var incomingServer = new ManagedServer
+        {
+            Id = local.Id,
+            Name = "Server1",
+            Host = "10.0.0.1",
+            Port = 22,
+            Username = "user",
+            UsePam = true,
+            PamSshCommand = "ssh -p 2222 app@internal",
+            PamPassword = "new-pam-secret-password",
+            PamTotpSecret = "JBSWY3DPEHPK3PXP",
+            PamTotpAlgorithm = "SHA256",
+            PamTotpDigits = 8,
+            PamTotpPeriodSeconds = 60,
+            PamTotpPrompt = "Verification Code: ",
+            PamAutoConfirm = true,
+            PamConfirmPrompt = "Continue? (y/n)"
+        };
+
+        var current = new ManagerConfig { UngroupedServers = [local] };
+        var incoming = new ManagerConfig { UngroupedServers = [incomingServer] };
+
+        var plan = ConfigTransfer.AnalyzeSmartImport(current, incoming);
+
+        // 1. All 10 PAM fields are detected as differing
+        var pamFields = plan.Fields.Where(f => f.PropertyName.StartsWith("Pam", StringComparison.Ordinal) || f.PropertyName == "UsePam").ToList();
+        Equal(10, pamFields.Count);
+
+        // 2. Secret fields are redacted in the comparison view (CurrentValue/IncomingValue)
+        var passField = pamFields.Single(f => f.PropertyName == "PamPassword");
+        var secretField = pamFields.Single(f => f.PropertyName == "PamTotpSecret");
+        Equal("не задан", passField.CurrentValue);
+        Equal("задан", passField.IncomingValue);
+        Equal("не задан", secretField.CurrentValue);
+        Equal("задан", secretField.IncomingValue);
+        Equal(false, passField.IncomingValue.Contains("new-pam-secret-password"));
+        Equal(false, secretField.IncomingValue.Contains("JBSWY3DPEHPK3PXP"));
+
+        // 3. Selective acceptance: accept UsePam, PamSshCommand, PamTotpSecret, reject PamPassword, PamAutoConfirm, PamConfirmPrompt
+        foreach (var field in pamFields)
+        {
+            if (field.PropertyName is "PamPassword" or "PamAutoConfirm" or "PamConfirmPrompt")
+                field.UseIncoming = false; // Reject, keep current
+            else
+                field.UseIncoming = true; // Accept from incoming
+        }
+
+        var merged = ConfigTransfer.MergeSmartImport(current, incoming, plan);
+        var mergedServer = merged.UngroupedServers.Single();
+
+        Equal(true, mergedServer.UsePam);
+        Equal("ssh -p 2222 app@internal", mergedServer.PamSshCommand);
+        Equal("", mergedServer.PamPassword); // Kept current (rejected incoming)
+        Equal("JBSWY3DPEHPK3PXP", mergedServer.PamTotpSecret); // Accepted
+        Equal("SHA256", mergedServer.PamTotpAlgorithm); // Accepted
+        Equal(8, mergedServer.PamTotpDigits); // Accepted
+        Equal(60, mergedServer.PamTotpPeriodSeconds); // Accepted
+        Equal("Verification Code: ", mergedServer.PamTotpPrompt); // Accepted
+        Equal(false, mergedServer.PamAutoConfirm); // Kept current (rejected incoming)
+        Equal("[Y/n]", mergedServer.PamConfirmPrompt); // Kept current (rejected incoming)
+
+        // 4. Test session-level Decision = UseIncoming (replaces all fields including all PAM fields)
+        var fullIncomingPlan = ConfigTransfer.AnalyzeSmartImport(current, incoming);
+        fullIncomingPlan.Sessions.Single().Decision = ImportDecision.UseIncoming;
+        var fullMerged = ConfigTransfer.MergeSmartImport(current, incoming, fullIncomingPlan);
+        var fullServer = fullMerged.UngroupedServers.Single();
+        Equal(true, fullServer.UsePam);
+        Equal("ssh -p 2222 app@internal", fullServer.PamSshCommand);
+        Equal("new-pam-secret-password", fullServer.PamPassword);
+        Equal("JBSWY3DPEHPK3PXP", fullServer.PamTotpSecret);
+        Equal("SHA256", fullServer.PamTotpAlgorithm);
+        Equal(8, fullServer.PamTotpDigits);
+        Equal(60, fullServer.PamTotpPeriodSeconds);
+        Equal("Verification Code: ", fullServer.PamTotpPrompt);
+        Equal(true, fullServer.PamAutoConfirm);
+        Equal("Continue? (y/n)", fullServer.PamConfirmPrompt);
+
+        // 5. Test session-level Decision = Skip
+        var skipPlan = ConfigTransfer.AnalyzeSmartImport(current, incoming);
+        skipPlan.Sessions.Single().Decision = ImportDecision.Skip;
+        var skipMerged = ConfigTransfer.MergeSmartImport(current, incoming, skipPlan);
+        var skipServer = skipMerged.UngroupedServers.Single();
+        Equal(false, skipServer.UsePam);
+        Equal("", skipServer.PamSshCommand);
+        Equal("", skipServer.PamPassword);
+    }
+
+    private static void PamExportImportRoundTripTests()
+    {
+        var server = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "PamRoundTripServer",
+            Host = "192.168.10.50",
+            Port = 22,
+            Username = "admin",
+            UsePam = true,
+            PamSshCommand = "ssh -p 2200 devops@bastion.internal",
+            PamPassword = "secure-pam-password",
+            PamTotpSecret = "MFRGGZDFMZTWQ2LK",
+            PamTotpAlgorithm = "SHA512",
+            PamTotpDigits = 7,
+            PamTotpPeriodSeconds = 45,
+            PamTotpPrompt = "Enter 2FA: ",
+            PamAutoConfirm = true,
+            PamConfirmPrompt = "Are you sure? "
+        };
+
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [server]
+        };
+
+        var exportConfig = ConfigTransfer.CreateExport(config, [server.Id], includeEntryPoints: false);
+        var tempFile = Path.Combine(Path.GetTempPath(), $"pam-export-{Guid.NewGuid():N}.json");
+        try
+        {
+            ConfigStore.Export(tempFile, exportConfig);
+            var reloaded = ConfigStore.Import(tempFile);
+
+            var loadedServer = reloaded.UngroupedServers.Single();
+            Equal(server.Id, loadedServer.Id);
+            Equal(server.Name, loadedServer.Name);
+            Equal(server.UsePam, loadedServer.UsePam);
+            Equal(server.PamSshCommand, loadedServer.PamSshCommand);
+            Equal(server.PamPassword, loadedServer.PamPassword);
+            Equal(server.PamTotpSecret, loadedServer.PamTotpSecret);
+            Equal(server.PamTotpAlgorithm, loadedServer.PamTotpAlgorithm);
+            Equal(server.PamTotpDigits, loadedServer.PamTotpDigits);
+            Equal(server.PamTotpPeriodSeconds, loadedServer.PamTotpPeriodSeconds);
+            Equal(server.PamTotpPrompt, loadedServer.PamTotpPrompt);
+            Equal(server.PamAutoConfirm, loadedServer.PamAutoConfirm);
+            Equal(server.PamConfirmPrompt, loadedServer.PamConfirmPrompt);
+        }
+        finally
+        {
+            try { File.Delete(tempFile); } catch { }
         }
     }
 }

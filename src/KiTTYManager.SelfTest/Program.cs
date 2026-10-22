@@ -94,6 +94,8 @@ internal sealed partial class SelfTestRunner
         Test("Завершение сессии JumpHost при сбое PAM SSH и защита от повышения прав", PamFailedLoginTranscriptTests);
         Test("Раздельная обработка первичного JumpHost SSH OTP и вложенного PAM OTP", InitialSshOtpVsNestedPamOtpTests);
         Test("Очистка временного лога сессии привязана к жизненному циклу процесса KiTTY", SessionLogCleanupTiedToProcessLifetimeTests);
+        Test("Умный импорт поддерживает построчный выбор и отклонение полей PAM", PamSmartImportFieldAcceptRejectTests);
+        Test("Полный round-trip экспорта и импорта сессий с параметрами PAM", PamExportImportRoundTripTests);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);
@@ -6918,6 +6920,14 @@ internal sealed partial class SelfTestRunner
         Equal(null, expNormal.SourceSessionPath);
         // Normal server password preserved (not a jumphost)
         Equal("normal-secret", expNormal.Password);
+
+        // Jumphost credentials also cleared when entry points are excluded
+        var exportedNoEp = ConfigTransfer.CreateExport(config, [jhServer.Id, normalServer.Id], false);
+        var expJhNoEp = exportedNoEp.AllServers().First(s => s.Name == "JH");
+        Equal("", expJhNoEp.Username);
+        Equal("", expJhNoEp.Password);
+        Equal("", expJhNoEp.PrivateKeyPassphrase);
+        Equal("", expJhNoEp.RootPassword);
     }
 
     private static void DirectlyReachableFiltersDependent()
