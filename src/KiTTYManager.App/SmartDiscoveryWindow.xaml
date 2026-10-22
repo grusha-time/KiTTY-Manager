@@ -181,38 +181,42 @@
 
         <!-- Secondary options row -->
         <Grid Margin="0,10,0,0">
-          <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-          </Grid.RowDefinitions>
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="*"/>
           </Grid.ColumnDefinitions>
 
-          <CheckBox x:Name="PreferGroupGatewaysCheckBox" Grid.Row="0" Grid.Column="0"
+          <CheckBox x:Name="PreferGroupGatewaysCheckBox" Grid.Column="0"
                     Content="Сначала через независимые серверы группы"
                     IsChecked="True" VerticalAlignment="Center" Margin="0,0,24,0"
                     ToolTip="При указании целевой группы сначала пробовать подключение через её независимые серверы-шлюзы"/>
 
-          <TextBlock Grid.Row="0" Grid.Column="1" Text="Стартовая сессия:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-          <ComboBox x:Name="InitialGatewaySessionComboBox" Grid.Row="0" Grid.Column="2"
+          <TextBlock Grid.Column="1" Text="Стартовая сессия:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+          <ComboBox x:Name="InitialGatewaySessionComboBox" Grid.Column="2"
                     ToolTip="Сессия, которая будет опробована в качестве первого шлюза с наивысшим приоритетом"/>
+        </Grid>
 
-          <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,8,24,0" VerticalAlignment="Center">
+        <!-- Action row: attempts input on left, buttons on right -->
+        <Grid Margin="0,10,0,0">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+
+          <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
             <TextBlock Text="Попыток на 1 пароль:" VerticalAlignment="Center" Margin="0,0,8,0"/>
             <TextBox x:Name="AttemptsPerPasswordBox" Text="1" Width="50" VerticalAlignment="Center"
                      ToolTip="Количество попыток ввода для каждого пароля перед переходом к следующему (минимум 1)"/>
           </StackPanel>
-        </Grid>
 
-        <!-- Scan action buttons -->
-        <WrapPanel Margin="0,12,0,0" HorizontalAlignment="Right">
-          <Button x:Name="StartScanButton" Content="Начать сканирование" Tag="Primary" Click="StartScan_Click" Margin="0,0,8,0"/>
-          <Button x:Name="StopScanButton" Content="Остановить" Tag="Danger" Click="StopScan_Click" IsEnabled="False" Margin="0,0,8,0"/>
-          <Button x:Name="RetrySelectedButton" Content="Повторить выбранные" Click="RetrySelected_Click" IsEnabled="False"/>
-        </WrapPanel>
+          <!-- Scan action buttons -->
+          <WrapPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
+            <Button x:Name="StartScanButton" Content="Начать сканирование" Tag="Primary" Click="StartScan_Click" Margin="0,0,8,0"/>
+            <Button x:Name="StopScanButton" Content="Остановить" Tag="Danger" Click="StopScan_Click" IsEnabled="False" Margin="0,0,8,0"/>
+            <Button x:Name="RetrySelectedButton" Content="Повторить выбранные" Click="RetrySelected_Click" IsEnabled="False"/>
+          </WrapPanel>
+        </Grid>
       </StackPanel>
     </Border>
 
