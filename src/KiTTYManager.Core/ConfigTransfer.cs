@@ -78,8 +78,9 @@ public static class ConfigTransfer
         }
         foreach (var link in result.Links)
         {
-            link.ProxyStatistics.RemoveAll(item => !exportedProxyIds.Contains(item.ProxyId));
+            link.ProxyStatistics.RemoveAll(item => item.ProxyId != Guid.Empty && !exportedProxyIds.Contains(item.ProxyId));
             if (link.LastSuccessfulProxyId is Guid preferredLinkProxyId &&
+                preferredLinkProxyId != Guid.Empty &&
                 !exportedProxyIds.Contains(preferredLinkProxyId))
             {
                 link.LastSuccessfulProxyId = null;
@@ -280,19 +281,23 @@ public static class ConfigTransfer
             if (serverIdMap.TryGetValue(link.FromServerId, out var fromId)) link.FromServerId = fromId;
             if (serverIdMap.TryGetValue(link.ToServerId, out var toId)) link.ToServerId = toId;
             if (link.LastSuccessfulProxyId is Guid linkProxyId)
-                link.LastSuccessfulProxyId = proxyIdMap.TryGetValue(linkProxyId, out var mappedLinkProxyId)
-                    ? mappedLinkProxyId
-                    : result.BaseProxies.Any(proxy => proxy.Id == linkProxyId) ? linkProxyId : null;
+                link.LastSuccessfulProxyId = linkProxyId == Guid.Empty
+                    ? Guid.Empty
+                    : proxyIdMap.TryGetValue(linkProxyId, out var mappedLinkProxyId)
+                        ? mappedLinkProxyId
+                        : result.BaseProxies.Any(proxy => proxy.Id == linkProxyId) ? linkProxyId : null;
             link.ProxyStatistics = link.ProxyStatistics
                 .Select(item =>
                 {
                     var copy = Clone(item);
-                    copy.ProxyId = proxyIdMap.TryGetValue(item.ProxyId, out var mappedStatisticProxyId)
-                        ? mappedStatisticProxyId
-                        : item.ProxyId;
+                    copy.ProxyId = item.ProxyId == Guid.Empty
+                        ? Guid.Empty
+                        : proxyIdMap.TryGetValue(item.ProxyId, out var mappedStatisticProxyId)
+                            ? mappedStatisticProxyId
+                            : item.ProxyId;
                     return copy;
                 })
-                .Where(item => result.BaseProxies.Any(proxy => proxy.Id == item.ProxyId))
+                .Where(item => item.ProxyId == Guid.Empty || result.BaseProxies.Any(proxy => proxy.Id == item.ProxyId))
                 .ToList();
             if (!validServerIds.Contains(link.FromServerId) || !validServerIds.Contains(link.ToServerId)) continue;
             result.Links.RemoveAll(existing =>

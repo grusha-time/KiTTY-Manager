@@ -486,7 +486,7 @@ public static class ConfigStore
         {
             link.ProxyStatistics ??= [];
             if (link.LastSuccessfulProxyId is Guid legacyProxyId &&
-                validProxyIds.Contains(legacyProxyId) &&
+                (legacyProxyId == Guid.Empty || validProxyIds.Contains(legacyProxyId)) &&
                 link.ProxyStatistics.All(item => item.ProxyId != legacyProxyId))
                 link.ProxyStatistics.Add(new LinkProxyStatistic
                 {
@@ -496,11 +496,12 @@ public static class ConfigStore
                     Strategy = link.LastStrategy
                 });
             link.ProxyStatistics = link.ProxyStatistics
-                .Where(item => item is not null && validProxyIds.Contains(item.ProxyId))
+                .Where(item => item is not null && (item.ProxyId == Guid.Empty || validProxyIds.Contains(item.ProxyId)))
                 .GroupBy(item => item.ProxyId)
                 .Select(group => group.OrderByDescending(item => item.LastSuccessUtc).First())
                 .ToList();
             if (link.LastSuccessfulProxyId is Guid invalidLegacyProxyId &&
+                invalidLegacyProxyId != Guid.Empty &&
                 !validProxyIds.Contains(invalidLegacyProxyId))
             {
                 link.LastSuccessfulProxyId = null;

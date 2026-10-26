@@ -749,9 +749,17 @@ public static class ImportWizardEngine
             if (!servers.TryGetValue(source.FromServerId, out var from) || !servers.TryGetValue(source.ToServerId, out var to)) continue;
             var link = Clone(source); link.FromServerId = from; link.ToServerId = to;
             if (link.LastSuccessfulProxyId is Guid proxy)
-                link.LastSuccessfulProxyId = proxies.TryGetValue(proxy, out var mappedProxy) ? mappedProxy : null;
-            link.ProxyStatistics = link.ProxyStatistics.Where(x => proxies.ContainsKey(x.ProxyId))
-                .Select(x => { var copy = Clone(x); copy.ProxyId = proxies[x.ProxyId]; return copy; }).ToList();
+                link.LastSuccessfulProxyId = proxy == Guid.Empty
+                    ? Guid.Empty
+                    : proxies.TryGetValue(proxy, out var mappedProxy) ? mappedProxy : null;
+            link.ProxyStatistics = link.ProxyStatistics
+                .Where(x => x.ProxyId == Guid.Empty || proxies.ContainsKey(x.ProxyId))
+                .Select(x =>
+                {
+                    var copy = Clone(x);
+                    copy.ProxyId = x.ProxyId == Guid.Empty ? Guid.Empty : proxies[x.ProxyId];
+                    return copy;
+                }).ToList();
             var existing = result.Links.FindIndex(x => x.FromServerId == from && x.ToServerId == to);
             if (existing >= 0)
             {

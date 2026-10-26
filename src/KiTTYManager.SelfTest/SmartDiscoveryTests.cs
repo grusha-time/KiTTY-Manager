@@ -3750,14 +3750,15 @@ internal sealed partial class SelfTestRunner
             TryDirectWithoutJumphost = false,
             RequiredPreviousServerId = gateway.Id
         };
-        config.UngroupedServers.Add(gateway);
-        config.UngroupedServers.Add(target);
-        config.Links.Add(new ServerLink
+        var link = new ServerLink
         {
             FromServerId = gateway.Id,
             ToServerId = target.Id,
             LastSuccessUtc = DateTimeOffset.UtcNow
-        });
+        };
+        config.UngroupedServers.Add(gateway);
+        config.UngroupedServers.Add(target);
+        config.Links.Add(link);
         config.BaseProxies.Clear();
 
         var candidates = RoutePlanner.Candidates(config, target.Id);
@@ -3809,6 +3810,38 @@ internal sealed partial class SelfTestRunner
 
         ConfigStore.Normalize(config);
         Equal(null, target.PreferredRoute);
+
+        // Direct multi-hop link statistics with Guid.Empty are preserved with proxy evidence present
+        gateway.TryDirectWithoutJumphost = true;
+        target.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [gateway.Id, target.Id]
+        };
+        var proxyP = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "ProxyP",
+            Host = "127.0.0.1",
+            Port = 1080,
+            Enabled = true
+        };
+        config.BaseProxies.Add(proxyP);
+
+        LinkStatisticsPolicy.Remember(link, proxyP.Id, DateTimeOffset.UtcNow.AddMinutes(-10), 50, "test");
+        LinkStatisticsPolicy.Remember(link, Guid.Empty, DateTimeOffset.UtcNow, 10, "direct");
+
+        ConfigStore.Normalize(config);
+        Equal(true, link.ProxyStatistics.Any(item => item.ProxyId == Guid.Empty));
+
+        var exportedWithStats = ConfigTransfer.CreateExport(config, [gateway.Id, target.Id], includeEntryPoints: true);
+        var exportedLink = exportedWithStats.Links.FirstOrDefault(l => l.FromServerId == gateway.Id && l.ToServerId == target.Id);
+        Equal(true, exportedLink?.ProxyStatistics.Any(item => item.ProxyId == Guid.Empty) == true);
+
+        var candidateWithEvidence = RoutePlanner.CandidateFromCached(config, cached);
+        Equal(true, candidateWithEvidence != null);
+        Equal(true, candidateWithEvidence!.WithoutProxy);
+        Equal(2, candidateWithEvidence.Servers.Count);
     }
 
     private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
