@@ -36,6 +36,7 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
     private readonly SavedLinkCheckHandler? checkLink;
     private readonly Action? saveConfig;
     private readonly SavedLinkConnectHandler? connectLink;
+    private readonly bool hideEntryPointLinks;
     private readonly ObservableCollection<SavedLinkTreeItem> roots = [];
     private LinkMapModel focusedMap = new([], [], 800, 500);
     private readonly Dictionary<Guid, Button> mapButtons = [];
@@ -65,13 +66,15 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
         ManagedServer selectedServer,
         SavedLinkCheckHandler? checkLink = null,
         Action? saveConfig = null,
-        SavedLinkConnectHandler? connectLink = null)
+        SavedLinkConnectHandler? connectLink = null,
+        bool hideEntryPointLinks = false)
     {
         this.config = config;
         this.selectedServer = selectedServer;
         this.checkLink = checkLink;
         this.saveConfig = saveConfig;
         this.connectLink = connectLink;
+        this.hideEntryPointLinks = hideEntryPointLinks;
 
         SourceInitialized += (_, _) => DarkWindowChrome.Apply(this);
         InitializeComponent();
@@ -105,6 +108,11 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
+    private IReadOnlyList<ServerLink> VisibleLinks() =>
+        hideEntryPointLinks
+            ? ServerLinkPairPolicy.ExcludeEntryPointLinks(config, config.Links)
+            : config.Links;
+
     private void BuildTree()
     {
         foreach (var item in LeafItems())
@@ -115,7 +123,7 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
         var query = LinksSearchBox?.Text.Trim() ?? "";
         roots.Clear();
 
-        var links = config.Links
+        var links = VisibleLinks()
             .Where(link => link.FromServerId == selectedServer.Id || link.ToServerId == selectedServer.Id)
             .Select(link => (Link: link, CounterpartId: link.FromServerId == selectedServer.Id
                 ? link.ToServerId
@@ -191,7 +199,7 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
         GraphCanvas.Children.Clear();
         mapButtons.Clear();
         mapEdges.Clear();
-        var full = LinkMapLayout.Build(config);
+        var full = LinkMapLayout.Build(config, VisibleLinks());
         var ids = new HashSet<Guid>([selectedServer.Id]);
         foreach (var leaf in LeafItems()) ids.Add(leaf.CounterpartServerId);
         var nodes = full.Nodes.Where(node => ids.Contains(node.ServerId)).ToArray();
@@ -216,7 +224,8 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
         var byId = normalized.ToDictionary(node => node.ServerId);
         foreach (var edge in edges)
         {
-            var from = byId[edge.ServerAId]; var to = byId[edge.ServerBId];
+            if (!byId.TryGetValue(edge.ServerAId, out var from) || !byId.TryGetValue(edge.ServerBId, out var to))
+                continue;
             var tooltip = LinkMapWindow.EdgeTooltip(edge, from.Name, to.Name);
             var x1 = from.X + LinkMapWindow.NodeWidth / 2;
             var y1 = from.Y + LinkMapWindow.NodeHeight / 2;
@@ -451,7 +460,8 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
                 completed += batch.Count;
                 foreach (var item in batch.Select(entry => entry.Item).Distinct())
                 {
-                    item.RefreshFromConfig(config);
+                    item.RefreshFromConfig(config, hideEntryPointLinks);
+                    if (item.RelatedLinks.Count == 0) continue;
                     item.ApplyRelationshipResults(outcomes[item]);
                 }
                 RefreshBranchStatuses();
@@ -470,10 +480,26 @@ public partial class SavedLinksDialog : Window, INotifyPropertyChanged
             if (ReferenceEquals(checkCancellation, cancellation)) checkCancellation = null;
             CancelCheckButton.IsEnabled = true;
             CancelCheckButton.Visibility = Visibility.Collapsed;
+            foreach (var item in leaves)
+            {
+                item.RefreshFromConfig(config, hideEntryPointLinks);
+                if (item.RelatedLinks.Count > 0) continue;
+                markedCounterpartIds.Remove(item.CounterpartServerId);
+                item.RemoveFromTree();
+            }
+            PruneEmptyRoots();
             UpdateMarkedStatus();
             UpdateConnectButton();
             BuildMap();
         }
+    }
+
+    private void PruneEmptyRoots()
+    {
+        foreach (var root in roots.ToList())
+            if (root.Children.Count == 0)
+                roots.Remove(root);
+        LinksTree.Visibility = LeafItems().Any() ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void RefreshBranchStatuses()
@@ -889,6 +915,22 @@ internal sealed class SavedLinkTreeItem : INotifyPropertyChanged
             yield return leaf;
     }
 
+    public void RemoveFromTree()
+    {
+        if (parent is null) return;
+        parent.Children.Remove(this);
+        parent.RefreshMarkedFromChildren();
+        parent.PruneEmptyBranches();
+    }
+
+    private void PruneEmptyBranches()
+    {
+        if (!IsBranch || Children.Count > 0 || parent is null) return;
+        parent.Children.Remove(this);
+        parent.RefreshMarkedFromChildren();
+        parent.PruneEmptyBranches();
+    }
+
     public void ApplyResult(ConnectivityResult result)
     {
         SetStatus(result.Success ? LinkCheckState.Succeeded : LinkCheckState.Failed, result.Message);
@@ -898,15 +940,24 @@ internal sealed class SavedLinkTreeItem : INotifyPropertyChanged
         LastSuccessDisplay = FormatDate(Link?.LastSuccessUtc ?? DateTimeOffset.Now);
     }
 
-    public void RefreshFromConfig(ManagerConfig config)
+    public void RefreshFromConfig(ManagerConfig config, bool hideEntryPointLinks = false)
     {
         if (SelectedServerId == Guid.Empty || CounterpartServerId == Guid.Empty) return;
-        var currentLinks = config.Links
+        var sourceLinks = hideEntryPointLinks
+            ? ServerLinkPairPolicy.ExcludeEntryPointLinks(config, config.Links)
+            : config.Links;
+        var currentLinks = sourceLinks
             .Where(l => (l.FromServerId == SelectedServerId && l.ToServerId == CounterpartServerId) ||
                         (l.FromServerId == CounterpartServerId && l.ToServerId == SelectedServerId))
             .ToList();
-        if (currentLinks.Count > 0)
-            RelatedLinks = currentLinks;
+        RelatedLinks = currentLinks;
+        if (currentLinks.Count == 0)
+        {
+            Link = null;
+            DirectionDisplay = "";
+            CanConnectVia = false;
+            return;
+        }
         RefreshFromLinks();
     }
 

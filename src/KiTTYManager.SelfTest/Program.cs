@@ -469,6 +469,19 @@ internal sealed partial class SelfTestRunner
         Test("Keepalive и автопереподключение KiTTY: миграция существующих сессий при обновлении", KittyKeepaliveAndReconnectUpgradeMigration);
         Test("Keepalive и автопереподключение KiTTY: мастер импорта конфигурации", KittyKeepaliveAndReconnectImportWizard);
         Test("Значения по умолчанию ManagerConfig и допустимость для настроек", SettingsDefaultsAndValidationBounds);
+        Test("Умное массовое добавление: парсинг хостов, логинов и паролей", SmartDiscoveryInputParserTests);
+        Test("Умное массовое добавление: генератор имён сессий и сопоставление токенов", SmartSessionNameGeneratorTests);
+        Test("Умное массовое добавление: приоритизация учётных данных и лимиты попыток", CredentialPrioritizationAndLimitsTests);
+        Test("Умное массовое добавление: порядок проверки повышения привилегий su/sudo", PrivilegeEscalationOrderingTests);
+        Test("Умное массовое добавление: многошаговое обнаружение и защита от циклов", MultiHopDiscoveryAndCyclePreventionTests);
+        Test("Умное массовое добавление: сохранение найденного при отмене сканирования", CancellationPreservesDiscoveredCandidatesTests);
+        Test("Умное массовое добавление: повтор проверок для проблемных хостов", StageSpecificRetryTests);
+        Test("Умное массовое добавление: создание сессий, группы, связи и валидация", SessionCreationAndLinkRegistrationTests);
+        Test("Умное массовое добавление: авто-выбор точки входа и отказоустойчивость", AutoEntryPointSelectionTests);
+        Test("Умное массовое добавление: связь с управляемой точкой входа", ManagedEntryPointLinkTests);
+        Test("Умное массовое добавление: журнал не раскрывает пароли", DiscoveryLoggingRedactionTests);
+        Test("Умное массовое добавление: предпросмотр конфига до создания сессий", SmartDiscoveryPreviewConfigTests);
+        Test("Умное массовое добавление: расширения Issue #26", SmartDiscoveryIssue26EnhancementsTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {
@@ -1267,6 +1280,15 @@ internal sealed partial class SelfTestRunner
         // 5. Search with no matches
         var noMatches = GroupSelectionPolicy.Build(config, draft.NewGroups, "несуществующий текст");
         Equal(0, noMatches.Count);
+
+        // 6. Picker selection keeps a matching current group, otherwise selects the searched result.
+        var activeSearch = GroupSelectionPolicy.Build(config, draft.NewGroups, "активная");
+        Equal<Guid?>(allRows[1].GroupId,
+            GroupSelectionPolicy.SelectForSearch(activeSearch, allRows[1].GroupId, "активная"));
+        Equal<Guid?>(dbSearch[2].GroupId,
+            GroupSelectionPolicy.SelectForSearch(dbSearch, allRows[0].GroupId, "базы"));
+        Equal<Guid?>(null,
+            GroupSelectionPolicy.SelectForSearch(dbSearch, null, "несуществующий текст"));
     }
 
     private static void AddToServerGroupPlacement()

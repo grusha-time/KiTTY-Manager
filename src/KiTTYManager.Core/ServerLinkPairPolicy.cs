@@ -27,6 +27,14 @@ public static class ServerLinkPairPolicy
         ManagerConfig config, ConnectivityResult result, DateTimeOffset now) =>
         RememberDirection(config, result.SourceId, result.TargetId, result, now, synthetic: false);
 
+    public static bool IsEntryPointLink(ManagerConfig config, ServerLink link) =>
+        link.LastSuccessfulProxyId is Guid proxyId &&
+        config.BaseProxies.Any(proxy => proxy.Id == proxyId && proxy.StartupServerId == link.FromServerId);
+
+    public static IReadOnlyList<ServerLink> ExcludeEntryPointLinks(
+        ManagerConfig config, IEnumerable<ServerLink> links) =>
+        links.Where(link => !IsEntryPointLink(config, link)).ToArray();
+
     public static bool IsKnownAsymmetric(ManagerConfig config, Guid serverAId, Guid serverBId)
     {
         var fwd = config.Links.FirstOrDefault(l => l.FromServerId == serverAId && l.ToServerId == serverBId);

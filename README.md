@@ -23,6 +23,7 @@ KiTTY Manager — приложение Windows для SSH-сессий. Оно �
 | Открыть панель или передать файл | Firefox с постоянным профилем, контейнерами и внутренним разрешением имён; WinSCP через маршрут | [Веб-панели и SFTP](https://github.com/grusha-time/KiTTY-Manager/wiki/Web-Interfaces) |
 | Пробросить SSH-туннель | Local (-L), Remote (-R), Dynamic (-D/SOCKS), окно активных туннелей | [Сессии и настройки](https://github.com/grusha-time/KiTTY-Manager/wiki/Configuration) |
 | Выполнить операцию на нескольких серверах | Конструктор из 11 типов действий или обычный playbook Ansible | [Массовые задачи](https://github.com/grusha-time/KiTTY-Manager/wiki/Batch-Tasks) |
+| Автоматически обнаружить и добавить пул сессий | Сканирование сети, подбор логинов/паролей, определение sudo/root, multi-hop | [Умное массовое добавление](https://github.com/grusha-time/KiTTY-Manager/wiki/Smart-Session-Addition) |
 | Перенести настройки | Выборочный JSON-экспорт и мастер умного импорта | [Экспорт и импорт](https://github.com/grusha-time/KiTTY-Manager/wiki/Export-Import) |
 | Безопасно обновить приложение | Проверка релизов GitHub, авторасписание 10:00, обновление в один клик без затирания данных | [Установка и первый запуск](https://github.com/grusha-time/KiTTY-Manager/wiki/Installation) |
 

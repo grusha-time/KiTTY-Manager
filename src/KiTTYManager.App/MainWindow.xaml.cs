@@ -49,6 +49,7 @@ public partial class MainWindow : Window
     private LinkMapWindow? linkMapWindow;
     private BatchTaskWindow? batchTaskWindow;
     private ActiveTunnelsWindow? activeTunnelsWindow;
+    private SmartDiscoveryWindow? smartDiscoveryWindow;
     private readonly TunnelService tunnelService;
     private readonly Dictionary<Guid, QuickDuplicateDialog> quickDuplicateWindows = [];
     private bool batchExitPending;
@@ -1230,7 +1231,9 @@ public partial class MainWindow : Window
 
     private async Task OpenRoutedConsoleAsync(
         ManagedServer server, Guid? forcedViaServerId = null,
-        CancellationToken externalCancellationToken = default)
+        CancellationToken externalCancellationToken = default,
+        ManagerConfig? routeConfig = null, bool persist = true, bool enableBackgroundProbing = true,
+        IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
         if (BlockIfOperationRunning()) return;
         var keyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
@@ -1260,7 +1263,9 @@ public partial class MainWindow : Window
             ActiveRoute route;
             try
             {
-                route = await Connect(server, cancellationToken, true, forcedViaServerId);
+                route = await Connect(server, cancellationToken, true, forcedViaServerId,
+                    routeConfig: routeConfig, persist: persist, enableBackgroundProbing: enableBackgroundProbing,
+                    explicitCandidates: explicitCandidates);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (InvalidOperationException ex) when (
@@ -1273,7 +1278,7 @@ public partial class MainWindow : Window
                 RouteLog($"Managed routes exhausted: target={server.Name}; fallback=original-session; error={ex.Message}");
                 Status($"Управляемые маршруты недоступны. Открываю исходную сессию KiTTY «{server.Name}»…");
                 server.LastOriginalSessionFallbackUtc = DateTimeOffset.UtcNow;
-                SaveConfig();
+                if (persist) SaveConfig();
                 OpenOriginalSession(server);
                 return;
             }
@@ -1524,23 +1529,28 @@ public partial class MainWindow : Window
 
     private async Task<ActiveRoute> Connect(
         ManagedServer server, CancellationToken cancellationToken, bool consoleOnly = false,
-        Guid? forcedViaServerId = null, Action<SshConnectionProgress>? progress = null)
+        Guid? forcedViaServerId = null, Action<SshConnectionProgress>? progress = null,
+        ManagerConfig? routeConfig = null, bool persist = true, bool enableBackgroundProbing = true,
+        IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
-        if (!server.TryDirectWithoutJumphost && config.BaseProxies.All(p => !p.Enabled))
+        var activeConfig = routeConfig ?? config;
+        if (explicitCandidates is not { Count: > 0 } && !server.TryDirectWithoutJumphost && activeConfig.BaseProxies.All(p => !p.Enabled))
             throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
         if (forcedViaServerId is Guid requestedViaId)
             RouteLog($"Forced route request: target={server.Name}; via=" +
-                     $"{config.FindServer(requestedViaId)?.Name ?? requestedViaId.ToString()}");
-        var ranked = forcedViaServerId is Guid viaId
-            ? RoutePlanner.ForcedFinalHopCandidates(config, viaId, server.Id)
-            : RoutePlanner.Candidates(config, server.Id);
+                     $"{activeConfig.FindServer(requestedViaId)?.Name ?? requestedViaId.ToString()}");
+        IReadOnlyList<RouteCandidate> ranked = explicitCandidates is { Count: > 0 }
+            ? explicitCandidates
+            : forcedViaServerId is Guid viaId
+                ? RoutePlanner.ForcedFinalHopCandidates(activeConfig, viaId, server.Id)
+                : RoutePlanner.Candidates(activeConfig, server.Id);
         if (ranked.Count == 0)
         {
             var required = server.RequiredPreviousServerId is Guid requiredId
-                ? config.FindServer(requiredId)
+                ? activeConfig.FindServer(requiredId)
                 : null;
             throw new InvalidOperationException(forcedViaServerId is Guid forcedId
-                ? $"Не найден маршрут через выбранный сервер «{config.FindServer(forcedId)?.Name ?? forcedId.ToString()}». Обычный маршрут не использован."
+                ? $"Не найден маршрут через выбранный сервер «{activeConfig.FindServer(forcedId)?.Name ?? forcedId.ToString()}». Обычный маршрут не использован."
                 : required is null
                 ? "Не найден рабочий маршрут. Запустите ручную проверку связности."
                 : $"Не найден маршрут через обязательную сессию «{required.Name}». " +
@@ -1549,21 +1559,26 @@ public partial class MainWindow : Window
         // Forced candidates are already ranked and every one ends with the
         // selected hop. OrderPreferred may reconstruct an ordinary cached route,
         // so it must never be applied to an explicitly forced connection.
-        var candidates = forcedViaServerId is null
-            ? RoutePlanner.OrderPreferred(config, ranked, server.PreferredRoute)
-            : ranked;
-        RouteLog($"Route order for {server.Name}: preferred=" +
-                 (server.PreferredRoute is null ? "none" :
-                     $"proxy={server.PreferredRoute.ProxyId}; servers={string.Join('>', server.PreferredRoute.ServerIds)}") +
-                 "; candidates=" + string.Join(" | ", candidates.Select(candidate =>
-                     $"[{RoutePlanner.CandidateReason(config, server.Id, candidate, server.PreferredRoute)}] " +
-                     RouteLabel(candidate))));
+        var candidates = explicitCandidates is { Count: > 0 }
+            ? ranked
+            : forcedViaServerId is null
+                ? RoutePlanner.OrderPreferred(activeConfig, ranked, server.PreferredRoute)
+                : ranked;
+        if (explicitCandidates is { Count: > 0 })
+            RouteLog($"Route order for {server.Name}: preview-explicit; candidates=" + string.Join(" | ", candidates.Select(RouteLabel)));
+        else
+            RouteLog($"Route order for {server.Name}: preferred=" +
+                     (server.PreferredRoute is null ? "none" :
+                         $"proxy={server.PreferredRoute.ProxyId}; servers={string.Join('>', server.PreferredRoute.ServerIds)}") +
+                     "; candidates=" + string.Join(" | ", candidates.Select(candidate =>
+                         $"[{RoutePlanner.CandidateReason(activeConfig, server.Id, candidate, server.PreferredRoute)}] " +
+                         RouteLabel(candidate))));
 
         void CompleteRoute(
             (ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration) result)
         {
             if (!result.Candidate.WithoutProxy)
-                AccessGrantPolicy.RememberSuccessfulRoute(config, result.Candidate.Proxy.Id,
+                AccessGrantPolicy.RememberSuccessfulRoute(activeConfig, result.Candidate.Proxy.Id,
                     result.Candidate.Servers.Select(item => item.Id), DateTimeOffset.UtcNow);
             if (forcedViaServerId is null)
                 server.PreferredRoute = RoutePreferencePolicy.FromSuccess(
@@ -1578,21 +1593,21 @@ public partial class MainWindow : Window
                 LastRouteText.Text = routeDisplay;
                 LastRouteText.Visibility = Visibility.Visible;
             }
-            SaveConfig();
+            if (persist) SaveConfig();
             Log($"{result.Candidate.Proxy.Name} → {string.Join(" → ", result.Candidate.Servers.Select(s => s.Name))}");
             if (forcedViaServerId is Guid successfulViaId)
                 RouteLog($"Forced route success: target={server.Name}; via=" +
-                         $"{config.FindServer(successfulViaId)?.Name ?? successfulViaId.ToString()}; " +
+                         $"{activeConfig.FindServer(successfulViaId)?.Name ?? successfulViaId.ToString()}; " +
                          $"route={RouteLabel(result.Candidate)}");
-            if (forcedViaServerId is null && consoleOnly &&
+            if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly &&
                 RoutePreferencePolicy.BetterCandidates(candidates, result.Candidate).Count > 0)
                 ScheduleBetterRouteProbe(server, candidates, result.Candidate);
-            else if (forcedViaServerId is null && consoleOnly && server.TryDirectWithoutJumphost &&
+            else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly && server.TryDirectWithoutJumphost &&
                      !result.Candidate.WithoutProxy)
                 ScheduleDirectRouteProbe(server, result.Candidate);
             // Подключились обходным путём, а прямой доступ ещё не подтверждён —
             // пробуем доказать его в фоне, чтобы следующее подключение шло напрямую.
-            else if (forcedViaServerId is null && consoleOnly &&
+            else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly &&
                      result.Candidate.Servers.Count > 1 && !IsProvenDirect(server))
                 ScheduleDirectRouteProbe(server, result.Candidate);
         }
@@ -1610,7 +1625,7 @@ public partial class MainWindow : Window
         }
 
         return await RouteCandidateConnector.ConnectCandidatesAsync(
-            config: config,
+            config: activeConfig,
             server: server,
             candidates: candidates,
             ssh: ssh,
@@ -1619,18 +1634,34 @@ public partial class MainWindow : Window
             forcedViaServerId: forcedViaServerId,
             progress: progress,
             ensureManagedJumphost: async (proxy, ct) =>
-                await EnsureManagedJumphostAsync(ct, true, proxyId: proxy.Id, accessTargetServerId: server.Id),
+            {
+                var ready = await EnsureManagedJumphostAsync(ct, true, proxyId: proxy.Id,
+                    accessTargetServerId: server.Id, persist: persist);
+                if (ready && routeConfig is not null)
+                {
+                    var liveProxy = config.BaseProxies.FirstOrDefault(p => p.Id == proxy.Id);
+                    if (liveProxy is not null)
+                    {
+                        proxy.Host = liveProxy.Host;
+                        proxy.Port = liveProxy.Port;
+                    }
+                }
+                return ready;
+            },
             isSocks5Ready: (proxy, timeout, ct) => IsSocks5ReadyAsync(proxy, timeout, ct),
-            tryRestoreAccess: (cands, ct) => TryRestoreAccessAsync(cands, ct),
+            tryRestoreAccess: enableBackgroundProbing ? (cands, ct) => TryRestoreAccessAsync(cands, ct) : null,
             status: s => Status(s),
             routeLog: l => RouteLog(l),
             onHopFailed: (sourceId, targetId) =>
             {
+                if (!persist) return;
                 ServerLinkPairPolicy.InvalidateDirection(config, sourceId, targetId);
                 SaveConfig();
             },
             onRouteSucceeded: CompleteRoute,
-            onPreferredRouteFailed: (candidate, ct) => RestoreFailedPreferredAccessAsync(candidate, ct));
+            onPreferredRouteFailed: enableBackgroundProbing
+                ? (candidate, ct) => RestoreFailedPreferredAccessAsync(candidate, ct)
+                : null);
     }
 
     private async Task RestoreFailedPreferredAccessAsync(
@@ -1720,7 +1751,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunAccessScriptInExistingConsoleAsync(
         BaseProxy proxy, ManagedServer server, int processId, Guid? targetServerId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool persist = true)
     {
         var proxyId = proxy.Id;
         var requestedAfter = proxy.LastAccessScriptAttemptUtc;
@@ -1733,7 +1764,7 @@ public partial class MainWindow : Window
             if (proxy.LastAccessScriptAttemptUtc != requestedAfter)
                 return proxy.LastAccessScriptResult == "Verified";
             AccessGrantPolicy.MarkScriptAttempt(proxy, DateTimeOffset.UtcNow);
-            SaveConfig();
+            if (persist) SaveConfig();
             try
             {
                 using var existing = Process.GetProcessById(processId);
@@ -1747,20 +1778,20 @@ public partial class MainWindow : Window
                 if (controls.Count == 0)
                 {
                     AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
-                    SaveConfig();
+                    if (persist) SaveConfig();
                     return false;
                 }
                 AccessGrantPolicy.MarkScriptSuccess(proxy, DateTimeOffset.UtcNow);
                 AccessGrantPolicy.RememberReachableControls(
                     config, proxy.Id, controls, DateTimeOffset.UtcNow);
-                SaveConfig();
+                if (persist) SaveConfig();
                 return true;
             }
             catch
             {
                 proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
                 AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
-                SaveConfig();
+                if (persist) SaveConfig();
                 throw;
             }
         }
@@ -1769,7 +1800,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunAccessScriptWithConsoleChoiceAsync(
         BaseProxy proxy, ManagedServer server, Guid? targetServerId, string trigger,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool persist = true)
     {
         var entryTitle = JumphostConsoleTitles.EntryTitle(server.Name, proxy.Name);
         var accessTitle = JumphostConsoleTitles.AccessTitle(server.Name, proxy.Name);
@@ -1805,14 +1836,14 @@ public partial class MainWindow : Window
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner={identity.Kind}; choice=existing-main; pid={mainIdentity.ProcessId}");
             return await RunAccessScriptInExistingConsoleAsync(
-                proxy, server, mainIdentity.ProcessId, targetServerId, cancellationToken);
+                proxy, server, mainIdentity.ProcessId, targetServerId, cancellationToken, persist);
         }
         if (target == AccessScriptConsoleTarget.ExistingAccess && accessPid is int existingPid)
         {
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner={identity.Kind}; choice=existing-access; pid={existingPid}");
             return await RunAccessScriptInExistingConsoleAsync(
-                proxy, server, existingPid, targetServerId, cancellationToken);
+                proxy, server, existingPid, targetServerId, cancellationToken, persist);
         }
         if (target == AccessScriptConsoleTarget.PromptUnknown)
         {
@@ -1845,7 +1876,7 @@ public partial class MainWindow : Window
                 RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                          $"owner=unknown-kitty; choice=existing-adopted; pid={pid}");
                 return await RunAccessScriptInExistingConsoleAsync(
-                    proxy, server, pid, targetServerId, cancellationToken);
+                    proxy, server, pid, targetServerId, cancellationToken, persist);
             }
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner=unknown-kitty; choice=isolated; pid={identity.ProcessId}");
@@ -1855,7 +1886,7 @@ public partial class MainWindow : Window
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner={identity.Kind}; choice=isolated; pid={identity.ProcessId}");
         }
-        return await RunAccessScriptAndConfirmAsync(proxy, server, targetServerId, cancellationToken);
+        return await RunAccessScriptAndConfirmAsync(proxy, server, targetServerId, cancellationToken, persist);
     }
 
     private static string RouteLabel(RouteCandidate candidate) =>
@@ -2218,7 +2249,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunAccessScriptAndConfirmAsync(
         BaseProxy proxy, ManagedServer server, Guid? targetServerId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool persist = true)
     {
         var proxyId = proxy.Id;
         var requestedAfter = proxy.LastAccessScriptAttemptUtc;
@@ -2234,18 +2265,18 @@ public partial class MainWindow : Window
                 return proxy.LastAccessScriptResult == "Verified";
             }
             return await RunAccessScriptAndConfirmCoreAsync(
-                proxy, server, targetServerId, cancellationToken);
+                proxy, server, targetServerId, cancellationToken, persist);
         }
         finally { gate.Release(); }
     }
 
     private async Task<bool> RunAccessScriptAndConfirmCoreAsync(
         BaseProxy proxy, ManagedServer server, Guid? targetServerId,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool persist = true)
     {
         var proxyId = proxy.Id;
         AccessGrantPolicy.MarkScriptAttempt(proxy, DateTimeOffset.UtcNow);
-        SaveConfig();
+        if (persist) SaveConfig();
         AccessScriptRunnerPlan? plan = null;
         Process? process = null;
         var cleanupAfterExit = false;
@@ -2273,7 +2304,7 @@ public partial class MainWindow : Window
             {
                 proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
                 AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
-                SaveConfig();
+                if (persist) SaveConfig();
                 var earlyExit = process.HasExited;
                 RouteLog($"Access script unconfirmed: proxy={proxy.Name}; " +
                          (earlyExit ? "KiTTY exited before marker" : "marker timeout; process left running"));
@@ -2297,7 +2328,7 @@ public partial class MainWindow : Window
                 proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
                 AccessGrantPolicy.RememberControlCandidates(config, proxy.Id, candidates);
                 AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
-                SaveConfig();
+                if (persist) SaveConfig();
                 RouteLog($"Access script unconfirmed: proxy={proxy.Name}; marker=seen; controls=0; " +
                          $"learned-candidates={candidates.Count}");
                 Status("Команда завершилась, но доступ к целевому или контрольному серверу не подтверждён");
@@ -2311,7 +2342,7 @@ public partial class MainWindow : Window
             AccessGrantPolicy.MarkScriptSuccess(proxy, DateTimeOffset.UtcNow);
             AccessGrantPolicy.RememberReachableControls(config, proxy.Id,
                 learned.Count > 0 ? learned : controls, DateTimeOffset.UtcNow);
-            SaveConfig();
+            if (persist) SaveConfig();
             RouteLog($"Access script verified: proxy={proxy.Name}; controls={controls.Count}; learned={learned.Count}");
             Status($"Скрипт доступа через «{proxy.Name}» подтверждён ({controls.Count} серверов)");
             return true;
@@ -2320,7 +2351,7 @@ public partial class MainWindow : Window
         {
             proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
             AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
-            SaveConfig();
+            if (persist) SaveConfig();
             if (plan is not null && process is not null)
             {
                 cleanupAfterExit = true;
@@ -2342,7 +2373,7 @@ public partial class MainWindow : Window
         CancellationToken cancellationToken, bool startMissing, Guid? startupServerId = null,
         Guid? proxyId = null, Guid? accessTargetServerId = null, bool startAllAutoStart = false,
         Guid? forceAccessScriptProxyId = null, bool deferAccessScriptUntilReady = false,
-        bool isManualLaunch = false)
+        bool isManualLaunch = false, bool persist = true)
     {
         var ordered = RoutePlanner.OrderedProxies(config)
             .Where(proxy => startupServerId is null || proxy.StartupServerId == startupServerId)
@@ -2354,7 +2385,7 @@ public partial class MainWindow : Window
                 if (proxy.LastStartupFailureUtc is not null)
                 {
                     proxy.LastStartupFailureUtc = null;
-                    SaveConfig();
+                    if (persist) SaveConfig();
                 }
         }
         if (!startMissing && !startAllAutoStart)
@@ -2364,7 +2395,7 @@ public partial class MainWindow : Window
                     if (proxy.LastStartupFailureUtc is not null)
                     {
                         proxy.LastStartupFailureUtc = null;
-                        SaveConfig();
+                        if (persist) SaveConfig();
                     }
                     return true;
                 }
@@ -2379,7 +2410,7 @@ public partial class MainWindow : Window
                 if (proxy.LastStartupFailureUtc is not null)
                 {
                     proxy.LastStartupFailureUtc = null;
-                    SaveConfig();
+                    if (persist) SaveConfig();
                 }
                 anyReady = true;
                 continue;
@@ -2408,7 +2439,7 @@ public partial class MainWindow : Window
                     if (proxy.LastStartupFailureUtc is not null)
                     {
                         proxy.LastStartupFailureUtc = null;
-                        SaveConfig();
+                        if (persist) SaveConfig();
                     }
                     anyReady = true;
                     if (!startAllAutoStart) return true;
@@ -2448,7 +2479,7 @@ public partial class MainWindow : Window
                     if (!jumphostProcesses.TryStopAliveManaged(proxy))
                     {
                         JumphostStartupPolicy.HandleStopUnhealthyProcessFailure(proxy, DateTimeOffset.UtcNow);
-                        SaveConfig();
+                        if (persist) SaveConfig();
                         Status($"Не удалось безопасно перезапустить собственную KiTTY «{proxy.Name}».");
                         continue;
                     }
@@ -2471,8 +2502,8 @@ public partial class MainWindow : Window
                     {
                         if (!deferAccessScriptUntilReady)
                         {
-                            var accessAlreadyValid = !forcedScheduledAccessScript &&
-                                await ConfirmExistingAccessAsync(proxy, cancellationToken);
+                                var accessAlreadyValid = !forcedScheduledAccessScript &&
+                                    await ConfirmExistingAccessAsync(proxy, cancellationToken, persist: persist);
                             var learnedAccessUnavailable = proxy.AccessProbeServerIds.Count > 0 && !accessAlreadyValid;
                             if (!accessAlreadyValid && (runAccessScript || learnedAccessUnavailable))
                             {
@@ -2481,13 +2512,13 @@ public partial class MainWindow : Window
                                 await RunAccessScriptWithConsoleChoiceAsync(
                                     proxy, server, accessTargetServerId,
                                     forcedScheduledAccessScript ? "scheduled" : "cold-start",
-                                    cancellationToken);
+                                    cancellationToken, persist);
                             }
                         }
                         proxy.LastSuccessUtc = DateTimeOffset.UtcNow;
                         proxy.LastStartupLatencyMs = startupStopwatch.Elapsed.TotalMilliseconds;
                         proxy.LastStartupFailureUtc = null;
-                        SaveConfig();
+                        if (persist) SaveConfig();
                         Status($"Точка входа «{proxy.Name}» готова");
                         return true;
                     }
@@ -2517,7 +2548,7 @@ public partial class MainWindow : Window
                     else
                     {
                         JumphostStartupPolicy.HandleAdoptedConsoleTimeout(proxy, DateTimeOffset.UtcNow);
-                        SaveConfig();
+                        if (persist) SaveConfig();
                         RouteLog($"Jumphost startup failed on adopted console: name={proxy.Name}; " +
                                  $"endpoint={proxy.Host}:{proxy.Port}; cooldown until {proxy.LastStartupFailureUtc?.Add(AccessGrantPolicy.StartupFailureCooldown)}");
                         Status($"KiTTY точки входа «{proxy.Name}» открыта (PID {titled.Id}), " +
@@ -2616,7 +2647,7 @@ public partial class MainWindow : Window
 
                 if (launchResult.Status == JumphostLaunchStatus.Success)
                 {
-                    SaveConfig();
+                    if (persist) SaveConfig();
                     if (deferAccessScriptUntilReady) return true;
                     anyReady = true;
                     if (!startAllAutoStart) return true;
@@ -2630,7 +2661,7 @@ public partial class MainWindow : Window
                     break;
                 }
 
-                SaveConfig();
+                if (persist) SaveConfig();
                 if (launchResult.Exception is not null)
                 {
                     RouteLog($"Jumphost launch error: name={proxy.Name}; error={launchResult.Exception.GetType().Name}: {launchResult.Exception.Message}");
@@ -2918,7 +2949,7 @@ public partial class MainWindow : Window
     }
 
     private async Task<bool> ConfirmExistingAccessAsync(
-        BaseProxy proxy, CancellationToken cancellationToken, bool rebaseSchedule = false)
+        BaseProxy proxy, CancellationToken cancellationToken, bool rebaseSchedule = false, bool persist = true)
     {
         var learnedCount = proxy.AccessProbeServerIds.Take(proxy.AccessProbeServerLimit).Count();
         if (learnedCount == 0) return false;
@@ -2934,9 +2965,9 @@ public partial class MainWindow : Window
         if (rebaseSchedule)
         {
             AccessGrantPolicy.RebaseAccessConfirmation(proxy, now);
-            SaveConfig();
+            if (persist) SaveConfig();
         }
-        else if (AccessGrantPolicy.MarkAccessConfirmedWithoutScript(proxy, now)) SaveConfig();
+        else if (AccessGrantPolicy.MarkAccessConfirmedWithoutScript(proxy, now) && persist) SaveConfig();
         RouteLog($"Access script skipped: proxy={proxy.Name}; learned control reachable");
         Status($"Доступ через «{proxy.Name}» уже действует; отдельная консоль скрипта не нужна");
         return true;
@@ -3224,12 +3255,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunDirectedConnectivityAsync(
+    private async Task<bool> RunDirectedConnectivityAsync(
         string scopeName, IReadOnlyList<ConnectivityPairChoice> requestedPairs)
     {
         var pairs = ConnectivityPairSelectionPolicy.Selected(requestedPairs);
-        if (pairs.Count == 0) return;
-        if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return; }
+        if (pairs.Count == 0) return false;
+        if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return false; }
         using var cts = new CancellationTokenSource();
         operationCancellation = cts;
         var progress = new LinkBuildingProgress { Owner = this, CancelRequested = () => cts.Cancel() };
@@ -3379,12 +3410,14 @@ public partial class MainWindow : Window
                 (failures.Length == 0 ? "" : "\n\n" + string.Join(Environment.NewLine, failures)),
                 "Результат построения связей", MessageBoxButton.OK,
                 unavailCount == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+            return true;
         }
         catch (OperationCanceledException)
         {
             Status("Проверка остановлена. Уже подтверждённые направления сохранены.");
+            return false;
         }
-        catch (Exception ex) { Error(ex); }
+        catch (Exception ex) { Error(ex); return false; }
         finally { EndProgressOperation(cts, progress); }
     }
 
@@ -3427,7 +3460,7 @@ public partial class MainWindow : Window
             async (viaServerId, cancellationToken) =>
             {
                 await OpenRoutedConsoleAsync(source, viaServerId, cancellationToken);
-            }) { Owner = this };
+            }, hideEntryPointLinks: true) { Owner = this };
         _ = dialog.ShowDialog();
     }
 
@@ -3746,6 +3779,52 @@ public partial class MainWindow : Window
     }
     private void ShowBatchTasks_Click(object sender, RoutedEventArgs e) => ShowBatchTasks();
     private void ShowLinkMap_Click(object sender, RoutedEventArgs e) => ShowLinkMap();
+
+    private void ShowSmartDiscovery()
+    {
+        if (smartDiscoveryWindow is not null)
+        {
+            if (smartDiscoveryWindow.WindowState == WindowState.Minimized)
+                smartDiscoveryWindow.WindowState = WindowState.Normal;
+            smartDiscoveryWindow.Activate();
+            return;
+        }
+        smartDiscoveryWindow = new SmartDiscoveryWindow(
+            () => config,
+            async (proxy, token) =>
+            {
+                var operation = Dispatcher.InvokeAsync(
+                    () => EnsureManagedJumphostAsync(token, true, proxyId: proxy.Id, isManualLaunch: true));
+                return await await operation;
+            },
+            () =>
+            {
+                SaveAndRefresh();
+            },
+            ConfirmHostKey,
+            text => Dispatcher.BeginInvoke(() => RouteLog("SmartDiscovery: " + text)),
+            PreviewDiscoveredCandidateAsync,
+            async pairs => await RunDirectedConnectivityAsync(
+                "Связи новых сессий с существующими серверами группы", pairs))
+        {
+            Owner = this
+        };
+        smartDiscoveryWindow.Closed += (_, _) => smartDiscoveryWindow = null;
+        smartDiscoveryWindow.Show();
+    }
+    private void ShowSmartDiscovery_Click(object sender, RoutedEventArgs e) => ShowSmartDiscovery();
+
+    private async Task PreviewDiscoveredCandidateAsync(
+        DiscoveredServerCandidate candidate, IReadOnlyList<DiscoveredServerCandidate> allCandidates)
+    {
+        var previewConfig = SmartDiscoverySessionCreator.CreatePreviewConfig(config, allCandidates);
+        var draft = previewConfig.FindServer(candidate.Id);
+        if (draft is null) return;
+        var explicitCandidates = SmartDiscoverySessionCreator.CreatePreviewCandidates(previewConfig, candidate);
+        RouteLog($"SmartDiscovery: предпросмотр сессии \"{draft.Name}\" без сохранения в конфигурацию.");
+        await OpenRoutedConsoleAsync(draft, routeConfig: previewConfig, persist: false, enableBackgroundProbing: false,
+            explicitCandidates: explicitCandidates.Count > 0 ? explicitCandidates : null);
+    }
 
     private void ShowActiveTunnels()
     {

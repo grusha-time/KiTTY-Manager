@@ -213,6 +213,15 @@ public sealed class SshConnectionService
             "Указанный маршрут недоступен.", cancellationToken, consoleOnly,
             rememberTargetPreference, progress, attemptIndex, attemptCount, budget);
 
+    public async Task<ActiveRoute> ConnectProbeAsync(
+        RouteCandidate candidate,
+        CancellationToken cancellationToken = default)
+    {
+        using var attempt = CreateAttemptCancellation(cancellationToken);
+        return await Task.Run(() => Connect(candidate, exposePorts: false, attempt.Token), attempt.Token)
+            .ConfigureAwait(false);
+    }
+
     public async Task<(ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration)> ConnectFirstSuccessfulAsync(
         ManagerConfig config, IReadOnlyList<RouteCandidate> candidates,
         CancellationToken cancellationToken = default, bool consoleOnly = false,
