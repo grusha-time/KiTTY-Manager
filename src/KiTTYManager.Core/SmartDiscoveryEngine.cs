@@ -1873,6 +1873,10 @@ public sealed class SmartDiscoveryEngine
 
         var seedDistance = new Dictionary<Guid, int>();
 
+        bool IsCompatibleWithChosenJumpHost(RouteCandidate c) =>
+            options.AutoSelectJumpHost ||
+            (options.JumpHost == null ? c.WithoutProxy : !c.WithoutProxy && c.Proxy.Id == options.JumpHost.Id);
+
         HashSet<Guid> FindIndependentServerIds(HashSet<Guid> scope)
         {
             var independentIds = new HashSet<Guid>(ConnectivityBatchPlanner.DirectlyReachable(config, scope));
@@ -1920,10 +1924,6 @@ public sealed class SmartDiscoveryEngine
             if (routes.ContainsKey(id)) return;
             var server = config.FindServer(id);
             if (server is null) return;
-
-            bool IsCompatibleWithChosenJumpHost(RouteCandidate c) =>
-                options.AutoSelectJumpHost ||
-                (options.JumpHost == null ? c.WithoutProxy : !c.WithoutProxy && c.Proxy.Id == options.JumpHost.Id);
 
             RouteCandidate? route = null;
 
@@ -2038,10 +2038,16 @@ public sealed class SmartDiscoveryEngine
             var route = server.PreferredRoute is not null
                 ? RoutePlanner.CandidateFromCached(config, server.PreferredRoute)
                 : null;
-            if (route is null && server.PreferredRoute is null)
+            if (route is not null && !IsCompatibleWithChosenJumpHost(route))
+            {
+                route = null;
+            }
+            if (route is null && (server.PreferredRoute is null || !options.AutoSelectJumpHost))
             {
                 var candidates = RoutePlanner.Candidates(config, server.Id);
-                route = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute).FirstOrDefault();
+                route = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute)
+                    .Where(IsCompatibleWithChosenJumpHost)
+                    .FirstOrDefault();
             }
             if (route is not null)
             {

@@ -3873,6 +3873,75 @@ internal sealed partial class SelfTestRunner
             c.Servers[1].Id == serverB.Id &&
             c.Servers[2].Id == serverT.Id);
         Equal(true, directZCandidate != null);
+
+        // Verify proxy paths are not displaced by direct paths (Finding 2):
+        // Target has RequiredPreviousServerId = B, proxy P configured,
+        // server A reached via P (A.PreferredRoute = [A] with P.Id),
+        // and 32 direct servers Z01..Z32 -> B with TryDirectWithoutJumphost = true.
+        var proxyDisplacementConfig = new ManagerConfig();
+        var proxyPDisplacement = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "P_Displace",
+            Host = "127.0.0.1",
+            Port = 1089,
+            Enabled = true
+        };
+        proxyDisplacementConfig.BaseProxies.Add(proxyPDisplacement);
+
+        var serverB2 = new ManagedServer { Id = Guid.NewGuid(), Name = "B", Host = "10.0.5.2", TryDirectWithoutJumphost = false };
+        var serverT2 = new ManagedServer { Id = Guid.NewGuid(), Name = "T", Host = "10.0.5.3", TryDirectWithoutJumphost = false, RequiredPreviousServerId = serverB2.Id };
+        var serverA = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "A",
+            Host = "10.0.5.1",
+            TryDirectWithoutJumphost = false,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = proxyPDisplacement.Id,
+                ServerIds = [Guid.NewGuid()]
+            }
+        };
+        serverA.PreferredRoute.ServerIds = [serverA.Id];
+
+        proxyDisplacementConfig.UngroupedServers.Add(serverB2);
+        proxyDisplacementConfig.UngroupedServers.Add(serverT2);
+        proxyDisplacementConfig.UngroupedServers.Add(serverA);
+
+        proxyDisplacementConfig.Links.Add(new ServerLink { FromServerId = serverA.Id, ToServerId = serverB2.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+        proxyDisplacementConfig.Links.Add(new ServerLink { FromServerId = serverB2.Id, ToServerId = serverT2.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+
+        var directZList = new List<ManagedServer>();
+        for (var i = 1; i <= 32; i++)
+        {
+            var z = new ManagedServer { Id = Guid.NewGuid(), Name = $"Z{i:D2}", Host = $"10.0.6.{i}", TryDirectWithoutJumphost = true };
+            directZList.Add(z);
+            proxyDisplacementConfig.UngroupedServers.Add(z);
+            proxyDisplacementConfig.Links.Add(new ServerLink { FromServerId = z.Id, ToServerId = serverB2.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+        }
+
+        var candidatesDisplacement = RoutePlanner.Candidates(proxyDisplacementConfig, serverT2.Id);
+
+        var proxyACandidate = candidatesDisplacement.FirstOrDefault(c =>
+            !c.WithoutProxy &&
+            c.Proxy.Id == proxyPDisplacement.Id &&
+            c.Servers.Count == 3 &&
+            c.Servers[0].Id == serverA.Id &&
+            c.Servers[1].Id == serverB2.Id &&
+            c.Servers[2].Id == serverT2.Id);
+        Equal(true, proxyACandidate != null);
+
+        foreach (var z in directZList)
+        {
+            var directZCand = candidatesDisplacement.FirstOrDefault(c =>
+                c.WithoutProxy &&
+                c.Servers.Count == 3 &&
+                c.Servers[0].Id == z.Id &&
+                c.Servers[1].Id == serverB2.Id &&
+                c.Servers[2].Id == serverT2.Id);
+            Equal(true, directZCand != null);
+        }
     }
 
     private static void ManualJumpHostSelectionBypassesSavedRouteTest()
@@ -3955,6 +4024,79 @@ internal sealed partial class SelfTestRunner
 
         Equal(false, probe.HopAttempts.Any(h => h.ProxyId == p1.Id));
         Equal(false, probe.ReachabilityAttempts.Any(r => r.proxyId == p1.Id));
+
+        // 3. Gateway G outside target group with TryDirectWithoutJumphost = true, PreferredRoute via p1 through intermediate U.
+        // Under manual direct mode (AutoSelectJumpHost = false, JumpHost = null), verify target T behind G is discovered
+        // and U is not present in the used gateway chain ([G] used directly).
+        var targetGroup = new ServerGroup { Id = Guid.NewGuid(), Name = "TargetGroup" };
+        config.Groups.Add(targetGroup);
+
+        var serverU = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerU",
+            Host = "10.88.99.1",
+            Port = 22,
+            Username = "admin",
+            Password = "pw",
+            TryDirectWithoutJumphost = false
+        };
+        var serverG = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerG",
+            Host = "10.88.0.10",
+            Port = 22,
+            Username = "admin",
+            Password = "pw",
+            TryDirectWithoutJumphost = true,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = p1.Id,
+                ServerIds = [Guid.NewGuid()]
+            }
+        };
+        serverG.PreferredRoute.ServerIds = [serverU.Id, serverG.Id];
+
+        config.UngroupedServers.Add(serverU);
+        config.UngroupedServers.Add(serverG);
+        config.Links.Add(new ServerLink
+        {
+            FromServerId = serverU.Id,
+            ToServerId = serverG.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        });
+
+        probe.HopAttempts.Clear();
+        probe.ReachabilityAttempts.Clear();
+        probe.AttemptedLogins.Clear();
+        probe.HopChains.Clear();
+
+        var targetTHost = "10.88.0.20";
+        probe.HopReachability.Add((serverG.Host, targetTHost));
+        probe.ValidCredentials[targetTHost] = [("admin", "pw")];
+
+        var optionsDirectWithGroup = new SmartDiscoveryOptions
+        {
+            TargetHosts = [serverG.Host, targetTHost],
+            Usernames = ["admin"],
+            Passwords = ["pw"],
+            TargetGroupId = targetGroup.Id,
+            AutoSelectJumpHost = false,
+            JumpHost = null,
+            MaxParallelConnections = 1
+        };
+
+        var engineDirectWithGroup = new SmartDiscoveryEngine(config, optionsDirectWithGroup, probe);
+        var resultDirectWithGroup = engineDirectWithGroup.DiscoverAsync().GetAwaiter().GetResult();
+
+        var discoveredT = resultDirectWithGroup.Discovered.FirstOrDefault(c => c.Host == targetTHost);
+        Equal(true, discoveredT != null);
+        Equal(serverG.Id, discoveredT!.RequiredPreviousServerId);
+        Equal(false, discoveredT.RouteHops.Any(h => h.ServerId == serverU.Id));
+        Equal(true, discoveredT.RouteHops.Any(h => h.ServerId == serverG.Id));
+        Equal(true, probe.HopChains.All(chain => chain.All(hop => hop.Host != serverU.Host)));
+        Equal(true, probe.HopAttempts.All(attempt => attempt.Gateways.All(gw => gw.Id != serverU.Id)));
     }
 
     private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>

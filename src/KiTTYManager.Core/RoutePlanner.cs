@@ -55,19 +55,21 @@ public static class RoutePlanner
 
         // Сначала по одному лучшему пути от разных входных серверов, затем вторые
         // варианты. Это не позволяет плотной ветке вытеснить все остальные входы.
-        return Enumerable.Range(0, MaxPathsPerEntry)
+        var allOrdered = Enumerable.Range(0, MaxPathsPerEntry)
             .SelectMany(round => pathsByEntry
                 .Where(paths => paths.Count > round)
                 .Select(paths => paths[round])
                 .OrderBy(path => target.RequiredPreviousServerId is Guid required &&
                                  (path.Count < 2 || path[^2].Id != required) ? 1 : 0)
-                .ThenBy(path => path[0].TryDirectWithoutJumphost ? 0 : 1)
                 .ThenBy(path => path.Count)
                 .ThenBy(path => string.Join('/', path.Select(server => server.Name)),
                     StringComparer.CurrentCultureIgnoreCase)
                 .ThenBy(path => string.Join('/', path.Select(server => server.Id))))
-            .Take(MaxSavedPaths)
             .ToArray();
+
+        var proxyPaths = allOrdered.Take(MaxSavedPaths);
+        var directPaths = allOrdered.Where(path => path[0].TryDirectWithoutJumphost).Take(MaxSavedPaths);
+        return proxyPaths.Concat(directPaths).DistinctBy(path => string.Join('/', path.Select(s => s.Id))).ToArray();
 
         List<Guid>? ShortestPath(
             Guid startId, Guid destinationId, (Guid From, Guid To)? bannedEdge = null)
