@@ -114,7 +114,10 @@ public static class RoutePlanner
         var direct = target.TryDirectWithoutJumphost
             ? new[] { new RouteCandidate(DirectConnectionProxy, [target], true) }
             : [];
-        var raw = direct.Concat(OrderedProxies(config, target)
+        var directMultiHop = savedPaths
+            .Where(path => path[0].TryDirectWithoutJumphost)
+            .Select(path => new RouteCandidate(DirectConnectionProxy, path, true));
+        var raw = direct.Concat(directMultiHop).Concat(OrderedProxies(config, target)
             .SelectMany(proxy => CandidatesForProxy(config, target, proxy, savedPaths)));
         return Rank(config, target, raw
             .Where(candidate => SatisfiesRouteConstraints(config, candidate))
@@ -203,8 +206,7 @@ public static class RoutePlanner
                                           !LinkStatisticsPolicy.HasProxyEvidence(link))))
                 return null;
         }
-        if (cached.ProxyId == Guid.Empty &&
-            (servers.Count != 1 || !servers[0].TryDirectWithoutJumphost))
+        if (cached.ProxyId == Guid.Empty && !servers[0].TryDirectWithoutJumphost)
             return null;
         var candidate = new RouteCandidate(proxy, servers, cached.ProxyId == Guid.Empty);
         return SatisfiesRouteConstraints(config, candidate) ? candidate : null;
@@ -569,7 +571,14 @@ public static class RoutePlanner
 
     private static int CandidateClass(ManagerConfig config, RouteCandidate candidate)
     {
-        if (candidate.WithoutProxy) return 0;
+        if (candidate.WithoutProxy)
+        {
+            if (candidate.Servers.Count == 1) return 0;
+            return HasProvenEntry(config, candidate) &&
+                   IsVerifiedPath(config, candidate.Servers, candidate.Proxy.Id)
+                ? 1
+                : 2;
+        }
         if (candidate.Servers.Count == 1)
         {
             // Direct route: prefer it only if the server was ever reached

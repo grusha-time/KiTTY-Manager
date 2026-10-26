@@ -1963,8 +1963,6 @@ public partial class MainWindow : Window
         IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
         var activeConfig = routeConfig ?? config;
-        if (explicitCandidates is not { Count: > 0 } && !server.TryDirectWithoutJumphost && activeConfig.BaseProxies.All(p => !p.Enabled))
-            throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
         if (forcedViaServerId is Guid requestedViaId)
             RouteLog($"Forced route request: target={server.Name}; via=" +
                      $"{activeConfig.FindServer(requestedViaId)?.Name ?? requestedViaId.ToString()}");
@@ -1975,6 +1973,8 @@ public partial class MainWindow : Window
                 : RoutePlanner.Candidates(activeConfig, server.Id);
         if (ranked.Count == 0)
         {
+            if (!server.TryDirectWithoutJumphost && activeConfig.BaseProxies.All(p => !p.Enabled))
+                throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
             var required = server.RequiredPreviousServerId is Guid requiredId
                 ? activeConfig.FindServer(requiredId)
                 : null;

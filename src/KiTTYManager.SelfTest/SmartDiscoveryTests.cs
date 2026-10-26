@@ -3728,6 +3728,58 @@ internal sealed partial class SelfTestRunner
         Equal("passB", probe26.AttemptedLogins[2].pass);
         Equal("passB", probe26.AttemptedLogins[3].pass);
         Equal("passA", probe26.AttemptedLogins[4].pass);
+
+        SavedMultiHopWithoutSocksPlannerTest();
+    }
+
+    private static void SavedMultiHopWithoutSocksPlannerTest()
+    {
+        var config = new ManagerConfig();
+        var gateway = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Gateway",
+            Host = "10.0.0.1",
+            TryDirectWithoutJumphost = true
+        };
+        var target = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Target",
+            Host = "192.168.1.10",
+            TryDirectWithoutJumphost = false,
+            RequiredPreviousServerId = gateway.Id
+        };
+        config.UngroupedServers.Add(gateway);
+        config.UngroupedServers.Add(target);
+        config.Links.Add(new ServerLink
+        {
+            FromServerId = gateway.Id,
+            ToServerId = target.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        });
+        config.BaseProxies.Clear();
+
+        var candidates = RoutePlanner.Candidates(config, target.Id);
+        Equal(true, candidates.Count >= 1);
+        var match = candidates.FirstOrDefault(c =>
+            c.WithoutProxy &&
+            c.Servers.Count == 2 &&
+            c.Servers[0].Id == gateway.Id &&
+            c.Servers[1].Id == target.Id);
+        Equal(true, match != null);
+
+        var cached = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [gateway.Id, target.Id]
+        };
+        var reconstructed = RoutePlanner.CandidateFromCached(config, cached);
+        Equal(true, reconstructed != null);
+        Equal(true, reconstructed!.WithoutProxy);
+        Equal(2, reconstructed.Servers.Count);
+        Equal(gateway.Id, reconstructed.Servers[0].Id);
+        Equal(target.Id, reconstructed.Servers[1].Id);
     }
 
     private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>
