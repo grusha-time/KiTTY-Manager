@@ -577,6 +577,51 @@ public partial class MainWindow : Window
     private void ClearGroupFilter_Click(object sender, RoutedEventArgs e) { selectedGroup = null; ClearTreeSelection(GroupTree.Items); RefreshSessions(); }
     private static void ClearTreeSelection(ItemCollection items) { foreach (var value in items) if (value is TreeViewItem item) { item.IsSelected = false; ClearTreeSelection(item.Items); } }
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) { if (SessionsGrid is not null) RefreshSessions(); }
+    private void FindSession_Executed(object sender, ExecutedRoutedEventArgs e)
+    {
+        SearchBox.Focus();
+        SearchBox.SelectAll();
+        e.Handled = true;
+    }
+    private void SearchBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        var result = SessionKeyboardPolicy.EvaluateSearchKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None, SessionsGrid.Items.Count);
+        if (!result.Handled) return;
+        e.Handled = true;
+        if (!result.ShouldNavigate) return;
+
+        SessionsGrid.SelectedIndex = result.TargetIndex;
+        SessionsGrid.SelectedItem = SessionsGrid.Items[result.TargetIndex];
+        if (SessionsGrid.Columns.Count > 0)
+        {
+            SessionsGrid.CurrentCell = new DataGridCellInfo(SessionsGrid.Items[result.TargetIndex], SessionsGrid.Columns[0]);
+        }
+        SessionsGrid.ScrollIntoView(SessionsGrid.Items[result.TargetIndex]);
+        SessionsGrid.UpdateLayout();
+
+        var row = SessionsGrid.ItemContainerGenerator.ContainerFromIndex(result.TargetIndex) as DataGridRow;
+        var cell = (row is not null && SessionsGrid.Columns.Count > 0)
+            ? FindParent<DataGridCell>(SessionsGrid.Columns[0].GetCellContent(row))
+            : null;
+
+        if (cell is not null)
+        {
+            cell.Focus();
+        }
+        else if (row is not null)
+        {
+            row.Focus();
+        }
+        else
+        {
+            SessionsGrid.Focus();
+        }
+
+        if (SelectedRow() is SessionRow selected)
+        {
+            ShowServer(selected.Server);
+        }
+    }
     private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e) { if (GroupTree is not null) RefreshGroups(); }
 
     private void ResetRequiredRoutePicker()
@@ -678,12 +723,22 @@ public partial class MainWindow : Window
         if (FindParent<DataGridColumnHeader>(e.OriginalSource as DependencyObject) is not null) return;
         var server = SelectedRow()?.Server;
         if (server is null) return;
-        if (config.BaseProxies.Any(proxy => proxy.Enabled && proxy.StartupServerId == server.Id))
-        {
-            await StartManagedJumphostAsync(server);
-            return;
-        }
-        await OpenRoutedConsoleAsync(server);
+        await SessionOpenDispatcher.OpenAsync(server, config, StartManagedJumphostAsync, OpenRoutedConsoleAsync);
+    }
+    private void SessionsGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SessionKeyboardPolicy.ShouldSyncDetailsOnSelectionChanged(SessionsGrid.IsKeyboardFocusWithin, SelectedRow() is not null) && SelectedRow() is SessionRow selected)
+            ShowServer(selected.Server);
+    }
+    private async void SessionsGrid_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        var result = SessionKeyboardPolicy.EvaluateGridKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None, e.IsRepeat, SelectedRow()?.Server is not null);
+        if (!result.Handled) return;
+        e.Handled = true;
+        if (!result.ShouldOpen) return;
+        var server = SelectedRow()?.Server;
+        if (server is null) return;
+        await SessionOpenDispatcher.OpenAsync(server, config, StartManagedJumphostAsync, OpenRoutedConsoleAsync);
     }
     private void SessionsGrid_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
@@ -1268,12 +1323,7 @@ public partial class MainWindow : Window
     private async void OpenRoutedConsole_Click(object sender, RoutedEventArgs e)
     {
         var server = SelectedRow()?.Server ?? selectedServer; if (server is null) return;
-        if (config.BaseProxies.Any(proxy => proxy.Enabled && proxy.StartupServerId == server.Id))
-        {
-            await StartManagedJumphostAsync(server);
-            return;
-        }
-        await OpenRoutedConsoleAsync(server);
+        await SessionOpenDispatcher.OpenAsync(server, config, StartManagedJumphostAsync, OpenRoutedConsoleAsync);
     }
 
     private async void OpenWinScp_Click(object sender, RoutedEventArgs e)
@@ -1354,6 +1404,9 @@ public partial class MainWindow : Window
             "Идёт проверка связей", MessageBoxButton.OK, MessageBoxImage.Information);
         return true;
     }
+
+    private Task OpenRoutedConsoleAsync(ManagedServer server) =>
+        OpenRoutedConsoleAsync(server, null);
 
     private async Task OpenRoutedConsoleAsync(
         ManagedServer server, Guid? forcedViaServerId = null,

@@ -99,6 +99,8 @@ internal sealed partial class SelfTestRunner
         Test("Детекция активного приглашения шелла IsActiveShellPrompt", ActiveShellPromptDetectionTests);
         Test("Опциональное ожидание OTP с завершением по шеллу, выходу и таймауту", OptionalOtpWaitLifecycleTests);
         Test("Защита настроенного PAM от затирания пустыми полями при импорте", PamImportProtectionTests);
+        Test("Диспетчер открытия сессий: обычный сервер и JumpHost", SessionOpenDispatcherTests);
+        Test("Клавиатурная навигация: политика, привязки XAML и регрессионная защита", SessionKeyboardPolicyAndBindingTests);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);

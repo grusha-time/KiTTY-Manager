@@ -1,7 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework Condition="$([MSBuild]::IsOSPlatform('Windows'))">net8.0-windows</TargetFramework>
+    <TargetFramework Condition="!$([MSBuild]::IsOSPlatform('Windows'))">net8.0</TargetFramework>
+    <UseWPF Condition="$([MSBuild]::IsOSPlatform('Windows'))">true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -13,5 +15,7 @@
     <Compile Include="..\KiTTYManager.App\HelpContent.cs" Link="HelpContent.cs" />
     <Compile Include="..\KiTTYManager.App\AppUpdateInstaller.cs" Link="AppUpdateInstaller.cs" />
     <Compile Include="..\KiTTYManager.App\KittyWindowInput.cs" Link="KittyWindowInput.cs" />
+    <Compile Include="..\KiTTYManager.App\SessionOpenDispatcher.cs" Link="SessionOpenDispatcher.cs" />
+    <Compile Include="..\KiTTYManager.App\SessionKeyboardPolicy.cs" Link="SessionKeyboardPolicy.cs" />
   </ItemGroup>
 </Project>
