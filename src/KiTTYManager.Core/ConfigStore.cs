@@ -402,7 +402,7 @@ public static class ConfigStore
         return JsonSerializer.Deserialize<ManagerConfig>(json, Options)!;
     }
 
-    private static void Normalize(ManagerConfig config)
+    public static void Normalize(ManagerConfig config)
     {
         // System.Text.Json can assign null to non-nullable collection properties
         // when a hand-edited/imported JSON explicitly contains null.
@@ -449,6 +449,7 @@ public static class ConfigStore
         foreach (var group in config.Groups) Normalize(group);
         var validServerIds = config.AllServers().Select(server => server.Id).ToHashSet();
         var validProxyIds = config.BaseProxies.Select(proxy => proxy.Id).ToHashSet();
+        var serverMap = config.AllServers().ToDictionary(s => s.Id);
         foreach (var server in config.AllServers())
         {
             if (server.RequiredPreviousServerId is Guid requiredPreviousServerId &&
@@ -464,6 +465,22 @@ public static class ConfigStore
                      validProxyIds.Contains(item.ProxyId.Value)) &&
                     (item.PreviousServerId is null || validServerIds.Contains(item.PreviousServerId.Value)))
                 .ToList();
+            var route = server.PreferredRoute;
+            if (route is null) continue;
+            if (route.ProxyId != Guid.Empty && !validProxyIds.Contains(route.ProxyId) ||
+                route.ProxyId == Guid.Empty &&
+                (route.ServerIds.Count == 0 ||
+                 !serverMap.TryGetValue(route.ServerIds[0], out var entry) ||
+                 !entry.TryDirectWithoutJumphost) ||
+                route.ServerIds.Count == 0 ||
+                route.ServerIds[^1] != server.Id ||
+                route.ServerIds.Any(id => !validServerIds.Contains(id)) ||
+                route.ProxyId != Guid.Empty &&
+                server.RequiredPreviousServerId is Guid req &&
+                (route.ServerIds.Count < 2 || route.ServerIds[^2] != req))
+            {
+                server.PreferredRoute = null;
+            }
         }
         foreach (var link in config.Links)
         {
@@ -516,7 +533,7 @@ public static class ConfigStore
         server.PamConfirmPrompt = string.IsNullOrWhiteSpace(server.PamConfirmPrompt) ? "[Y/n]" : server.PamConfirmPrompt;
     }
 
-    private static void Normalize(ManagedServer server)
+    public static void Normalize(ManagedServer server)
     {
         server.Host = server.Host.Trim();
         if (server.KittyBaseline is not null) server.KittyBaseline.Host = server.KittyBaseline.Host.Trim();
@@ -593,11 +610,9 @@ public static class ConfigStore
         if (server.PreferredRoute is not null)
         {
             server.PreferredRoute.ServerIds ??= [];
-            if (server.PreferredRoute.ProxyId == Guid.Empty &&
-                (!server.TryDirectWithoutJumphost ||
-                 server.PreferredRoute.ServerIds.Count != 1) ||
-                server.PreferredRoute.ServerIds.Count == 0 ||
+            if (server.PreferredRoute.ServerIds.Count == 0 ||
                 server.PreferredRoute.ServerIds[^1] != server.Id ||
+                server.PreferredRoute.ProxyId == Guid.Empty && server.PreferredRoute.ServerIds.Count == 1 && !server.TryDirectWithoutJumphost ||
                 server.PreferredRoute.ProxyId != Guid.Empty &&
                 server.RequiredPreviousServerId is Guid required &&
                 (server.PreferredRoute.ServerIds.Count < 2 ||

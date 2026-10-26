@@ -3780,6 +3780,35 @@ internal sealed partial class SelfTestRunner
         Equal(2, reconstructed.Servers.Count);
         Equal(gateway.Id, reconstructed.Servers[0].Id);
         Equal(target.Id, reconstructed.Servers[1].Id);
+
+        target.PreferredRoute = new CachedRoute
+        {
+            ProxyId = Guid.Empty,
+            ServerIds = [gateway.Id, target.Id]
+        };
+
+        var exported = ConfigTransfer.CreateExport(config, [gateway.Id, target.Id], includeEntryPoints: true);
+        var exportedTarget = exported.FindServer(target.Id);
+        Equal(true, exportedTarget?.PreferredRoute != null);
+        Equal(Guid.Empty, exportedTarget!.PreferredRoute!.ProxyId);
+        Equal(2, exportedTarget.PreferredRoute.ServerIds.Count);
+        Equal(gateway.Id, exportedTarget.PreferredRoute.ServerIds[0]);
+        Equal(target.Id, exportedTarget.PreferredRoute.ServerIds[1]);
+
+        ConfigStore.Normalize(config);
+        Equal(true, target.PreferredRoute != null);
+        Equal(Guid.Empty, target.PreferredRoute!.ProxyId);
+        Equal(2, target.PreferredRoute.ServerIds.Count);
+        Equal(gateway.Id, target.PreferredRoute.ServerIds[0]);
+        Equal(target.Id, target.PreferredRoute.ServerIds[1]);
+
+        gateway.TryDirectWithoutJumphost = false;
+        var exportedWithoutDirect = ConfigTransfer.CreateExport(config, [gateway.Id, target.Id], includeEntryPoints: true);
+        var exportedTargetWithoutDirect = exportedWithoutDirect.FindServer(target.Id);
+        Equal(null, exportedTargetWithoutDirect?.PreferredRoute);
+
+        ConfigStore.Normalize(config);
+        Equal(null, target.PreferredRoute);
     }
 
     private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>

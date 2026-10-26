@@ -416,6 +416,7 @@ public static class ConfigTransfer
     {
         var serverIds = config.AllServers().Select(server => server.Id).ToHashSet();
         var proxyIds = config.BaseProxies.Select(proxy => proxy.Id).ToHashSet();
+        var serverMap = config.AllServers().ToDictionary(s => s.Id);
         foreach (var server in config.AllServers())
         {
             if (server.RequiredPreviousServerId is Guid requiredPreviousServerId &&
@@ -425,7 +426,9 @@ public static class ConfigTransfer
             if (route is null) continue;
             if (route.ProxyId != Guid.Empty && !proxyIds.Contains(route.ProxyId) ||
                 route.ProxyId == Guid.Empty &&
-                (!server.TryDirectWithoutJumphost || route.ServerIds.Count != 1) ||
+                (route.ServerIds.Count == 0 ||
+                 !serverMap.TryGetValue(route.ServerIds[0], out var entry) ||
+                 !entry.TryDirectWithoutJumphost) ||
                 route.ServerIds.Count == 0 ||
                 route.ServerIds[^1] != server.Id || route.ServerIds.Any(id => !serverIds.Contains(id)) ||
                 route.ProxyId != Guid.Empty &&
