@@ -1372,7 +1372,7 @@ public partial class MainWindow : Window
             ssh.ClearFailureCache();
             await BusyAsync("Строю SSH-маршрут с PAM-авторизацией…", async cancellationToken =>
             {
-                var jumpHostCandidates = ResolveJumpHostCandidates(server, forcedViaServerId);
+                var jumpHostCandidates = ResolveJumpHostCandidates(server, forcedViaServerId, routeConfig);
                 ActiveRoute? route = null;
                 ManagedServer? connectedJumpHost = null;
                 BaseProxy? connectedProxy = null;
@@ -1398,7 +1398,7 @@ public partial class MainWindow : Window
                     try
                     {
                         Status($"Подключаюсь к JumpHost «{item.JumpHost.Name}»…");
-                        route = await Connect(item.JumpHost, cancellationToken, true);
+                        route = await Connect(item.JumpHost, cancellationToken, true, routeConfig: routeConfig, persist: persist, enableBackgroundProbing: enableBackgroundProbing);
                         connectedJumpHost = item.JumpHost;
                         connectedProxy = item.Proxy;
                         connectedCandidate = item.Candidate;
@@ -1732,8 +1732,9 @@ public partial class MainWindow : Window
     }
 
     private List<(ManagedServer JumpHost, BaseProxy? Proxy, RouteCandidate? Candidate)> ResolveJumpHostCandidates(
-        ManagedServer server, Guid? forcedViaServerId = null)
+        ManagedServer server, Guid? forcedViaServerId = null, ManagerConfig? routeConfig = null)
     {
+        var activeConfig = routeConfig ?? config;
         var result = new List<(ManagedServer JumpHost, BaseProxy? Proxy, RouteCandidate? Candidate)>();
         var seen = new HashSet<(Guid ServerId, Guid? ProxyId)>();
 
@@ -1746,25 +1747,25 @@ public partial class MainWindow : Window
 
         if (forcedViaServerId is Guid forcedId)
         {
-            var forcedServer = config.FindServer(forcedId)
+            var forcedServer = activeConfig.FindServer(forcedId)
                 ?? throw new InvalidOperationException($"Сервер-посредник «{forcedId}» не найден.");
-            var proxy = config.BaseProxies.FirstOrDefault(p => p.StartupServerId == forcedId);
+            var proxy = activeConfig.BaseProxies.FirstOrDefault(p => p.StartupServerId == forcedId);
             TryAdd(forcedServer, proxy, null);
             return result;
         }
 
         if (server.RequiredPreviousServerId is Guid requiredId)
         {
-            var requiredServer = config.FindServer(requiredId)
+            var requiredServer = activeConfig.FindServer(requiredId)
                 ?? throw new InvalidOperationException("Обязательный сервер-посредник для PAM не найден.");
-            var proxy = config.BaseProxies.FirstOrDefault(p => p.StartupServerId == requiredId);
+            var proxy = activeConfig.BaseProxies.FirstOrDefault(p => p.StartupServerId == requiredId);
             TryAdd(requiredServer, proxy, null);
             return result;
         }
 
-        var candidates = RoutePlanner.Candidates(config, server.Id);
+        var candidates = RoutePlanner.Candidates(activeConfig, server.Id);
         var ordered = server.PreferredRoute is not null
-            ? RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute)
+            ? RoutePlanner.OrderPreferred(activeConfig, candidates, server.PreferredRoute)
             : candidates;
 
         foreach (var candidate in ordered)
@@ -1772,11 +1773,11 @@ public partial class MainWindow : Window
             if (candidate.Servers.Count > 1)
             {
                 var jh = candidate.Servers[^2];
-                var proxy = config.BaseProxies.FirstOrDefault(p => p.StartupServerId == jh.Id);
+                var proxy = activeConfig.BaseProxies.FirstOrDefault(p => p.StartupServerId == jh.Id);
                 TryAdd(jh, proxy, candidate);
             }
             else if (candidate.Proxy.StartupServerId is Guid startupServerId &&
-                     config.FindServer(startupServerId) is ManagedServer startupServer)
+                     activeConfig.FindServer(startupServerId) is ManagedServer startupServer)
             {
                 TryAdd(startupServer, candidate.Proxy, candidate);
             }
@@ -1784,9 +1785,9 @@ public partial class MainWindow : Window
 
         if (result.Count == 0)
         {
-            foreach (var proxy in config.BaseProxies.Where(p => p.Enabled && p.StartupServerId is not null && p.StartupServerId != server.Id))
+            foreach (var proxy in activeConfig.BaseProxies.Where(p => p.Enabled && p.StartupServerId is not null && p.StartupServerId != server.Id))
             {
-                var startupServer = config.FindServer(proxy.StartupServerId!.Value);
+                var startupServer = activeConfig.FindServer(proxy.StartupServerId!.Value);
                 if (startupServer is not null)
                     TryAdd(startupServer, proxy, null);
             }
@@ -4224,7 +4225,17 @@ public partial class MainWindow : Window
             {
                 var operation = Dispatcher.InvokeAsync(
                     () => EnsureManagedJumphostAsync(token, true, proxyId: proxy.Id, isManualLaunch: true));
-                return await await operation;
+                var ready = await await operation;
+                if (ready)
+                {
+                    var liveProxy = config.BaseProxies.FirstOrDefault(p => p.Id == proxy.Id);
+                    if (liveProxy is not null)
+                    {
+                        proxy.Host = liveProxy.Host;
+                        proxy.Port = liveProxy.Port;
+                    }
+                }
+                return ready;
             },
             () =>
             {

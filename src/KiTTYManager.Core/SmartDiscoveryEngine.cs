@@ -1083,9 +1083,11 @@ public sealed class SmartDiscoveryEngine
                     var savedPrefixLength = gatewayChain.SavedRoute?.Servers.Count ?? 0;
                     if (gateway.RouteHops.Count - savedPrefixLength >= maxHops) continue;
 
-                    var gatewayEntryPoints = gatewayChain.SavedRoute is { } savedRoute
-                        ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
-                        : entryPoints;
+                    var gatewayEntryPoints = !options.AutoSelectJumpHost
+                        ? entryPoints
+                        : gatewayChain.SavedRoute is { } savedRoute
+                            ? (IReadOnlyList<BaseProxy?>)[savedRoute.WithoutProxy ? null : savedRoute.Proxy]
+                            : entryPoints;
 
                     var nonRetryableOnThisGateway = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1919,30 +1921,38 @@ public sealed class SmartDiscoveryEngine
             var server = config.FindServer(id);
             if (server is null) return;
 
+            bool IsCompatibleWithChosenJumpHost(RouteCandidate c) =>
+                options.AutoSelectJumpHost ||
+                (options.JumpHost == null ? c.WithoutProxy : !c.WithoutProxy && c.Proxy.Id == options.JumpHost.Id);
+
             RouteCandidate? route = null;
 
             if (server.PreferredRoute is not null)
             {
                 var cachedCandidate = RoutePlanner.CandidateFromCached(config, server.PreferredRoute);
                 if (cachedCandidate is not null &&
+                    IsCompatibleWithChosenJumpHost(cachedCandidate) &&
                     (distance == -1 || cachedCandidate.Servers.Take(cachedCandidate.Servers.Count - 1).All(prefix => !scope.Contains(prefix.Id))))
                 {
                     route = cachedCandidate;
                 }
             }
 
-            if (route is null && (server.PreferredRoute is null || distance == -1))
+            if (route is null && (server.PreferredRoute is null || distance == -1 || !options.AutoSelectJumpHost))
             {
                 var candidates = RoutePlanner.Candidates(config, id);
                 var ordered = RoutePlanner.OrderPreferred(
                         config, candidates, server.PreferredRoute)
+                    .Where(IsCompatibleWithChosenJumpHost)
                     .Where(candidate => distance == -1 || candidate.Servers
                         .Take(candidate.Servers.Count - 1)
                         .All(prefixServer => !scope.Contains(prefixServer.Id)))
                     .ToArray();
                 if (ordered.Length == 0 && distance == -1)
                 {
-                    ordered = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute).ToArray();
+                    ordered = RoutePlanner.OrderPreferred(config, candidates, server.PreferredRoute)
+                        .Where(IsCompatibleWithChosenJumpHost)
+                        .ToArray();
                 }
 
                 route = server.PreferredRoute is { } preferred

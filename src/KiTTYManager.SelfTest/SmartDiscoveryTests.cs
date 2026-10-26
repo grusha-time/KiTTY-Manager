@@ -3730,6 +3730,7 @@ internal sealed partial class SelfTestRunner
         Equal("passA", probe26.AttemptedLogins[4].pass);
 
         SavedMultiHopWithoutSocksPlannerTest();
+        ManualJumpHostSelectionBypassesSavedRouteTest();
     }
 
     private static void SavedMultiHopWithoutSocksPlannerTest()
@@ -3842,6 +3843,118 @@ internal sealed partial class SelfTestRunner
         Equal(true, candidateWithEvidence != null);
         Equal(true, candidateWithEvidence!.WithoutProxy);
         Equal(2, candidateWithEvidence.Servers.Count);
+
+        // Verify path limit prioritizing direct entry servers (finding 4):
+        // 33 intermediate servers N01..N33 -> B without TryDirectWithoutJumphost,
+        // and one direct entry Z -> B with TryDirectWithoutJumphost = true.
+        var pathLimitConfig = new ManagerConfig();
+        var serverB = new ManagedServer { Id = Guid.NewGuid(), Name = "B", Host = "10.0.1.2", TryDirectWithoutJumphost = false };
+        var serverT = new ManagedServer { Id = Guid.NewGuid(), Name = "T", Host = "10.0.1.3", TryDirectWithoutJumphost = false };
+        pathLimitConfig.UngroupedServers.Add(serverB);
+        pathLimitConfig.UngroupedServers.Add(serverT);
+        pathLimitConfig.Links.Add(new ServerLink { FromServerId = serverB.Id, ToServerId = serverT.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+
+        for (var i = 1; i <= 33; i++)
+        {
+            var n = new ManagedServer { Id = Guid.NewGuid(), Name = $"N{i:D2}", Host = $"10.0.2.{i}", TryDirectWithoutJumphost = false };
+            pathLimitConfig.UngroupedServers.Add(n);
+            pathLimitConfig.Links.Add(new ServerLink { FromServerId = n.Id, ToServerId = serverB.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+        }
+
+        var serverZ = new ManagedServer { Id = Guid.NewGuid(), Name = "Z", Host = "10.0.3.1", TryDirectWithoutJumphost = true };
+        pathLimitConfig.UngroupedServers.Add(serverZ);
+        pathLimitConfig.Links.Add(new ServerLink { FromServerId = serverZ.Id, ToServerId = serverB.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+
+        var pathLimitCandidates = RoutePlanner.Candidates(pathLimitConfig, serverT.Id);
+        var directZCandidate = pathLimitCandidates.FirstOrDefault(c =>
+            c.WithoutProxy &&
+            c.Servers.Count == 3 &&
+            c.Servers[0].Id == serverZ.Id &&
+            c.Servers[1].Id == serverB.Id &&
+            c.Servers[2].Id == serverT.Id);
+        Equal(true, directZCandidate != null);
+    }
+
+    private static void ManualJumpHostSelectionBypassesSavedRouteTest()
+    {
+        var config = new ManagerConfig();
+        var p1 = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "P1",
+            Host = "127.0.0.1",
+            Port = 1081,
+            Enabled = true
+        };
+        var p2 = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "P2",
+            Host = "127.0.0.1",
+            Port = 1082,
+            Enabled = true
+        };
+        config.BaseProxies.Add(p1);
+        config.BaseProxies.Add(p2);
+
+        var gatewayId = Guid.NewGuid();
+        var gateway = new ManagedServer
+        {
+            Id = gatewayId,
+            Name = "SavedGW",
+            Host = "10.88.0.1",
+            Port = 22,
+            Username = "admin",
+            Password = "pw",
+            TryDirectWithoutJumphost = false,
+            PreferredRoute = new CachedRoute
+            {
+                ProxyId = p1.Id,
+                ServerIds = [gatewayId]
+            }
+        };
+        config.UngroupedServers.Add(gateway);
+
+        var probe = new TestSmartDiscoveryProbe();
+        probe.HopReachability.Add((gateway.Host, "10.88.0.2"));
+        probe.ValidCredentials["10.88.0.2"] = [("admin", "pw")];
+
+        // 1. Manual direct connection (JumpHost == null)
+        var optionsDirect = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.88.0.2"],
+            Usernames = ["admin"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = false,
+            JumpHost = null,
+            MaxParallelConnections = 1
+        };
+
+        var engineDirect = new SmartDiscoveryEngine(config, optionsDirect, probe);
+        var resultDirect = engineDirect.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(false, probe.HopAttempts.Any(h => h.ProxyId == p1.Id));
+        Equal(false, probe.ReachabilityAttempts.Any(r => r.proxyId == p1.Id));
+
+        // 2. Manual specific proxy P2
+        probe.HopAttempts.Clear();
+        probe.ReachabilityAttempts.Clear();
+
+        var optionsP2 = new SmartDiscoveryOptions
+        {
+            TargetHosts = ["10.88.0.2"],
+            Usernames = ["admin"],
+            Passwords = ["pw"],
+            AutoSelectJumpHost = false,
+            JumpHost = p2,
+            MaxParallelConnections = 1
+        };
+
+        var engineP2 = new SmartDiscoveryEngine(config, optionsP2, probe);
+        var resultP2 = engineP2.DiscoverAsync().GetAwaiter().GetResult();
+
+        Equal(false, probe.HopAttempts.Any(h => h.ProxyId == p1.Id));
+        Equal(false, probe.ReachabilityAttempts.Any(r => r.proxyId == p1.Id));
     }
 
     private sealed class SyncProgress<T>(Action<T> handler) : IProgress<T>

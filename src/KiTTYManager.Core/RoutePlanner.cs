@@ -61,6 +61,7 @@ public static class RoutePlanner
                 .Select(paths => paths[round])
                 .OrderBy(path => target.RequiredPreviousServerId is Guid required &&
                                  (path.Count < 2 || path[^2].Id != required) ? 1 : 0)
+                .ThenBy(path => path[0].TryDirectWithoutJumphost ? 0 : 1)
                 .ThenBy(path => path.Count)
                 .ThenBy(path => string.Join('/', path.Select(server => server.Name)),
                     StringComparer.CurrentCultureIgnoreCase)
