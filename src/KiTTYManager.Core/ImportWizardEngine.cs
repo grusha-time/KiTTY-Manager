@@ -25,6 +25,8 @@ public sealed class ImportSessionDecision
     public string Reason { get; init; } = "";
     public ImportDecision Decision { get; set; }
     public bool UseIncomingGroup { get; set; }
+    public bool CurrentHadPamConfigured { get; set; }
+    public bool IncomingHadPamConfigured { get; set; }
     public int CheckedFields { get; set; }
     public List<ImportSessionCandidate> Candidates { get; init; } = [];
     public string IncomingDisplay => $"{IncomingName} — {IncomingEndpoint} — {IncomingGroup}";
@@ -242,6 +244,13 @@ public static class ImportWizardEngine
     {
         var currentLocations = Locations(current);
         var incomingLocations = Locations(incoming);
+        foreach (var session in plan.Sessions)
+        {
+            var curr = currentLocations.FirstOrDefault(x => x.Server.Id == session.CurrentId);
+            var inc = incomingLocations.FirstOrDefault(x => x.Server.Id == session.IncomingId);
+            session.CurrentHadPamConfigured = curr?.Server.HasPamConfigured() ?? false;
+            session.IncomingHadPamConfigured = inc?.Server.HasPamConfigured() ?? false;
+        }
         Replace(plan.Fields, AnalyzeFields(plan.Sessions, currentLocations, incomingLocations,
             EntryPointServerIds(current, incoming)));
         Replace(plan.Groups, AnalyzeGroups(current, incoming, plan.Sessions,
@@ -283,8 +292,13 @@ public static class ImportWizardEngine
                 serverMap[row.IncomingId] = currentId;
                 if (row.Decision == ImportDecision.UseIncoming)
                 {
+                    var existingServer = result.FindServer(currentId)!;
                     var replacement = Clone(source);
                     replacement.Id = currentId;
+                    if (existingServer.HasPamConfigured())
+                    {
+                        replacement.MergePamPreservingPopulated(existingServer);
+                    }
                     ReplaceServerInPlace(result, currentId, replacement);
                     importedServerIds.Add(currentId);
                 }
@@ -340,6 +354,7 @@ public static class ImportWizardEngine
         RemapReferences(result, serverMap, proxyMap, importedServerIds, importedProxyIds, importedFields);
         ApplyPreferredRoutes(current, incoming, result, plan.Sessions, serverMap, proxyMap);
         ApplyLinkDecisions(result, incoming, plan.Links, serverMap, proxyMap);
+        foreach (var server in result.AllServers()) ConfigStore.NormalizePamDefaults(server);
         return result;
     }
 
@@ -356,6 +371,12 @@ public static class ImportWizardEngine
             "Выберите «Добавить в существующую и переименовать» только у одной из них.");
     }
 
+    private static readonly HashSet<string> PamFieldNames = new(StringComparer.Ordinal)
+    {
+        "UsePam", "PamSshCommand", "PamPassword", "PamTotpSecret", "PamTotpAlgorithm",
+        "PamTotpDigits", "PamTotpPeriodSeconds", "PamTotpPrompt", "PamAutoConfirm", "PamConfirmPrompt"
+    };
+
     public static readonly Guid NoMatchCandidateId = Guid.Empty;
 
     private static ImportSessionDecision Session(
@@ -369,6 +390,8 @@ public static class ImportWizardEngine
         Confidence = confidence, Reason = reason, Decision = decision,
         UseIncomingGroup = current is not null &&
             !string.Equals(incoming.Path, current.Path, StringComparison.OrdinalIgnoreCase),
+        CurrentHadPamConfigured = current?.Server.HasPamConfigured() ?? false,
+        IncomingHadPamConfigured = incoming.Server.HasPamConfigured(),
         Candidates = candidates.Select(item => new ImportSessionCandidate(item.Server.Id,
             $"{item.Server.Name} — {item.Server.Endpoint} — {item.Path}")).ToList()
     };
@@ -378,10 +401,41 @@ public static class ImportWizardEngine
     public static void ApplyFullImportCascade(ImportWizardPlan plan, IEnumerable<Guid> incomingIds)
     {
         var ids = incomingIds.ToHashSet();
+        var sessionPamConfigured = plan.Sessions
+            .Where(x => ids.Contains(x.IncomingId))
+            .ToDictionary(x => x.IncomingId, x =>
+            {
+                var targetHadPam = x.CurrentHadPamConfigured ||
+                    plan.Fields.Any(f => f.IncomingSessionId == x.IncomingId &&
+                        ((f.PropertyName == "UsePam" && f.CurrentValue.Equals("True", StringComparison.OrdinalIgnoreCase)) ||
+                         (f.PropertyName == "PamSshCommand" && !string.IsNullOrWhiteSpace(f.CurrentValue)) ||
+                         (f.PropertyName == "PamPassword" && !string.IsNullOrEmpty(f.CurrentValue)) ||
+                         (f.PropertyName == "PamTotpSecret" && !string.IsNullOrEmpty(f.CurrentValue))));
+                return (TargetHadPam: targetHadPam, IncomingHadPam: x.IncomingHadPamConfigured);
+            });
+
         foreach (var row in plan.Sessions.Where(x => ids.Contains(x.IncomingId) && x.Decision == ImportDecision.UseIncoming))
             row.UseIncomingGroup = true;
+
         foreach (var field in plan.Fields.Where(x => ids.Contains(x.IncomingSessionId)))
+        {
+            if (PamFieldNames.Contains(field.PropertyName) &&
+                sessionPamConfigured.TryGetValue(field.IncomingSessionId, out var pamInfo) &&
+                pamInfo.TargetHadPam)
+            {
+                var val = field.IncomingValue.Trim();
+                var isIncomingEmptyOrFalse = string.IsNullOrEmpty(val) ||
+                    string.Equals(val, "не задан", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(val, "не задана", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(val, "False", StringComparison.OrdinalIgnoreCase);
+
+                if (!pamInfo.IncomingHadPam || isIncomingEmptyOrFalse)
+                {
+                    continue;
+                }
+            }
             field.UseIncoming = true;
+        }
     }
 
     private static List<ImportFieldDecision> AnalyzeFields(List<ImportSessionDecision> sessions,
@@ -417,6 +471,32 @@ public static class ImportWizardEngine
             Add("EnableTcpKeepalives", "TCP keepalive", before.EnableTcpKeepalives.ToString(), after.EnableTcpKeepalives.ToString());
             Add("ReconnectOnConnectionFailure", "Переподключение при сбое", before.ReconnectOnConnectionFailure.ToString(), after.ReconnectOnConnectionFailure.ToString());
             Add("ReconnectOnSystemWakeup", "Переподключение при выходе из сна", before.ReconnectOnSystemWakeup.ToString(), after.ReconnectOnSystemWakeup.ToString());
+            var pamBeforeConfigured = before.HasPamConfigured();
+            var pamAfterConfigured = after.HasPamConfigured();
+            bool PamKeep(string? oldStr = null, string? newStr = null)
+            {
+                if (pamBeforeConfigured && !pamAfterConfigured) return true;
+                if (oldStr is not null && !string.IsNullOrEmpty(oldStr) && string.IsNullOrEmpty(newStr)) return true;
+                return false;
+            }
+
+            if (after.HasExplicitUsePam)
+                Add("UsePam", "Использовать PAM", before.UsePam.ToString(), after.UsePam.ToString(), keepCurrent: PamKeep());
+            Add("PamSshCommand", "SSH-команда PAM", before.PamSshCommand, after.PamSshCommand, keepCurrent: PamKeep(before.PamSshCommand, after.PamSshCommand));
+            Add("PamPassword", "Пароль PAM", before.PamPassword, after.PamPassword, secret: true, keepCurrent: PamKeep(before.PamPassword, after.PamPassword));
+            Add("PamTotpSecret", "TOTP-секрет PAM", before.PamTotpSecret, after.PamTotpSecret, secret: true, keepCurrent: PamKeep(before.PamTotpSecret, after.PamTotpSecret));
+            if (!string.IsNullOrWhiteSpace(after.PamTotpAlgorithm))
+                Add("PamTotpAlgorithm", "Алгоритм TOTP PAM", before.PamTotpAlgorithm, after.PamTotpAlgorithm, keepCurrent: PamKeep());
+            if (after.PamTotpDigits > 0)
+                Add("PamTotpDigits", "Количество цифр TOTP PAM", before.PamTotpDigits.ToString(), after.PamTotpDigits.ToString(), keepCurrent: PamKeep());
+            if (after.PamTotpPeriodSeconds > 0)
+                Add("PamTotpPeriodSeconds", "Период TOTP PAM", before.PamTotpPeriodSeconds.ToString(), after.PamTotpPeriodSeconds.ToString(), keepCurrent: PamKeep());
+            if (!string.IsNullOrWhiteSpace(after.PamTotpPrompt))
+                Add("PamTotpPrompt", "Запрос OTP PAM", before.PamTotpPrompt, after.PamTotpPrompt, keepCurrent: PamKeep(before.PamTotpPrompt, after.PamTotpPrompt));
+            if (after.HasExplicitPamAutoConfirm)
+                Add("PamAutoConfirm", "Автоподтверждение PAM", before.PamAutoConfirm.ToString(), after.PamAutoConfirm.ToString(), keepCurrent: PamKeep());
+            if (!string.IsNullOrWhiteSpace(after.PamConfirmPrompt))
+                Add("PamConfirmPrompt", "Запрос подтверждения PAM", before.PamConfirmPrompt, after.PamConfirmPrompt, keepCurrent: PamKeep(before.PamConfirmPrompt, after.PamConfirmPrompt));
 
             void Add(string property, string label, string oldValue, string newValue, bool secret = false, bool keepCurrent = false)
             {
@@ -484,9 +564,11 @@ public static class ImportWizardEngine
     private static string WebSummary(IEnumerable<WebInterface> values) => string.Join(", ",
         values.Select(x => $"{x.Name}: {x.Url} (учётные данные: {(x.Username.Length > 0 || x.Password.Length > 0 ? "заданы" : "не заданы")})"));
 
-    private static void ApplySelectedFields(ManagedServer target, ManagedServer source,
+    public static void ApplySelectedFields(ManagedServer target, ManagedServer source,
         IEnumerable<ImportFieldDecision> fields)
     {
+        var targetHadPam = target.HasPamConfigured();
+
         foreach (var field in fields)
             switch (field.PropertyName)
             {
@@ -517,6 +599,36 @@ public static class ImportWizardEngine
                 case "EnableTcpKeepalives": target.EnableTcpKeepalives = source.EnableTcpKeepalives; break;
                 case "ReconnectOnConnectionFailure": target.ReconnectOnConnectionFailure = source.ReconnectOnConnectionFailure; break;
                 case "ReconnectOnSystemWakeup": target.ReconnectOnSystemWakeup = source.ReconnectOnSystemWakeup; break;
+                case "UsePam":
+                    if (source.HasExplicitUsePam || !targetHadPam) target.UsePam = source.UsePam;
+                    break;
+                case "PamSshCommand":
+                    if (!string.IsNullOrWhiteSpace(source.PamSshCommand) || !targetHadPam) target.PamSshCommand = source.PamSshCommand;
+                    break;
+                case "PamPassword":
+                    if (!string.IsNullOrEmpty(source.PamPassword) || !targetHadPam) target.PamPassword = source.PamPassword;
+                    break;
+                case "PamTotpSecret":
+                    if (!string.IsNullOrEmpty(source.PamTotpSecret) || !targetHadPam) target.PamTotpSecret = source.PamTotpSecret;
+                    break;
+                case "PamTotpAlgorithm":
+                    if (!string.IsNullOrWhiteSpace(source.PamTotpAlgorithm) || !targetHadPam) target.PamTotpAlgorithm = source.PamTotpAlgorithm;
+                    break;
+                case "PamTotpDigits":
+                    if (source.PamTotpDigits > 0 || !targetHadPam) target.PamTotpDigits = source.PamTotpDigits;
+                    break;
+                case "PamTotpPeriodSeconds":
+                    if (source.PamTotpPeriodSeconds > 0 || !targetHadPam) target.PamTotpPeriodSeconds = source.PamTotpPeriodSeconds;
+                    break;
+                case "PamTotpPrompt":
+                    if (!string.IsNullOrWhiteSpace(source.PamTotpPrompt) || !targetHadPam) target.PamTotpPrompt = source.PamTotpPrompt;
+                    break;
+                case "PamAutoConfirm":
+                    if (source.HasExplicitPamAutoConfirm || !targetHadPam) target.PamAutoConfirm = source.PamAutoConfirm;
+                    break;
+                case "PamConfirmPrompt":
+                    if (!string.IsNullOrWhiteSpace(source.PamConfirmPrompt) || !targetHadPam) target.PamConfirmPrompt = source.PamConfirmPrompt;
+                    break;
             }
     }
 
@@ -803,7 +915,37 @@ public static class ImportWizardEngine
         if (!names.Contains(wanted)) return wanted;
         for (var i = 2; ; i++) if (!names.Contains($"{wanted} ({i})")) return $"{wanted} ({i})";
     }
-    private static T Clone<T>(T value) => JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(value, JsonOptions), JsonOptions)!;
+    private static T Clone<T>(T value)
+    {
+        var cloned = JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(value, JsonOptions), JsonOptions)!;
+        CopyExplicitPamFlags(value, cloned);
+        return cloned;
+    }
+
+    private static void CopyExplicitPamFlags(object? source, object? target)
+    {
+        if (source is null || target is null) return;
+        if (source is ManagedServer s && target is ManagedServer t)
+        {
+            t.HasExplicitUsePam = s.HasExplicitUsePam;
+            t.HasExplicitPamAutoConfirm = s.HasExplicitPamAutoConfirm;
+            t.HasAllPamPropertiesPresentInImport = s.HasAllPamPropertiesPresentInImport;
+            return;
+        }
+        if (source is ManagerConfig sc && target is ManagerConfig tc)
+        {
+            var sourceServers = sc.AllServers().ToDictionary(x => x.Id);
+            foreach (var ts in tc.AllServers())
+            {
+                if (sourceServers.TryGetValue(ts.Id, out var ss))
+                {
+                    ts.HasExplicitUsePam = ss.HasExplicitUsePam;
+                    ts.HasExplicitPamAutoConfirm = ss.HasExplicitPamAutoConfirm;
+                    ts.HasAllPamPropertiesPresentInImport = ss.HasAllPamPropertiesPresentInImport;
+                }
+            }
+        }
+    }
     private sealed record ServerLocation(ManagedServer Server, Guid? GroupId, string Path);
     private static T? SingleOrDefaultSafe<T>(this IEnumerable<T> source, Func<T, bool> predicate) where T : class
     {

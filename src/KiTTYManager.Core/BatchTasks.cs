@@ -2678,14 +2678,14 @@ public static class BatchTaskTemplateStore
 public static class SecretRedactor
 {
     public static string[] Secrets(ManagerConfig config) => config.AllServers()
-        .SelectMany(server => new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword }
+        .SelectMany(server => new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword, server.PamPassword, server.PamTotpSecret }
             .Concat(server.WebInterfaces.Select(x => x.Password)))
         .Concat(config.BaseProxies.Select(x => x.TotpSecret))
         .Where(value => !string.IsNullOrEmpty(value)).Distinct().OrderByDescending(value => value.Length).ToArray();
 
     public static string Redact(string text, ManagedServer server, IEnumerable<string>? additionalSecrets = null)
     {
-        foreach (var secret in new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword }
+        foreach (var secret in new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword, server.PamPassword, server.PamTotpSecret }
                      .Concat(server.WebInterfaces.Select(x => x.Password))
                      .Concat(additionalSecrets ?? [])
                      .Where(value => !string.IsNullOrEmpty(value)).Distinct().OrderByDescending(value => value.Length))

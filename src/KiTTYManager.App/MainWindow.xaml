@@ -291,6 +291,49 @@
               <Button Click="AddBackupEndpoint_Click" Style="{StaticResource SuccessButton}" Margin="0,0,8,0">Добавить</Button>
               <Button Click="RemoveBackupEndpoint_Click" Style="{StaticResource DangerButton}">Удалить</Button>
             </WrapPanel>
+
+            <Border Margin="0,22,0,18" BorderBrush="#292929" BorderThickness="0,1,0,0"/>
+            <TextBlock Text="PAM-авторизация" FontSize="17" FontWeight="SemiBold"/>
+            <Grid x:Name="PamPanel" Margin="0,14,0,0">
+              <Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+              </Grid.RowDefinitions>
+              <CheckBox x:Name="UsePamBox" Grid.ColumnSpan="2" Margin="0,0,0,8" Content="Использовать PAM"/>
+              <TextBlock Grid.Row="1" Text="SSH-команда PAM" VerticalAlignment="Center"/>
+              <TextBox x:Name="PamSshCommandBox" Grid.Row="1" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="2" Text="Пароль PAM" VerticalAlignment="Center"/>
+              <local:SecretBox x:Name="PamPasswordBox" Grid.Row="2" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="3" Text="TOTP-секрет" VerticalAlignment="Center"/>
+              <local:SecretBox x:Name="PamTotpSecretBox" Grid.Row="3" Grid.Column="1" Margin="0,0,0,8"/>
+              <TextBlock Grid.Row="4" Text="Алгоритм" VerticalAlignment="Center"/>
+              <ComboBox x:Name="PamTotpAlgorithmBox" Grid.Row="4" Grid.Column="1" Margin="0,0,0,8">
+                <ComboBoxItem Content="SHA1" IsSelected="True"/>
+                <ComboBoxItem Content="SHA256"/>
+                <ComboBoxItem Content="SHA512"/>
+              </ComboBox>
+              <TextBlock Grid.Row="5" Text="Количество цифр" VerticalAlignment="Center"/>
+              <TextBox x:Name="PamTotpDigitsBox" Grid.Row="5" Grid.Column="1" Margin="0,0,0,8" Text="6"/>
+              <TextBlock Grid.Row="6" Text="Период (сек)" VerticalAlignment="Center"/>
+              <TextBox x:Name="PamTotpPeriodBox" Grid.Row="6" Grid.Column="1" Margin="0,0,0,8" Text="30"/>
+              <TextBlock Grid.Row="7" Text="Текущий OTP" VerticalAlignment="Center"/>
+              <TextBlock x:Name="PamCurrentTotpBlock" Grid.Row="7" Grid.Column="1" Margin="0,4,0,8" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="{StaticResource MutedTextBrush}" Text="—"/>
+              <TextBlock Grid.Row="8" Text="Запрос OTP" VerticalAlignment="Center"/>
+              <TextBox x:Name="PamTotpPromptBox" Grid.Row="8" Grid.Column="1" Margin="0,0,0,8" Text="OTP: "/>
+              <CheckBox x:Name="PamAutoConfirmBox" Grid.Row="9" Grid.ColumnSpan="2" Margin="0,0,0,8" Content="Автоматическое подтверждение"/>
+              <TextBlock Grid.Row="10" Text="Запрос подтверждения" VerticalAlignment="Center"/>
+              <TextBox x:Name="PamConfirmPromptBox" Grid.Row="10" Grid.Column="1" Margin="0,0,0,8" Text="[Y/n]"/>
+            </Grid>
           </StackPanel>
         </ScrollViewer>
       </Border>

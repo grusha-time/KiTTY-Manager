@@ -8,6 +8,15 @@ public sealed class KittyLoginScript : IDisposable
 
     private KittyLoginScript(string path) => Path = path;
 
+    public static string EscapeResponse(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        var escaped = value.Replace("\\", "\\\\", StringComparison.Ordinal);
+        if (value.EndsWith('\\'))
+            escaped += "\\n";
+        return escaped;
+    }
+
     public static KittyLoginScript? Create(ManagedServer server)
     {
         var command = KittyCredentialDecoder.NormalizeRootCommand(server.RootLogin);
@@ -22,7 +31,7 @@ public sealed class KittyLoginScript : IDisposable
         // shell prompt first prevents the root password from matching and being
         // sent to the initial SSH "password:" prompt.
         var shellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
-        File.WriteAllLines(path, [shellPrompt, command, "assword", server.RootPassword],
+        File.WriteAllLines(path, [shellPrompt, command, "assword", EscapeResponse(server.RootPassword)],
             new UTF8Encoding(false));
         return new KittyLoginScript(path);
     }
@@ -32,7 +41,7 @@ public sealed class KittyLoginScript : IDisposable
         if (steps.Count == 0) return null;
         var path = System.IO.Path.Combine(
             System.IO.Path.GetTempPath(), "kitty-manager-jumphost-" + Guid.NewGuid().ToString("N") + ".txt");
-        File.WriteAllLines(path, steps.SelectMany(step => new[] { step.Prompt, step.Response }),
+        File.WriteAllLines(path, steps.SelectMany(step => new[] { step.Prompt, EscapeResponse(step.Response) }),
             new UTF8Encoding(false));
         return new KittyLoginScript(path);
     }

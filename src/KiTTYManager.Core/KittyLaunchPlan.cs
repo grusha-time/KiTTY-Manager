@@ -62,6 +62,54 @@ public static class KittyLaunchPlan
         return arguments;
     }
 
+    public static IReadOnlyList<string> PamRoutedConsoleArguments(
+        ManagedServer target, ManagedServer jumpHost, int localSshPort, bool loadSavedSession,
+        string? savedSessionPath = null, string? loginScriptPath = null)
+    {
+        var arguments = new List<string>();
+        if (loadSavedSession)
+        {
+            arguments.Add("-loadfile");
+            arguments.Add(savedSessionPath ?? jumpHost.SourceSessionPath ?? jumpHost.Name);
+        }
+
+        arguments.AddRange(["-ssh", "127.0.0.1", "-P", localSshPort.ToString()]);
+        arguments.AddRange(["-loghost", $"{jumpHost.Host}:{jumpHost.Port}"]);
+        if (jumpHost.EffectiveUsername.Length > 0) arguments.AddRange(["-l", jumpHost.EffectiveUsername]);
+        AddAuthenticationSecret(arguments, jumpHost);
+        AddPrivateKey(arguments, jumpHost);
+
+        if (!string.IsNullOrWhiteSpace(loginScriptPath))
+            arguments.AddRange(["-loginscript", loginScriptPath]);
+
+        arguments.AddRange(["-title", $"{target.Name} — PAM-авторизация"]);
+        return arguments;
+    }
+
+    public static IReadOnlyList<string> PamDirectConsoleArguments(
+        ManagedServer target, ManagedServer jumpHost, string host, int port, bool loadSavedSession,
+        string? savedSessionPath = null, string? loginScriptPath = null)
+    {
+        var arguments = new List<string>();
+        if (loadSavedSession)
+        {
+            arguments.Add("-loadfile");
+            arguments.Add(savedSessionPath ?? jumpHost.SourceSessionPath ?? jumpHost.Name);
+        }
+
+        arguments.AddRange(["-ssh", host, "-P", port.ToString()]);
+        arguments.AddRange(["-loghost", $"{jumpHost.Host}:{jumpHost.Port}"]);
+        if (jumpHost.EffectiveUsername.Length > 0) arguments.AddRange(["-l", jumpHost.EffectiveUsername]);
+        AddAuthenticationSecret(arguments, jumpHost);
+        AddPrivateKey(arguments, jumpHost);
+
+        if (!string.IsNullOrWhiteSpace(loginScriptPath))
+            arguments.AddRange(["-loginscript", loginScriptPath]);
+
+        arguments.AddRange(["-title", $"{target.Name} — PAM-авторизация"]);
+        return arguments;
+    }
+
     public static IReadOnlyList<string> OriginalSessionArguments(
         ManagedServer server, string? loginScriptPath = null)
     {

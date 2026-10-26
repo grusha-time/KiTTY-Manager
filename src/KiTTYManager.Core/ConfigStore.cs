@@ -57,13 +57,184 @@ public static class ConfigStore
             Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
             // Clone and make paths portable so the config is relocatable.
             var portable = CloneForSave(config);
+            foreach (var server in portable.AllServers()) NormalizePamDefaults(server);
             MakePathsPortable(portable);
             ConfigSecrets.Protect(portable, SecretProtector);
             WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options));
         }
     }
 
-    public static ManagerConfig Import(string path) => Load(path);
+    public static ManagerConfig Import(string path)
+    {
+        if (!File.Exists(path)) return new ManagerConfig();
+
+        var config = Load(path);
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            using var document = JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                if (TryGetPropertyIgnoreCase(document.RootElement, "UngroupedServers", out var ungroupedEl))
+                {
+                    MatchServers(config.UngroupedServers, ungroupedEl);
+                }
+
+                if (TryGetPropertyIgnoreCase(document.RootElement, "Groups", out var groupsEl))
+                {
+                    MatchGroups(config.Groups, groupsEl);
+                }
+            }
+        }
+        catch
+        {
+            // If structural matching fails, config remains as loaded
+        }
+
+        return config;
+    }
+
+    private static bool TryGetPropertyIgnoreCase(JsonElement element, string name, out JsonElement value)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = prop.Value;
+                    return true;
+                }
+            }
+        }
+        value = default;
+        return false;
+    }
+
+    private static void MatchServers(IList<ManagedServer> servers, JsonElement arrayElement)
+    {
+        if (arrayElement.ValueKind != JsonValueKind.Array) return;
+        var count = Math.Min(servers.Count, arrayElement.GetArrayLength());
+        var index = 0;
+        foreach (var serverElement in arrayElement.EnumerateArray())
+        {
+            if (index >= count) break;
+            ApplyOmittedPamDefaults(servers[index], serverElement);
+            index++;
+        }
+    }
+
+    private static void MatchGroups(IList<ServerGroup> groups, JsonElement arrayElement)
+    {
+        if (arrayElement.ValueKind != JsonValueKind.Array) return;
+        var count = Math.Min(groups.Count, arrayElement.GetArrayLength());
+        var index = 0;
+        foreach (var groupElement in arrayElement.EnumerateArray())
+        {
+            if (index >= count) break;
+            var group = groups[index];
+            if (groupElement.ValueKind == JsonValueKind.Object)
+            {
+                if (TryGetPropertyIgnoreCase(groupElement, "Servers", out var serversEl))
+                {
+                    MatchServers(group.Servers, serversEl);
+                }
+
+                if (TryGetPropertyIgnoreCase(groupElement, "Groups", out var childGroupsEl))
+                {
+                    MatchGroups(group.Groups, childGroupsEl);
+                }
+            }
+            index++;
+        }
+    }
+
+    private static void ApplyOmittedPamDefaults(ManagedServer server, JsonElement serverElement)
+    {
+        if (serverElement.ValueKind != JsonValueKind.Object) return;
+
+        var propUsePam = false;
+        var propAutoConfirm = false;
+        var propSshCommand = false;
+        var propPassword = false;
+        var propSecret = false;
+        var propAlgorithm = false;
+        var propDigits = false;
+        var propPeriod = false;
+        var propPrompt = false;
+        var propConfirm = false;
+
+        var hasNonEmptyAlgorithm = false;
+        var hasNonZeroDigits = false;
+        var hasNonZeroPeriod = false;
+        var hasNonEmptyPrompt = false;
+        var hasNonEmptyConfirm = false;
+
+        foreach (var prop in serverElement.EnumerateObject())
+        {
+            if (string.Equals(prop.Name, "UsePam", StringComparison.OrdinalIgnoreCase))
+                propUsePam = true;
+            else if (string.Equals(prop.Name, "PamAutoConfirm", StringComparison.OrdinalIgnoreCase))
+                propAutoConfirm = true;
+            else if (string.Equals(prop.Name, "PamSshCommand", StringComparison.OrdinalIgnoreCase))
+                propSshCommand = true;
+            else if (string.Equals(prop.Name, "PamPassword", StringComparison.OrdinalIgnoreCase))
+                propPassword = true;
+            else if (string.Equals(prop.Name, "PamTotpSecret", StringComparison.OrdinalIgnoreCase))
+                propSecret = true;
+            else if (string.Equals(prop.Name, "PamTotpAlgorithm", StringComparison.OrdinalIgnoreCase))
+            {
+                propAlgorithm = true;
+                hasNonEmptyAlgorithm = prop.Value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(prop.Value.GetString());
+            }
+            else if (string.Equals(prop.Name, "PamTotpDigits", StringComparison.OrdinalIgnoreCase))
+            {
+                propDigits = true;
+                hasNonZeroDigits = prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetInt32(out var d) && d > 0;
+            }
+            else if (string.Equals(prop.Name, "PamTotpPeriodSeconds", StringComparison.OrdinalIgnoreCase))
+            {
+                propPeriod = true;
+                hasNonZeroPeriod = prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetInt32(out var p) && p > 0;
+            }
+            else if (string.Equals(prop.Name, "PamTotpPrompt", StringComparison.OrdinalIgnoreCase))
+            {
+                propPrompt = true;
+                hasNonEmptyPrompt = prop.Value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(prop.Value.GetString());
+            }
+            else if (string.Equals(prop.Name, "PamConfirmPrompt", StringComparison.OrdinalIgnoreCase))
+            {
+                propConfirm = true;
+                hasNonEmptyConfirm = prop.Value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(prop.Value.GetString());
+            }
+        }
+
+        var allTenPamPropertiesPresent = propUsePam && propAutoConfirm && propSshCommand && propPassword && propSecret &&
+                                         propAlgorithm && propDigits && propPeriod && propPrompt && propConfirm;
+        server.HasAllPamPropertiesPresentInImport = allTenPamPropertiesPresent;
+
+        if (allTenPamPropertiesPresent && server.IsFullUnconfiguredPamExport())
+        {
+            server.HasExplicitUsePam = false;
+            server.HasExplicitPamAutoConfirm = false;
+            server.PamTotpAlgorithm = "";
+            server.PamTotpDigits = 0;
+            server.PamTotpPeriodSeconds = 0;
+            server.PamTotpPrompt = "";
+            server.PamConfirmPrompt = "";
+            return;
+        }
+
+        server.HasExplicitUsePam = propUsePam;
+        server.HasExplicitPamAutoConfirm = propAutoConfirm;
+        if (!hasNonEmptyAlgorithm) server.PamTotpAlgorithm = "";
+        if (!hasNonZeroDigits) server.PamTotpDigits = 0;
+        if (!hasNonZeroPeriod) server.PamTotpPeriodSeconds = 0;
+        if (!hasNonEmptyPrompt) server.PamTotpPrompt = "";
+        if (!hasNonEmptyConfirm) server.PamConfirmPrompt = "";
+    }
+
     public static void Export(string path, ManagerConfig config)
     {
         var fullPath = Path.GetFullPath(path);
@@ -71,6 +242,7 @@ public static class ConfigStore
         {
             Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
             var portable = CloneForSave(config);
+            foreach (var server in portable.AllServers()) NormalizePamDefaults(server);
             MakePathsPortable(portable);
             WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options));
         }
@@ -335,12 +507,29 @@ public static class ConfigStore
         foreach (var child in group.Groups) Normalize(child);
     }
 
+    public static void NormalizePamDefaults(ManagedServer server)
+    {
+        server.PamTotpAlgorithm = server.PamTotpAlgorithm is "SHA1" or "SHA256" or "SHA512" ? server.PamTotpAlgorithm : "SHA1";
+        server.PamTotpDigits = server.PamTotpDigits is >= 6 and <= 8 ? server.PamTotpDigits : 6;
+        server.PamTotpPeriodSeconds = server.PamTotpPeriodSeconds > 0 ? server.PamTotpPeriodSeconds : 30;
+        server.PamTotpPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP: " : server.PamTotpPrompt;
+        server.PamConfirmPrompt = string.IsNullOrWhiteSpace(server.PamConfirmPrompt) ? "[Y/n]" : server.PamConfirmPrompt;
+    }
+
     private static void Normalize(ManagedServer server)
     {
         server.Host = server.Host.Trim();
         if (server.KittyBaseline is not null) server.KittyBaseline.Host = server.KittyBaseline.Host.Trim();
         server.ShellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
         server.ImportedCommand ??= "";
+        server.PamSshCommand = (server.PamSshCommand ?? "").Trim();
+        server.PamPassword ??= "";
+        server.PamTotpSecret = (server.PamTotpSecret ?? "").Trim();
+        server.PamTotpAlgorithm = server.PamTotpAlgorithm is "SHA1" or "SHA256" or "SHA512" ? server.PamTotpAlgorithm : "SHA1";
+        server.PamTotpDigits = server.PamTotpDigits is >= 6 and <= 8 ? server.PamTotpDigits : 6;
+        server.PamTotpPeriodSeconds = server.PamTotpPeriodSeconds > 0 ? server.PamTotpPeriodSeconds : 30;
+        server.PamTotpPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP: " : server.PamTotpPrompt;
+        server.PamConfirmPrompt = string.IsNullOrWhiteSpace(server.PamConfirmPrompt) ? "[Y/n]" : server.PamConfirmPrompt;
         MigrateKeepaliveFromSourceSession(server);
         if (server.KeepaliveIntervalSeconds < 0) server.KeepaliveIntervalSeconds = 15;
         server.WebInterfaces ??= [];
