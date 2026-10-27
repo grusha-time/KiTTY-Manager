@@ -6,6 +6,11 @@ public readonly record struct GridKeyDownResult(bool Handled, bool ShouldOpen);
 
 public static class SessionKeyboardPolicy
 {
+    public static bool ShouldClearSearchOnKeyDown(string key, bool hasModifiers)
+    {
+        return (key is "Escape" or "Esc") && !hasModifiers;
+    }
+
     public static SearchKeyDownResult EvaluateSearchKeyDown(string key, bool hasModifiers, int itemCount)
     {
         if (key == "Down" && !hasModifiers)
