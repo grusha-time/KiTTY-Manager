@@ -83,6 +83,10 @@ internal sealed partial class SelfTestRunner
         Test("Служба туннелей корректно очищает ресурсы при остановке во время запуска", TunnelServiceStopDuringStartupCleansUpProperly);
         Test("Статус ошибки туннеля сохраняет защиту активных ресурсов и позволяет их освободить", TunnelServiceErrorStatusRetainsActiveResourceProtection);
         Test("Синхронная остановка всех туннелей освобождает ресурсы без блокировки", TunnelServiceSynchronousStopAllReleasesResourcesWithoutBlocking);
+        Test("Автоматическое восстановление SSH-туннелей при обрыве соединения", TunnelServiceAutoReconnectLifecycle);
+        Test("Удаление и остановка восстанавливаемого SSH-туннеля освобождает ресурсы", TunnelServiceRemoveTunnelStopsRecoveryCleanly);
+        Test("Удаление туннеля из списка не вызывает взаимную блокировку с UI-потоком", TunnelServiceRemoveTunnelDoesNotDeadlockWithSyncContext);
+        Test("Остановка туннеля во время восстановления соблюдает блокировку жизненного цикла", TunnelServiceStopDuringRecoveryPreservesLifecycleLock);
         Test("Последовательность prompt-response для PAM-авторизации", PamLoginPlanSequenceTests);
         Test("Изоляция учётных данных PAM от пароля сессии и root", PamCredentialIndependenceTests);
         Test("Защита и маскирование секретов PAM", PamSecretProtectionAndRedactionTests);
