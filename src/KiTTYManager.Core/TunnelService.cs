@@ -10,6 +10,9 @@ public sealed class ActiveTunnelItem : INotifyPropertyChanged
 {
     private string status = "Подключение…";
     internal bool isStopRequested;
+    internal bool isRecoveryActive;
+    internal Task? SupervisorTask { get; set; }
+    internal TaskCompletionSource<string>? CurrentFaultTcs { get; set; }
     internal readonly SemaphoreSlim LifecycleLock = new(1, 1);
 
     public Guid Id => Definition.Id;
@@ -45,7 +48,7 @@ public sealed class ActiveTunnelItem : INotifyPropertyChanged
     public bool IsRunning => Status == "Работает";
 
     public bool HasActiveResources =>
-        Route is not null || Port is not null || (!isStopRequested && status == "Подключение…");
+        Route is not null || Port is not null || (!isStopRequested && (status == "Подключение…" || isRecoveryActive));
 
     internal ActiveRoute? Route { get; set; }
     internal ForwardedPort? Port { get; set; }
@@ -74,6 +77,22 @@ public sealed class TunnelService : IDisposable
 
     public event Action? Changed;
 
+    internal TimeSpan ReconnectRetryDelay { get; set; } = TimeSpan.FromSeconds(5);
+    internal TimeSpan HealthCheckInterval { get; set; } = TimeSpan.FromSeconds(1);
+    internal Func<ActiveTunnelItem, bool>? HealthCheckProbe { get; set; }
+    internal Action<ActiveRoute, ForwardedPort>? RoutePortAttacher { get; set; }
+    internal Action<ForwardedPort>? PortStarter { get; set; }
+
+    internal void SimulateTunnelFault(Guid tunnelId, string faultMessage = "Сбой соединения")
+    {
+        ActiveTunnelItem? item;
+        lock (lockObj)
+        {
+            item = tunnels.FirstOrDefault(t => t.Id == tunnelId);
+        }
+        item?.CurrentFaultTcs?.TrySetResult(faultMessage);
+    }
+
     public TunnelService(
         Func<Guid, CancellationToken, Task<ActiveRoute>> openRoute,
         Action<ActiveRoute> releaseRoute,
@@ -97,6 +116,91 @@ public sealed class TunnelService : IDisposable
         lock (lockObj)
         {
             return tunnels.Any(t => t.HasActiveResources);
+        }
+    }
+
+    private async Task ConnectTunnelPortAsync(
+        ActiveTunnelItem item,
+        TaskCompletionSource<string> faultTcs,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        if (item.isStopRequested || isDisposed)
+            throw new OperationCanceledException();
+
+        item.CurrentFaultTcs = faultTcs;
+
+        var route = await openRoute(item.Definition.ServerId, token).ConfigureAwait(false);
+        item.Route = route;
+
+        if (item.isStopRequested || isDisposed || token.IsCancellationRequested)
+        {
+            CleanupItemResources(item);
+            throw new OperationCanceledException();
+        }
+
+        if (route.Client is null)
+            throw new InvalidOperationException("Маршрут не предоставляет SSH-клиент для создания туннеля.");
+
+        var port = TunnelPortFactory.Create(item.Definition);
+        item.Port = port;
+
+        port.Exception += (_, args) =>
+        {
+            var msg = "Ошибка туннеля: " + args.Exception.Message;
+            log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): {msg}");
+            faultTcs.TrySetResult(msg);
+        };
+
+        if (route.Client is { } sshClient)
+        {
+            try
+            {
+                sshClient.KeepAliveInterval = TimeSpan.FromSeconds(10);
+            }
+            catch { }
+
+            sshClient.ErrorOccurred += (_, args) =>
+            {
+                var msg = "Сбой SSH: " + args.Exception.Message;
+                log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): {msg}");
+                faultTcs.TrySetResult(msg);
+            };
+        }
+
+        if (RoutePortAttacher != null)
+            RoutePortAttacher(route, port);
+        else
+            route.AddForwardedPort(port);
+
+        if (item.isStopRequested || isDisposed || token.IsCancellationRequested)
+        {
+            CleanupItemResources(item);
+            throw new OperationCanceledException();
+        }
+
+        if (PortStarter != null)
+            PortStarter(port);
+        else
+            port.Start();
+
+        if (item.isStopRequested || isDisposed || token.IsCancellationRequested)
+        {
+            CleanupItemResources(item);
+            throw new OperationCanceledException();
+        }
+
+        var bound = port switch
+        {
+            ForwardedPortLocal localPort => (int)localPort.BoundPort,
+            ForwardedPortDynamic dynamicPort => (int)dynamicPort.BoundPort,
+            ForwardedPortRemote remotePort => (int)remotePort.Port,
+            _ => 0
+        };
+
+        if (bound != 0 && item.Definition.BindPort == 0)
+        {
+            item.Definition.BindPort = bound;
         }
     }
 
@@ -135,8 +239,8 @@ public sealed class TunnelService : IDisposable
             }
 
             log?.Invoke($"Запуск туннеля «{item.Summary}» для «{item.ServerName}»…");
-            var route = await openRoute(definition.ServerId, linkedCts.Token).ConfigureAwait(false);
-            item.Route = route;
+            var faultTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await ConnectTunnelPortAsync(item, faultTcs, linkedCts.Token).ConfigureAwait(false);
 
             if (item.isStopRequested || isDisposed)
             {
@@ -144,67 +248,20 @@ public sealed class TunnelService : IDisposable
                 item.Status = "Остановлен";
                 NotifyChanged();
                 return item;
-            }
-
-            if (route.Client is null)
-                throw new InvalidOperationException("Маршрут не предоставляет SSH-клиент для создания туннеля.");
-
-            var port = TunnelPortFactory.Create(definition);
-            item.Port = port;
-
-            port.Exception += (_, args) =>
-            {
-                item.Status = "Ошибка туннеля: " + args.Exception.Message;
-                log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): ошибка — {args.Exception.Message}");
-                NotifyChanged();
-            };
-
-            if (route.Client is { } sshClient)
-            {
-                sshClient.ErrorOccurred += (_, args) =>
-                {
-                    item.Status = "Сбой SSH: " + args.Exception.Message;
-                    log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): сбой SSH — {args.Exception.Message}");
-                    NotifyChanged();
-                };
-            }
-
-            route.AddForwardedPort(port);
-
-            if (item.isStopRequested || isDisposed)
-            {
-                CleanupItemResources(item);
-                item.Status = "Остановлен";
-                NotifyChanged();
-                return item;
-            }
-
-            port.Start();
-
-            if (item.isStopRequested || isDisposed)
-            {
-                CleanupItemResources(item);
-                item.Status = "Остановлен";
-                NotifyChanged();
-                return item;
-            }
-
-            var bound = port switch
-            {
-                ForwardedPortLocal localPort => (int)localPort.BoundPort,
-                ForwardedPortDynamic dynamicPort => (int)dynamicPort.BoundPort,
-                ForwardedPortRemote remotePort => (int)remotePort.Port,
-                _ => 0
-            };
-
-            if (bound != 0 && definition.BindPort == 0)
-            {
-                definition.BindPort = bound;
             }
 
             item.Status = "Работает";
             log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}) успешно поднят.");
             NotifyChanged();
+
+            CancellationToken supervisorToken;
+            lock (lockObj)
+            {
+                item.Cts = CancellationTokenSource.CreateLinkedTokenSource(disposeCts.Token);
+                supervisorToken = item.Cts.Token;
+            }
+
+            item.SupervisorTask = Task.Run(() => RunTunnelSupervisorAsync(item, faultTcs, supervisorToken));
             return item;
         }
         catch (OperationCanceledException)
@@ -232,6 +289,139 @@ public sealed class TunnelService : IDisposable
         }
     }
 
+    private async Task RunTunnelSupervisorAsync(
+        ActiveTunnelItem item,
+        TaskCompletionSource<string> initialFaultTcs,
+        CancellationToken stopToken)
+    {
+        var faultTcs = initialFaultTcs;
+
+        while (!item.isStopRequested && !stopToken.IsCancellationRequested && !isDisposed)
+        {
+            // 1. Healthy tunnel monitoring
+            while (!item.isStopRequested && !stopToken.IsCancellationRequested && !isDisposed)
+            {
+                try
+                {
+                    var delayTask = Task.Delay(HealthCheckInterval, stopToken);
+                    var completed = await Task.WhenAny(faultTcs.Task, delayTask).ConfigureAwait(false);
+
+                    if (item.isStopRequested || stopToken.IsCancellationRequested || isDisposed)
+                        return;
+
+                    bool faulted = false;
+                    string? faultMessage = null;
+
+                    if (completed == faultTcs.Task)
+                    {
+                        faulted = true;
+                        faultMessage = await faultTcs.Task.ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        var client = item.Route?.Client;
+                        var port = item.Port;
+                        bool isHealthy = HealthCheckProbe != null
+                            ? HealthCheckProbe(item)
+                            : (client != null && client.IsConnected && port != null && port.IsStarted);
+
+                        if (!isHealthy)
+                        {
+                            faulted = true;
+                            faultMessage = "Потеряно соединение с SSH-сервером";
+                        }
+                    }
+
+                    if (faulted)
+                    {
+                        log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): сбой соединения ({faultMessage}). Восстановление…");
+                        break;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+
+            if (item.isStopRequested || stopToken.IsCancellationRequested || isDisposed)
+                return;
+
+            // 2. Begin recovery
+            item.isRecoveryActive = true;
+            await item.LifecycleLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            try
+            {
+                CleanupItemResources(item);
+            }
+            finally
+            {
+                item.LifecycleLock.Release();
+            }
+
+            // 3. Retry connection indefinitely until restored or stopped
+            while (!item.isStopRequested && !stopToken.IsCancellationRequested && !isDisposed)
+            {
+                item.Status = "Переподключение…";
+                NotifyChanged();
+
+                var nextFaultTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                bool connected = false;
+
+                await item.LifecycleLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+                try
+                {
+                    if (item.isStopRequested || stopToken.IsCancellationRequested || isDisposed)
+                    {
+                        CleanupItemResources(item);
+                        return;
+                    }
+
+                    await ConnectTunnelPortAsync(item, nextFaultTcs, stopToken).ConfigureAwait(false);
+                    connected = true;
+                }
+                catch (OperationCanceledException) when (item.isStopRequested || stopToken.IsCancellationRequested || isDisposed)
+                {
+                    CleanupItemResources(item);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    CleanupItemResources(item);
+                    var msg = ex is AggregateException ag
+                        ? (ag.InnerExceptions.FirstOrDefault()?.Message ?? ag.Message)
+                        : ex.Message;
+                    item.Status = "Ошибка: " + msg;
+                    log?.Invoke($"Не удалось восстановить туннель «{item.Summary}» ({item.ServerName}): {msg}. Повтор через {ReconnectRetryDelay.TotalSeconds:0.#} с…");
+                    NotifyChanged();
+                }
+                finally
+                {
+                    item.LifecycleLock.Release();
+                }
+
+                if (connected)
+                {
+                    faultTcs = nextFaultTcs;
+                    item.isRecoveryActive = false;
+                    item.Status = "Работает";
+                    log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}) успешно восстановлен.");
+                    NotifyChanged();
+                    break;
+                }
+
+                try
+                {
+                    await Task.Delay(ReconnectRetryDelay, stopToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
     public async Task StopTunnelAsync(Guid tunnelId)
     {
         ActiveTunnelItem? item;
@@ -243,6 +433,7 @@ public sealed class TunnelService : IDisposable
         if (item is null) return;
 
         item.isStopRequested = true;
+        item.isRecoveryActive = false;
 
         try
         {
@@ -252,6 +443,15 @@ public sealed class TunnelService : IDisposable
 
         item.Status = "Останавливается";
         NotifyChanged();
+
+        if (item.SupervisorTask is { } supTask)
+        {
+            try
+            {
+                await supTask.ConfigureAwait(false);
+            }
+            catch { }
+        }
 
         await item.LifecycleLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
         try
@@ -291,16 +491,32 @@ public sealed class TunnelService : IDisposable
         await StopTunnelsAsync(ids).ConfigureAwait(false);
     }
 
+    public async Task RemoveTunnelAsync(Guid tunnelId) =>
+        await StopTunnelAsync(tunnelId).ConfigureAwait(false);
+
     public void RemoveTunnelFromList(Guid tunnelId)
     {
+        ActiveTunnelItem? item;
         lock (lockObj)
         {
-            var item = tunnels.FirstOrDefault(t => t.Id == tunnelId);
-            if (item != null && !item.HasActiveResources)
-            {
-                tunnels.Remove(item);
-            }
+            item = tunnels.FirstOrDefault(t => t.Id == tunnelId);
         }
+
+        if (item is null) return;
+
+        if (item.HasActiveResources || item.isRecoveryActive || item.SupervisorTask != null)
+        {
+            _ = StopTunnelAsync(tunnelId);
+            return;
+        }
+
+        lock (lockObj)
+        {
+            tunnels.Remove(item);
+        }
+
+        CleanupItemResources(item);
+        item.Status = "Остановлен";
         NotifyChanged();
     }
 
@@ -323,6 +539,7 @@ public sealed class TunnelService : IDisposable
             item.Port = null;
             route = item.Route;
             item.Route = null;
+            item.CurrentFaultTcs = null;
         }
 
         if (port != null)
@@ -364,6 +581,7 @@ public sealed class TunnelService : IDisposable
         foreach (var item in remaining)
         {
             item.isStopRequested = true;
+            item.isRecoveryActive = false;
             try { item.Cts?.Cancel(); } catch { }
             CleanupItemResources(item);
             item.Status = "Остановлен";

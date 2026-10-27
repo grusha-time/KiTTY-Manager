@@ -1,3 +1,6 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net.Sockets;
 using KiTTYManager.App;
 using KiTTYManager.Core;
 using Renci.SshNet;
@@ -400,6 +403,426 @@ internal sealed partial class SelfTestRunner
         Equal(true, releaseThreadIds.All(id => id != callingThreadId));
         Equal("Остановлен", item1.Status);
         Equal("Остановлен", item2.Status);
+
+        service.Dispose();
+    }
+
+    private static void TunnelServiceAutoReconnectLifecycle()
+    {
+        var releasedRoutes = new List<ActiveRoute>();
+        var server = new ManagedServer { Id = Guid.NewGuid(), Name = "Server-AutoReconnect" };
+        using var dummyClient = new SshClient("127.0.0.1", 2222, "user", "pass");
+
+        int openRouteCount = 0;
+        bool shouldFailRoute = false;
+        var openRouteTcs = new TaskCompletionSource<bool>();
+        var reconnectAttemptTcs = new TaskCompletionSource<bool>();
+
+        var service = new TunnelService(
+            openRoute: (_, _) =>
+            {
+                var count = Interlocked.Increment(ref openRouteCount);
+                if (count == 1)
+                {
+                    openRouteTcs.TrySetResult(true);
+                }
+                else
+                {
+                    reconnectAttemptTcs.TrySetResult(true);
+                }
+
+                if (shouldFailRoute)
+                {
+                    throw new SocketException((int)SocketError.ConnectionRefused);
+                }
+
+                var r = new ActiveRoute(server, 2222, 0, "direct", dummyClient, [], []);
+                return Task.FromResult(r);
+            },
+            releaseRoute: r =>
+            {
+                lock (releasedRoutes)
+                {
+                    releasedRoutes.Add(r);
+                }
+            })
+        {
+            ReconnectRetryDelay = TimeSpan.FromMilliseconds(30),
+            HealthCheckInterval = TimeSpan.FromMilliseconds(10),
+            RoutePortAttacher = (_, _) => { },
+            PortStarter = _ => { }
+        };
+
+        bool isClientHealthy = true;
+        service.HealthCheckProbe = _ => isClientHealthy;
+
+        var def = new TunnelDefinition
+        {
+            ServerId = server.Id,
+            ServerName = server.Name,
+            Kind = TunnelKind.Dynamic,
+            BindHost = "127.0.0.1",
+            BindPort = 1093
+        };
+
+        // 1. Start tunnel with externalToken
+        using var externalCts = new CancellationTokenSource();
+        var item = service.StartTunnelAsync(def, externalCts.Token).GetAwaiter().GetResult();
+        Equal("Работает", item.Status);
+        Equal(true, item.IsRunning);
+        Equal(true, item.HasActiveResources);
+        Equal(true, service.HasActiveTunnels());
+        Equal(1, openRouteCount);
+
+        // Cancel externalToken after start - supervisor must NOT terminate
+        externalCts.Cancel();
+
+        // 2. Configure next route attempt to fail, so we observe "Ошибка: ..."
+        shouldFailRoute = true;
+        reconnectAttemptTcs = new TaskCompletionSource<bool>();
+        service.SimulateTunnelFault(item.Id, "Соединение разорвано");
+
+        // Verify reconnect attempt TCS returned true
+        Equal(true, reconnectAttemptTcs.Task.Wait(TimeSpan.FromSeconds(3)));
+        Equal(true, openRouteCount >= 2);
+
+        // Wait for failure handling to update status to "Ошибка: ..."
+        var sw = Stopwatch.StartNew();
+        while (!item.Status.StartsWith("Ошибка", StringComparison.OrdinalIgnoreCase) && sw.ElapsedMilliseconds < 3000)
+        {
+            Thread.Sleep(10);
+        }
+        Equal(true, item.Status.StartsWith("Ошибка", StringComparison.OrdinalIgnoreCase));
+
+        // 3. Verify HasActiveTunnels() remains true during recovery
+        Equal(true, item.HasActiveResources);
+        Equal(true, service.HasActiveTunnels());
+        Equal(false, item.IsRunning);
+
+        // 4. Now let route succeed on next retry
+        shouldFailRoute = false;
+        var prevCount = openRouteCount;
+
+        sw.Restart();
+        while (item.Status != "Работает" && sw.ElapsedMilliseconds < 3000)
+        {
+            Thread.Sleep(10);
+        }
+
+        Equal("Работает", item.Status);
+        Equal(true, item.IsRunning);
+        Equal(true, item.HasActiveResources);
+        Equal(true, service.HasActiveTunnels());
+        Equal(true, openRouteCount > prevCount);
+
+        // 5. Test health check probe trigger
+        reconnectAttemptTcs = new TaskCompletionSource<bool>();
+        prevCount = openRouteCount;
+        isClientHealthy = false;
+
+        Equal(true, reconnectAttemptTcs.Task.Wait(TimeSpan.FromSeconds(3)));
+        Equal(true, openRouteCount > prevCount);
+        isClientHealthy = true;
+
+        sw.Restart();
+        while (item.Status != "Работает" && sw.ElapsedMilliseconds < 3000)
+        {
+            Thread.Sleep(10);
+        }
+        Equal("Работает", item.Status);
+
+        // 6. StopTunnelAsync cleanly stops recovery and releases resources
+        service.StopTunnelAsync(item.Id).GetAwaiter().GetResult();
+        Equal("Остановлен", item.Status);
+        Equal(false, item.IsRunning);
+        Equal(false, item.HasActiveResources);
+        Equal(false, service.HasActiveTunnels());
+        Equal(0, service.GetTunnels().Count);
+
+        service.Dispose();
+    }
+
+    private static void TunnelServiceRemoveTunnelStopsRecoveryCleanly()
+    {
+        var server = new ManagedServer { Id = Guid.NewGuid(), Name = "Server-RemoveSync" };
+        using var dummyClient = new SshClient("127.0.0.1", 2222, "user", "pass");
+
+        var reconnectAttemptTcs = new TaskCompletionSource<bool>();
+        bool shouldFail = false;
+
+        var service = new TunnelService(
+            openRoute: (_, _) =>
+            {
+                if (shouldFail)
+                {
+                    reconnectAttemptTcs.TrySetResult(true);
+                    throw new SocketException((int)SocketError.ConnectionRefused);
+                }
+                return Task.FromResult(new ActiveRoute(server, 2222, 0, "direct", dummyClient, [], []));
+            },
+            releaseRoute: _ => { })
+        {
+            ReconnectRetryDelay = TimeSpan.FromMilliseconds(50),
+            HealthCheckInterval = TimeSpan.FromMilliseconds(10),
+            RoutePortAttacher = (_, _) => { },
+            PortStarter = _ => { }
+        };
+
+        var def1 = new TunnelDefinition
+        {
+            ServerId = server.Id,
+            ServerName = server.Name,
+            Kind = TunnelKind.Dynamic,
+            BindHost = "127.0.0.1",
+            BindPort = 1091
+        };
+
+        var def2 = new TunnelDefinition
+        {
+            ServerId = server.Id,
+            ServerName = server.Name,
+            Kind = TunnelKind.Dynamic,
+            BindHost = "127.0.0.1",
+            BindPort = 1092
+        };
+
+        // Test RemoveTunnelFromList during recovery
+        var item1 = service.StartTunnelAsync(def1).GetAwaiter().GetResult();
+        shouldFail = true;
+        service.SimulateTunnelFault(item1.Id, "Обрыв");
+        Equal(true, reconnectAttemptTcs.Task.Wait(TimeSpan.FromSeconds(3)));
+
+        service.RemoveTunnelFromList(item1.Id);
+        var sw = Stopwatch.StartNew();
+        while ((service.GetTunnels().Count > 0 || item1.Status != "Остановлен") && sw.ElapsedMilliseconds < 3000)
+        {
+            Thread.Sleep(10);
+        }
+        Equal(0, service.GetTunnels().Count);
+        Equal(false, service.HasActiveTunnels());
+        Equal("Остановлен", item1.Status);
+
+        // Test RemoveTunnelAsync on active tunnel
+        shouldFail = false;
+        var item2 = service.StartTunnelAsync(def2).GetAwaiter().GetResult();
+        Equal("Работает", item2.Status);
+        service.RemoveTunnelAsync(item2.Id).GetAwaiter().GetResult();
+        Equal(0, service.GetTunnels().Count);
+        Equal(false, service.HasActiveTunnels());
+        Equal("Остановлен", item2.Status);
+
+        service.Dispose();
+    }
+
+    private static void TunnelServiceRemoveTunnelDoesNotDeadlockWithSyncContext()
+    {
+        var server = new ManagedServer { Id = Guid.NewGuid(), Name = "Server-SyncContext" };
+        using var dummyClient = new SshClient("127.0.0.1", 2222, "user", "pass");
+
+        using var syncContext = new SingleThreadSynchronizationContext();
+
+        bool releaseRouteExecuted = false;
+        var releaseEvent = new ManualResetEventSlim(false);
+
+        var service = new TunnelService(
+            openRoute: (_, _) => Task.FromResult(new ActiveRoute(server, 2222, 0, "direct", dummyClient, [], [])),
+            releaseRoute: _ =>
+            {
+                // Simulate UI dispatch (e.g. Application.Current.Dispatcher.Invoke or syncContext.Send)
+                syncContext.Send(_ =>
+                {
+                    releaseRouteExecuted = true;
+                }, null);
+                releaseEvent.Set();
+            })
+        {
+            ReconnectRetryDelay = TimeSpan.FromMilliseconds(50),
+            HealthCheckInterval = TimeSpan.FromMilliseconds(10),
+            RoutePortAttacher = (_, _) => { },
+            PortStarter = _ => { }
+        };
+
+        var def = new TunnelDefinition
+        {
+            ServerId = server.Id,
+            ServerName = server.Name,
+            Kind = TunnelKind.Dynamic,
+            BindHost = "127.0.0.1",
+            BindPort = 1093
+        };
+
+        var item = service.StartTunnelAsync(def).GetAwaiter().GetResult();
+        Equal("Работает", item.Status);
+
+        // Call RemoveTunnelFromList from simulated UI thread
+        syncContext.Send(_ =>
+        {
+            service.RemoveTunnelFromList(item.Id);
+        }, null);
+
+        Equal(true, releaseEvent.Wait(TimeSpan.FromSeconds(3)));
+        Equal(true, releaseRouteExecuted);
+
+        var sw = Stopwatch.StartNew();
+        while (service.GetTunnels().Count > 0 && sw.ElapsedMilliseconds < 3000)
+        {
+            Thread.Sleep(10);
+        }
+        Equal(0, service.GetTunnels().Count);
+        Equal(false, service.HasActiveTunnels());
+
+        service.Dispose();
+    }
+
+    private sealed class SingleThreadSynchronizationContext : SynchronizationContext, IDisposable
+    {
+        private readonly BlockingCollection<Action> queue = new();
+        private readonly Thread thread;
+
+        public SingleThreadSynchronizationContext()
+        {
+            thread = new Thread(Run) { IsBackground = true };
+            thread.Start();
+        }
+
+        private void Run()
+        {
+            SetSynchronizationContext(this);
+            try
+            {
+                foreach (var action in queue.GetConsumingEnumerable())
+                {
+                    action();
+                }
+            }
+            catch (ObjectDisposedException) { }
+        }
+
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            try
+            {
+                queue.Add(() => d(state));
+            }
+            catch (InvalidOperationException) { }
+        }
+
+        public override void Send(SendOrPostCallback d, object? state)
+        {
+            if (Thread.CurrentThread == thread)
+            {
+                d(state);
+                return;
+            }
+
+            using var mres = new ManualResetEventSlim(false);
+            Exception? error = null;
+            try
+            {
+                queue.Add(() =>
+                {
+                    try { d(state); }
+                    catch (Exception ex) { error = ex; }
+                    finally { mres.Set(); }
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                return;
+            }
+
+            mres.Wait();
+            if (error != null)
+                throw new InvalidOperationException("SyncContext invocation error", error);
+        }
+
+        public void Dispose()
+        {
+            queue.CompleteAdding();
+            thread.Join(TimeSpan.FromSeconds(2));
+            queue.Dispose();
+        }
+    }
+
+    private static void TunnelServiceStopDuringRecoveryPreservesLifecycleLock()
+    {
+        var server = new ManagedServer { Id = Guid.NewGuid(), Name = "Server-StopRecoveryLock" };
+        using var dummyClient = new SshClient("127.0.0.1", 2222, "user", "pass");
+
+        var portStarterEntered = new ManualResetEventSlim(false);
+        var stopTriggered = new ManualResetEventSlim(false);
+        bool inRecovery = false;
+        ForwardedPort? observedPortDuringHook = null;
+        bool portWasNullDuringHook = false;
+        int releaseRouteCount = 0;
+
+        ActiveTunnelItem? item = null;
+
+        var service = new TunnelService(
+            openRoute: (_, _) => Task.FromResult(new ActiveRoute(server, 2222, 0, "direct", dummyClient, [], [])),
+            releaseRoute: _ => Interlocked.Increment(ref releaseRouteCount))
+        {
+            ReconnectRetryDelay = TimeSpan.FromMilliseconds(50),
+            HealthCheckInterval = TimeSpan.FromMilliseconds(10),
+            RoutePortAttacher = (_, _) => { },
+            PortStarter = port =>
+            {
+                if (!inRecovery)
+                {
+                    return;
+                }
+
+                observedPortDuringHook = port;
+                portStarterEntered.Set();
+                // Wait until stop has been initiated from the outside
+                stopTriggered.Wait(TimeSpan.FromSeconds(3));
+                // Give background tasks a moment to see if premature cleanup runs
+                Thread.Sleep(50);
+                if (item != null && item.Port == null)
+                {
+                    portWasNullDuringHook = true;
+                }
+            }
+        };
+
+        var def = new TunnelDefinition
+        {
+            ServerId = server.Id,
+            ServerName = server.Name,
+            Kind = TunnelKind.Dynamic,
+            BindHost = "127.0.0.1",
+            BindPort = 1094
+        };
+
+        item = service.StartTunnelAsync(def).GetAwaiter().GetResult();
+        Equal("Работает", item.Status);
+
+        inRecovery = true;
+        service.SimulateTunnelFault(item.Id, "Сбой для проверки блокировки");
+
+        // Wait until recovery reaches PortStarter under LifecycleLock
+        Equal(true, portStarterEntered.Wait(TimeSpan.FromSeconds(3)));
+
+        // Initiate StopTunnelAsync while PortStarter is still executing under LifecycleLock
+        var stopTask = service.StopTunnelAsync(item.Id);
+
+        // Signal PortStarter to proceed after stop was requested
+        stopTriggered.Set();
+
+        // Wait for StopTunnelAsync to complete
+        stopTask.GetAwaiter().GetResult();
+
+        // Port must NOT have been nulled out or cleaned up while PortStarter was inside LifecycleLock
+        Equal(false, portWasNullDuringHook);
+        Equal(true, observedPortDuringHook != null);
+
+        // After StopTunnelAsync completes, resources must be stopped and cleared
+        Equal(0, service.GetTunnels().Count);
+        Equal(false, service.HasActiveTunnels());
+        Equal("Остановлен", item.Status);
+        Equal(null, item.Port);
+        Equal(null, item.Route);
+        Equal(true, releaseRouteCount > 0);
 
         service.Dispose();
     }
