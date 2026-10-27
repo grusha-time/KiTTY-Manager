@@ -585,6 +585,14 @@ public partial class MainWindow : Window
     }
     private void SearchBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        if (SessionKeyboardPolicy.ShouldClearSearchOnKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None))
+        {
+            SearchBox.Clear();
+            SearchBox.Focus();
+            e.Handled = true;
+            return;
+        }
+
         var result = SessionKeyboardPolicy.EvaluateSearchKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None, SessionsGrid.Items.Count);
         if (!result.Handled) return;
         e.Handled = true;
@@ -623,6 +631,27 @@ public partial class MainWindow : Window
         }
     }
     private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e) { if (GroupTree is not null) RefreshGroups(); }
+    private void GroupSearchClear_Click(object sender, RoutedEventArgs e)
+    {
+        GroupSearchBox.Clear();
+        GroupSearchBox.Focus();
+    }
+
+    private void SearchClear_Click(object sender, RoutedEventArgs e)
+    {
+        SearchBox.Clear();
+        SearchBox.Focus();
+    }
+
+    private void GroupSearchBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (SessionKeyboardPolicy.ShouldClearSearchOnKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None))
+        {
+            GroupSearchBox.Clear();
+            GroupSearchBox.Focus();
+            e.Handled = true;
+        }
+    }
 
     private void ResetRequiredRoutePicker()
     {

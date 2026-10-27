@@ -1,5 +1,6 @@
 using KiTTYManager.App;
 using KiTTYManager.Core;
+using System.Xml.Linq;
 
 internal sealed partial class SelfTestRunner
 {
@@ -143,6 +144,16 @@ internal sealed partial class SelfTestRunner
         var s5 = SessionKeyboardPolicy.EvaluateSearchKeyDown("Enter", false, 5);
         Equal(false, s5.Handled);
 
+        // 1b. SessionKeyboardPolicy.ShouldClearSearchOnKeyDown
+        Equal(true, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("Escape", false));
+        Equal(true, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("Esc", false));
+        Equal(false, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("Escape", true));
+        Equal(false, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("Esc", true));
+        Equal(false, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("Down", false));
+        Equal(false, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("Enter", false));
+        Equal(false, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("A", false));
+        Equal(false, SessionKeyboardPolicy.ShouldClearSearchOnKeyDown("F", true));
+
         // 2. SessionKeyboardPolicy.EvaluateGridKeyDown
         // - Enter with server and not repeat -> Handled=true, ShouldOpen=true
         var g1 = SessionKeyboardPolicy.EvaluateGridKeyDown("Enter", false, false, true);
@@ -195,6 +206,67 @@ internal sealed partial class SelfTestRunner
                     xamlText.Contains("PreviewKeyDown=\"SessionsGrid_PreviewKeyDown\"") &&
                     xamlText.Contains("SelectionChanged=\"SessionsGrid_SelectionChanged\""));
 
+        Equal(true, xamlText.Contains("x:Name=\"GroupSearchClearButton\""));
+        Equal(true, xamlText.Contains("x:Name=\"SearchClearButton\""));
+        Equal(true, xamlText.Contains("PreviewKeyDown=\"GroupSearchBox_PreviewKeyDown\""));
+        Equal(true, xamlText.Contains("Click=\"GroupSearchClear_Click\""));
+        Equal(true, xamlText.Contains("Click=\"SearchClear_Click\""));
+        Equal(true, xamlText.Contains("Focusable=\"False\""));
+        Equal(true, xamlText.Contains("IsTabStop=\"False\""));
+
+        var doc = XDocument.Parse(xamlText);
+        var ns = doc.Root!.Name.Namespace;
+        var xNs = XNamespace.Get("http://schemas.microsoft.com/winfx/2006/xaml");
+
+        var allTextBoxes = doc.Descendants(ns + "TextBox").ToList();
+        var groupSearchBoxEl = allTextBoxes.FirstOrDefault(e => (string?)e.Attribute(xNs + "Name") == "GroupSearchBox")
+            ?? throw new InvalidOperationException("GroupSearchBox not found in XAML");
+        var searchBoxEl = allTextBoxes.FirstOrDefault(e => (string?)e.Attribute(xNs + "Name") == "SearchBox")
+            ?? throw new InvalidOperationException("SearchBox not found in XAML");
+
+        Equal("10,8,38,8", (string?)groupSearchBoxEl.Attribute("Padding"));
+        Equal("10,8,38,8", (string?)searchBoxEl.Attribute("Padding"));
+        Equal("GroupSearchBox_PreviewKeyDown", (string?)groupSearchBoxEl.Attribute("PreviewKeyDown"));
+
+        var allButtons = doc.Descendants(ns + "Button").ToList();
+        var groupClearBtnEl = allButtons.FirstOrDefault(e => (string?)e.Attribute(xNs + "Name") == "GroupSearchClearButton")
+            ?? throw new InvalidOperationException("GroupSearchClearButton not found in XAML");
+        var searchClearBtnEl = allButtons.FirstOrDefault(e => (string?)e.Attribute(xNs + "Name") == "SearchClearButton")
+            ?? throw new InvalidOperationException("SearchClearButton not found in XAML");
+
+        Equal("GroupSearchClear_Click", (string?)groupClearBtnEl.Attribute("Click"));
+        Equal("SearchClear_Click", (string?)searchClearBtnEl.Attribute("Click"));
+
+        var groupBtnTriggers = groupClearBtnEl.Descendants(ns + "DataTrigger").ToList();
+        var groupClearTrigger = groupBtnTriggers.FirstOrDefault(dt =>
+            ((string?)dt.Attribute("Value")) == "0" &&
+            ((string?)dt.Attribute("Binding"))?.Contains("ElementName=GroupSearchBox") == true &&
+            ((string?)dt.Attribute("Binding"))?.Contains("Text.Length") == true);
+        Equal(true, groupClearTrigger is not null);
+        var groupSetter = groupClearTrigger!.Elements(ns + "Setter").FirstOrDefault(s => (string?)s.Attribute("Property") == "Visibility");
+        Equal("Collapsed", (string?)groupSetter?.Attribute("Value"));
+
+        var searchBtnTriggers = searchClearBtnEl.Descendants(ns + "DataTrigger").ToList();
+        var searchClearTrigger = searchBtnTriggers.FirstOrDefault(dt =>
+            ((string?)dt.Attribute("Value")) == "0" &&
+            ((string?)dt.Attribute("Binding"))?.Contains("ElementName=SearchBox") == true &&
+            ((string?)dt.Attribute("Binding"))?.Contains("Text.Length") == true);
+        Equal(true, searchClearTrigger is not null);
+        var searchSetter = searchClearTrigger!.Elements(ns + "Setter").FirstOrDefault(s => (string?)s.Attribute("Property") == "Visibility");
+        Equal("Collapsed", (string?)searchSetter?.Attribute("Value"));
+
+        var searchClearStyle = doc.Descendants(ns + "Style").FirstOrDefault(s => (string?)s.Attribute(xNs + "Key") == "SearchClearButtonStyle");
+        Equal(true, searchClearStyle is not null);
+        var focusableSetter = searchClearStyle!.Elements(ns + "Setter").FirstOrDefault(s => (string?)s.Attribute("Property") == "Focusable");
+        Equal("False", (string?)focusableSetter?.Attribute("Value"));
+        var tabStopSetter = searchClearStyle!.Elements(ns + "Setter").FirstOrDefault(s => (string?)s.Attribute("Property") == "IsTabStop");
+        Equal("False", (string?)tabStopSetter?.Attribute("Value"));
+
+        var searchClearPath = searchClearStyle!.Descendants(ns + "Path").FirstOrDefault();
+        Equal(true, searchClearPath is not null);
+        Equal("14", (string?)searchClearPath!.Attribute("Width"));
+        Equal("14", (string?)searchClearPath!.Attribute("Height"));
+
         var csPath = ResolveSourceFile(Path.Combine("src", "KiTTYManager.App", "MainWindow.xaml.cs"));
         var csText = File.ReadAllText(csPath);
 
@@ -205,6 +277,28 @@ internal sealed partial class SelfTestRunner
         Equal(true, ContainsUncommentedCode(findSessionBody, "e.Handled = true;"));
 
         var searchBoxBody = ExtractMethodBody(csText, "SearchBox_PreviewKeyDown");
+        Equal(true, ContainsUncommentedCode(searchBoxBody, "SessionKeyboardPolicy.ShouldClearSearchOnKeyDown"));
+        Equal(true, ContainsUncommentedCode(searchBoxBody, "SearchBox.Clear();"));
+        Equal(true, ContainsUncommentedCode(searchBoxBody, "SearchBox.Focus();"));
+        Equal(true, ContainsUncommentedCode(searchBoxBody, "e.Handled = true;"));
+        var clearIdx = searchBoxBody.IndexOf("ShouldClearSearchOnKeyDown", StringComparison.Ordinal);
+        var evalIdx = searchBoxBody.IndexOf("EvaluateSearchKeyDown", StringComparison.Ordinal);
+        Equal(true, clearIdx >= 0 && evalIdx > clearIdx);
+
+        var groupClearBody = ExtractMethodBody(csText, "GroupSearchClear_Click");
+        Equal(true, ContainsUncommentedCode(groupClearBody, "GroupSearchBox.Clear();"));
+        Equal(true, ContainsUncommentedCode(groupClearBody, "GroupSearchBox.Focus();"));
+
+        var searchClearBody = ExtractMethodBody(csText, "SearchClear_Click");
+        Equal(true, ContainsUncommentedCode(searchClearBody, "SearchBox.Clear();"));
+        Equal(true, ContainsUncommentedCode(searchClearBody, "SearchBox.Focus();"));
+
+        var groupKeyDownBody = ExtractMethodBody(csText, "GroupSearchBox_PreviewKeyDown");
+        Equal(true, ContainsUncommentedCode(groupKeyDownBody, "SessionKeyboardPolicy.ShouldClearSearchOnKeyDown"));
+        Equal(true, ContainsUncommentedCode(groupKeyDownBody, "GroupSearchBox.Clear();"));
+        Equal(true, ContainsUncommentedCode(groupKeyDownBody, "GroupSearchBox.Focus();"));
+        Equal(true, ContainsUncommentedCode(groupKeyDownBody, "e.Handled = true;"));
+
         Equal(true, ContainsUncommentedCode(searchBoxBody, "SessionKeyboardPolicy.EvaluateSearchKeyDown"));
         Equal(true, ContainsUncommentedCode(searchBoxBody, "e.Handled = true;"));
 
@@ -354,9 +448,11 @@ internal sealed partial class SelfTestRunner
 
         var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
         var searchBox = Activator.CreateInstance(textBoxType)!;
+        var groupSearchBox = Activator.CreateInstance(textBoxType)!;
         var sessionsGrid = Activator.CreateInstance(dataGridType)!;
 
         windowType.GetField("SearchBox", flags)?.SetValue(window, searchBox);
+        windowType.GetField("GroupSearchBox", flags)?.SetValue(window, groupSearchBox);
         windowType.GetField("SessionsGrid", flags)?.SetValue(window, sessionsGrid);
 
         // 1. Verify FindSession_Executed
@@ -387,6 +483,29 @@ internal sealed partial class SelfTestRunner
 
         var hwndSourceCtor = hwndSourceType.GetConstructor(new[] { typeof(int), typeof(int), typeof(int), typeof(int), typeof(int), typeof(string), typeof(IntPtr) });
         var source = hwndSourceCtor?.Invoke(new object[] { 0, 0, 0, 0, 0, "Test", IntPtr.Zero });
+
+        if (source is not null)
+        {
+            try
+            {
+                var rootProp = hwndSourceType.GetProperty("RootVisual", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                var stackPanelType = presentationFramework.GetType("System.Windows.Controls.StackPanel");
+                if (rootProp is not null && stackPanelType is not null)
+                {
+                    var rootPanel = Activator.CreateInstance(stackPanelType);
+                    var childrenProp = stackPanelType.GetProperty("Children", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                    var children = childrenProp?.GetValue(rootPanel);
+                    var addMethod = children?.GetType().GetMethod("Add", new[] { presentationCore.GetType("System.Windows.UIElement")! });
+                    addMethod?.Invoke(children, new[] { groupSearchBox });
+                    addMethod?.Invoke(children, new[] { searchBox });
+                    rootProp.SetValue(source, rootPanel);
+                }
+            }
+            catch
+            {
+                // Visual root setup fallback
+            }
+        }
 
         try
         {
@@ -422,6 +541,47 @@ internal sealed partial class SelfTestRunner
             gridKeyDownMethod.Invoke(window, new object[] { sessionsGrid, enterArgs });
             var enterHandled = (bool)handledProp.GetValue(enterArgs)!;
             Equal(true, enterHandled);
+
+            // 4. Verify SearchBox and GroupSearchBox Esc clears text and sets e.Handled = true
+            var groupKeyDownMethod = windowType.GetMethod("GroupSearchBox_PreviewKeyDown", flags)
+                ?? throw new InvalidOperationException("GroupSearchBox_PreviewKeyDown not found");
+            var groupClearMethod = windowType.GetMethod("GroupSearchClear_Click", flags)
+                ?? throw new InvalidOperationException("GroupSearchClear_Click not found");
+            var searchClearMethod = windowType.GetMethod("SearchClear_Click", flags)
+                ?? throw new InvalidOperationException("SearchClear_Click not found");
+
+            var textProp = textBoxType.GetProperty("Text", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)!;
+
+            // GroupSearchBox Esc
+            textProp.SetValue(groupSearchBox, "group esc query");
+            var groupEscArgs = CreateKeyArgs("Escape");
+            groupKeyDownMethod.Invoke(window, new object[] { groupSearchBox, groupEscArgs });
+            Equal(true, (bool)handledProp.GetValue(groupEscArgs)!);
+            Equal("", (string)textProp.GetValue(groupSearchBox)!);
+
+            // SearchBox Esc
+            textProp.SetValue(searchBox, "session esc query");
+            var searchEscArgs = CreateKeyArgs("Escape");
+            searchKeyDownMethod.Invoke(window, new object[] { searchBox, searchEscArgs });
+            Equal(true, (bool)handledProp.GetValue(searchEscArgs)!);
+            Equal("", (string)textProp.GetValue(searchBox)!);
+
+            // GroupSearchClear_Click
+            textProp.SetValue(groupSearchBox, "group click query");
+            var buttonType = presentationFramework.GetType("System.Windows.Controls.Button")!;
+            var groupClearBtn = Activator.CreateInstance(buttonType)!;
+            var routedArgsCtor = routedEventArgsType.GetConstructors(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)
+                .FirstOrDefault(c => c.GetParameters().Length == 0)
+                ?? throw new InvalidOperationException("RoutedEventArgs parameterless constructor not found.");
+            var clickArgs = routedArgsCtor.Invoke(Array.Empty<object>());
+            groupClearMethod.Invoke(window, new object[] { groupClearBtn, clickArgs });
+            Equal("", (string)textProp.GetValue(groupSearchBox)!);
+
+            // SearchClear_Click
+            textProp.SetValue(searchBox, "session click query");
+            var searchClearBtn = Activator.CreateInstance(buttonType)!;
+            searchClearMethod.Invoke(window, new object[] { searchClearBtn, clickArgs });
+            Equal("", (string)textProp.GetValue(searchBox)!);
         }
         finally
         {

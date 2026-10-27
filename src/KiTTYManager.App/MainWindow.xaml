@@ -7,6 +7,45 @@
         Icon="Assets/kitty-manager.ico" Closing="Window_Closing"
         Background="{StaticResource WindowBrush}" Foreground="{StaticResource TextBrush}"
         FontFamily="Segoe UI" FontSize="14">
+  <Window.Resources>
+    <Style x:Key="SearchClearButtonStyle" TargetType="Button">
+      <Setter Property="Width" Value="28"/>
+      <Setter Property="Height" Value="28"/>
+      <Setter Property="MinHeight" Value="0"/>
+      <Setter Property="MinWidth" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Margin" Value="0,0,5,0"/>
+      <Setter Property="HorizontalAlignment" Value="Right"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Foreground" Value="{StaticResource MutedTextBrush}"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="IsTabStop" Value="False"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Border" Width="24" Height="24" CornerRadius="12" SnapsToDevicePixels="True" Background="{TemplateBinding Background}">
+              <Path Data="M 0,0 L 14,14 M 14,0 L 0,14" Stroke="{TemplateBinding Foreground}" StrokeThickness="1.5"
+                    StrokeStartLineCap="Round" StrokeEndLineCap="Round" Width="14" Height="14"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Border" Property="Background" Value="#333333"/>
+                <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Border" Property="Background" Value="#444444"/>
+                <Setter Property="Opacity" Value="0.8"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
   <Window.CommandBindings>
     <CommandBinding Command="ApplicationCommands.Find" Executed="FindSession_Executed"/>
   </Window.CommandBindings>
@@ -44,8 +83,24 @@
           <Border DockPanel.Dock="Top" Padding="16,14" BorderBrush="#292929" BorderThickness="0,0,0,1">
             <StackPanel>
               <TextBlock Text="Группы" FontSize="17" FontWeight="SemiBold"/>
-              <TextBox x:Name="GroupSearchBox" Margin="0,10,0,0" TextChanged="GroupSearchBox_TextChanged"
-                       ToolTip="Поиск по названиям групп и подгрупп"/>
+              <Grid Margin="0,10,0,0">
+                <TextBox x:Name="GroupSearchBox" Padding="10,8,38,8" TextChanged="GroupSearchBox_TextChanged"
+                         PreviewKeyDown="GroupSearchBox_PreviewKeyDown"
+                         ToolTip="Поиск по названиям групп и подгрупп"/>
+                <Button x:Name="GroupSearchClearButton" Click="GroupSearchClear_Click"
+                        Focusable="False" IsTabStop="False"
+                        ToolTip="Очистить поиск" AutomationProperties.Name="Очистить поиск групп">
+                  <Button.Style>
+                    <Style TargetType="Button" BasedOn="{StaticResource SearchClearButtonStyle}">
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding Text.Length, ElementName=GroupSearchBox}" Value="0">
+                          <Setter Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </Button.Style>
+                </Button>
+              </Grid>
             </StackPanel>
           </Border>
           <TreeView x:Name="GroupTree" Margin="8" AllowDrop="True" SelectedItemChanged="GroupTree_SelectedItemChanged"
@@ -83,8 +138,23 @@
             </Grid>
             <StackPanel Grid.Row="1" Margin="0,10,0,0">
               <TextBlock x:Name="GroupFilterText" Foreground="#8FB4FF" FontSize="12" Margin="0,0,0,5"/>
-              <TextBox x:Name="SearchBox" TextChanged="SearchBox_TextChanged" PreviewKeyDown="SearchBox_PreviewKeyDown"
-                       ToolTip="Поиск по группам, сессиям, IP, портам, логинам, паролям и веб-интерфейсам"/>
+              <Grid Margin="0,10,0,0">
+                <TextBox x:Name="SearchBox" Padding="10,8,38,8" TextChanged="SearchBox_TextChanged" PreviewKeyDown="SearchBox_PreviewKeyDown"
+                         ToolTip="Поиск по группам, сессиям, IP, портам, логинам, паролям и веб-интерфейсам"/>
+                <Button x:Name="SearchClearButton" Click="SearchClear_Click"
+                        Focusable="False" IsTabStop="False"
+                        ToolTip="Очистить поиск" AutomationProperties.Name="Очистить поиск сессий">
+                  <Button.Style>
+                    <Style TargetType="Button" BasedOn="{StaticResource SearchClearButtonStyle}">
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding Text.Length, ElementName=SearchBox}" Value="0">
+                          <Setter Property="Visibility" Value="Collapsed"/>
+                        </DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </Button.Style>
+                </Button>
+              </Grid>
             </StackPanel>
           </Grid>
           <DataGrid x:Name="SessionsGrid" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
