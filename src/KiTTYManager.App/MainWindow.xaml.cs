@@ -1891,152 +1891,239 @@ public partial class MainWindow : Window
     {
         if (BlockIfOperationRunning()) return;
         if (selectedServer is null || WebGrid.SelectedItem is not WebInterface web) { Warn("Выберите веб-интерфейс."); return; }
-        if (!Uri.TryCreate(web.Url, UriKind.Absolute, out _)) { Warn("Некорректный URL."); return; }
+
         var server = selectedServer;
-        ssh.ClearFailureCache();
-        await BusyAsync("Строю маршрут к веб-интерфейсу…", async cancellationToken =>
+        var serverId = server.Id;
+        var serverName = server.Name;
+        var webId = web.Id;
+        var webName = web.Name;
+        var webUrl = web.Url;
+        var resolverAddress = web.ResolverAddress;
+
+        if (!Uri.TryCreate(webUrl, UriKind.Absolute, out var originalDestination) ||
+            (originalDestination.Scheme != Uri.UriSchemeHttp && originalDestination.Scheme != Uri.UriSchemeHttps))
         {
-            ActiveRoute? route = null;
-            Process? tunnel = null;
-            KittyRoutedSession? routedSession = null;
-            KittyLoginScript? loginScript = null;
-            ResolvingSocks5Relay? resolver = null;
-            var handedOff = false;
-            try
+            Warn("Некорректный URL.");
+            return;
+        }
+
+        if (!ValidateFirefoxProfile(showWarning: true)) return;
+
+        var containerKey = $"{serverId:N}-{webId:N}";
+        Dispatcher.VerifyAccess();
+        if (pendingWebOpenings.Contains(containerKey))
+        {
+            Status($"Подключение к «{serverName} — {webName}» уже выполняется…");
+            return;
+        }
+
+        var configSnapshot = ConfigTransfer.CloneSnapshot(config);
+        var serverSnapshot = configSnapshot.FindServer(serverId);
+        if (serverSnapshot is null) return;
+
+        pendingWebOpenings.Add(containerKey);
+        ssh.ClearFailureCache();
+
+        ActiveRoute? route = null;
+        Process? tunnel = null;
+        KittyRoutedSession? routedSession = null;
+        KittyLoginScript? loginScript = null;
+        ResolvingSocks5Relay? resolver = null;
+        var handedOff = false;
+
+        try
+        {
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(webCts.Token);
+            var cancellationToken = linkedCts.Token;
+
+            await EnsureFirefoxContainersAsync(cancellationToken);
+
+            if (containerSessions.TryGetValue(containerKey, out var existing))
             {
-                if (!ValidateFirefoxProfile(showWarning: true)) return;
-                await EnsureFirefoxContainersAsync(cancellationToken);
-                if (config.FindServer(server.Id) is null || !server.WebInterfaces.Any(w => w.Id == web.Id)) return;
-                var containerKey = $"{server.Id:N}-{web.Id:N}";
-                if (containerSessions.TryGetValue(containerKey, out var existing))
-                {
-                    try
-                    {
-                        await containerBrowser!.Bridge.OpenAsync(containerKey, $"{server.Name} — {web.Name}",
-                            existing.Relay.Port, web.Url, cancellationToken);
-                    }
-                    catch { CloseContainerSession(containerKey, true); throw; }
-                    return;
-                }
-                var webPort = SelectFreeLoopbackPort();
-                var originalDestination = new Uri(web.Url);
-                var useInternalResolver = !string.IsNullOrWhiteSpace(web.ResolverAddress) &&
-                    !System.Net.IPAddress.TryParse(originalDestination.Host, out _);
-                if (useInternalResolver && !System.Net.IPAddress.TryParse(web.ResolverAddress.Trim(), out _))
-                    throw new InvalidOperationException($"Для веб-интерфейса «{web.Name}» укажите IP в поле «Адрес DNS».");
-                var destination = useInternalResolver
-                    ? originalDestination
-                    : await ResolveWebDestinationAsync(originalDestination, cancellationToken);
-                var resolverMappings = new List<KeyValuePair<string, string>>();
-                if (useInternalResolver)
-                {
-                    resolverMappings.Add(new(originalDestination.DnsSafeHost, web.ResolverAddress.Trim()));
-                    resolverMappings.Add(new("127.0.0.1", web.ResolverAddress.Trim()));
-                }
-                foreach (var pair in WebResolverMappingPlan.Build(server))
-                {
-                    if (!resolverMappings.Any(m => string.Equals(m.Key, pair.Key, StringComparison.OrdinalIgnoreCase)))
-                        resolverMappings.Add(pair);
-                }
-                resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings, resolveUnmappedLocally: true);
-                var browserProxyPort = resolver.Port;
-                route = await Connect(server, cancellationToken, true);
-                var loadSavedSession = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
-                                       File.Exists(server.SourceSessionPath);
-                var kitty = loadSavedSession
-                    ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
-                    : ResolveProgram(config.KittyPath);
-                routedSession = loadSavedSession
-                    ? KittyRoutedSession.Create(server.SourceSessionPath!, route.LocalSshPort,
-                        server.ImportedCommand, true, webPort, server: server)
-                    : KittyRoutedSession.CreateMinimal(
-                        "127.0.0.1", route.LocalSshPort, dynamicPort: webPort, server: server);
-                // No login script for the tunnel: it connects to an already-
-                // authenticated local SSH port. A login script waiting for a
-                // shell prompt blocks the tunnel console until timeout.
-                var tunnelStart = new ProcessStartInfo(kitty)
-                {
-                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
-                    WindowStyle = ProcessWindowStyle.Minimized
-                };
-                foreach (var argument in KittyLaunchPlan.RoutedTunnelArguments(server, route.LocalSshPort,
-                             true, routedSession.Path, null, skipPrivilegeCommand: true))
-                    tunnelStart.ArgumentList.Add(argument);
-                tunnel = Process.Start(tunnelStart) ?? throw new IOException("KiTTY не вернула процесс веб-туннеля.");
-                RouteLog($"Web KiTTY tunnel starting: session={server.Name}; ingress=127.0.0.1:{route.LocalSshPort}; socks=127.0.0.1:{webPort}; exit=target");
-                RouteLog($"Web tunnel args: {string.Join(" ", tunnelStart.ArgumentList)}");
-                RouteLog($"Web tunnel routed-session: {routedSession.Path}");
+                if (containerBrowser?.IsRunning != true || !containerBrowser.Bridge.Connected)
+                    throw new IOException("Firefox или расширение контейнеров недоступны.");
+
                 try
                 {
-                    var sessionContent = File.ReadAllText(routedSession.Path);
-                    var relevantLines = sessionContent.Split('\n')
-                        .Where(l => l.StartsWith("Nopty", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("TerminalType", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("Autocommand", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("Scriptfile", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("RemoteCommand", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("PortForwardings", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("HostName", StringComparison.OrdinalIgnoreCase) ||
-                                    l.StartsWith("PortNumber", StringComparison.OrdinalIgnoreCase))
-                        .Select(l => l.Trim());
-                    RouteLog($"Web tunnel session key fields: {string.Join(" | ", relevantLines)}");
-                }
-                catch { }
-
-                var deadline = DateTime.UtcNow.AddSeconds(config.ConnectionTimeoutSeconds);
-                while (DateTime.UtcNow < deadline &&
-                       !await IsSocks5ReadyAsync("127.0.0.1", webPort, TimeSpan.FromSeconds(1), cancellationToken))
-                {
-                    if (tunnel.HasExited) throw new IOException("KiTTY завершила веб-туннель до запуска SOCKS5.");
-                    await Task.Delay(250, cancellationToken);
-                }
-                if (!await IsSocks5ReadyAsync("127.0.0.1", webPort, TimeSpan.FromSeconds(1), cancellationToken))
-                    throw new TimeoutException("KiTTY не запустила динамический SOCKS5 за отведённое время.");
-                routedSession?.Dispose(); routedSession = null;
-                if (loginScript is not null)
-                {
-                    PreserveTemporaryFile(loginScript.Path);
-                    loginScript = null;
-                }
-
-                var probeDestination = useInternalResolver
-                    ? new UriBuilder(originalDestination) { Host = "127.0.0.1" }.Uri
-                    : destination;
-                var probe = await ProbeThroughSocksAsync("127.0.0.1", browserProxyPort, probeDestination,
-                    TimeSpan.FromSeconds(8), cancellationToken);
-                RouteLog($"Web destination probe: session={server.Name}; engine=kitty; exit=target; proxy=127.0.0.1:{browserProxyPort}; resolver={(useInternalResolver ? "internal" : "system")}; destination={destination.Host}:{destination.Port}; result={(probe.Success ? "PASS" : "FAIL")}; detail={probe.Detail}");
-                if (!probe.Success)
-                    throw new IOException("KiTTY-туннель конечной сессии не смог открыть указанный веб-адрес. Подробности записаны в журнал.");
-
-                if (config.FindServer(server.Id) is null || !server.WebInterfaces.Any(w => w.Id == web.Id))
-                    throw new OperationCanceledException("Сессия или веб-интерфейс были удалены во время подключения.");
-
-                containerSessions.Add(containerKey, new ContainerWebSession(tunnel, route, resolver));
-                try
-                {
-                    await containerBrowser!.Bridge.OpenAsync(containerKey, $"{server.Name} — {web.Name}",
-                        browserProxyPort, web.Url, cancellationToken);
-                    handedOff = true;
-                    RouteLog($"Firefox container opened: key={containerKey}; proxy=127.0.0.1:{browserProxyPort}");
+                    await containerBrowser.Bridge.OpenAsync(containerKey, $"{serverName} — {webName}",
+                        existing.Relay.Port, webUrl, cancellationToken);
+                    Status($"Веб-интерфейс «{serverName} — {webName}» открыт.");
                 }
                 catch
                 {
-                    containerSessions.Remove(containerKey);
+                    CloseContainerSession(containerKey, true);
                     throw;
                 }
+                return;
             }
-            finally
+
+            Status($"Строю маршрут к «{serverName} — {webName}»…");
+
+            var liveServer = config.FindServer(serverId);
+            if (liveServer is null || !liveServer.WebInterfaces.Any(w => w.Id == webId))
+                return;
+
+            var webPort = SelectFreeLoopbackPort();
+            var useInternalResolver = !string.IsNullOrWhiteSpace(resolverAddress) &&
+                !System.Net.IPAddress.TryParse(originalDestination.Host, out _);
+            if (useInternalResolver && !System.Net.IPAddress.TryParse(resolverAddress.Trim(), out _))
+                throw new InvalidOperationException($"Для веб-интерфейса «{webName}» укажите IP в поле «Адрес DNS».");
+
+            var destination = useInternalResolver
+                ? originalDestination
+                : await ResolveWebDestinationAsync(originalDestination, cancellationToken);
+
+            var resolverMappings = new List<KeyValuePair<string, string>>();
+            if (useInternalResolver)
             {
-                routedSession?.Dispose();
-                loginScript?.Dispose();
-                if (!handedOff)
-                {
-                    if (resolver is not null) await resolver.DisposeAsync();
-                    if (tunnel is not null) StopProcess(tunnel);
-                    if (route is not null) ReleaseRoute(route);
-                }
+                resolverMappings.Add(new(originalDestination.DnsSafeHost, resolverAddress.Trim()));
+                resolverMappings.Add(new("127.0.0.1", resolverAddress.Trim()));
             }
-        });
+            foreach (var pair in WebResolverMappingPlan.Build(serverSnapshot))
+            {
+                if (!resolverMappings.Any(m => string.Equals(m.Key, pair.Key, StringComparison.OrdinalIgnoreCase)))
+                    resolverMappings.Add(pair);
+            }
+            resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings, resolveUnmappedLocally: true);
+            var browserProxyPort = resolver.Port;
+
+            route = await Connect(serverSnapshot, cancellationToken, true, routeConfig: configSnapshot);
+
+            var kittyPath = configSnapshot.KittyPath;
+            var (tunnelProc, session, tunnelArgs) = await Task.Run(() =>
+            {
+                var loadSavedSession = !string.IsNullOrWhiteSpace(serverSnapshot.SourceSessionPath) &&
+                                       File.Exists(serverSnapshot.SourceSessionPath);
+                var kitty = loadSavedSession
+                    ? FindKittyNearSession(serverSnapshot.SourceSessionPath!) ?? ResolveProgram(kittyPath)
+                    : ResolveProgram(kittyPath);
+                KittyRoutedSession? routed = null;
+                try
+                {
+                    routed = loadSavedSession
+                        ? KittyRoutedSession.Create(serverSnapshot.SourceSessionPath!, route.LocalSshPort,
+                            serverSnapshot.ImportedCommand, true, webPort, server: serverSnapshot)
+                        : KittyRoutedSession.CreateMinimal(
+                            "127.0.0.1", route.LocalSshPort, dynamicPort: webPort, server: serverSnapshot);
+
+                    var tunnelStart = new ProcessStartInfo(kitty)
+                    {
+                        WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                        WindowStyle = ProcessWindowStyle.Minimized
+                    };
+                    foreach (var argument in KittyLaunchPlan.RoutedTunnelArguments(serverSnapshot, route.LocalSshPort,
+                                 true, routed.Path, null, skipPrivilegeCommand: true))
+                        tunnelStart.ArgumentList.Add(argument);
+                    var proc = Process.Start(tunnelStart) ?? throw new IOException("KiTTY не вернула процесс веб-туннеля.");
+                    return (proc, routed, string.Join(" ", tunnelStart.ArgumentList));
+                }
+                catch
+                {
+                    routed?.Dispose();
+                    throw;
+                }
+            }, cancellationToken);
+
+            tunnel = tunnelProc;
+            routedSession = session;
+
+            RouteLog($"Web KiTTY tunnel starting: session={serverName}; ingress=127.0.0.1:{route.LocalSshPort}; socks=127.0.0.1:{webPort}; exit=target");
+            var safeTunnelArgs = SecretRedactor.Redact(tunnelArgs, serverSnapshot, SecretRedactor.Secrets(configSnapshot));
+            RouteLog($"Web tunnel args: {safeTunnelArgs}");
+            RouteLog($"Web tunnel routed-session: {routedSession.Path}");
+            try
+            {
+                var sessionContent = File.ReadAllText(routedSession.Path);
+                var relevantLines = sessionContent.Split('\n')
+                    .Where(l => l.StartsWith("Nopty", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("TerminalType", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("Autocommand", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("Scriptfile", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("RemoteCommand", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("PortForwardings", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("HostName", StringComparison.OrdinalIgnoreCase) ||
+                                l.StartsWith("PortNumber", StringComparison.OrdinalIgnoreCase))
+                    .Select(l => l.Trim());
+                RouteLog($"Web tunnel session key fields: {string.Join(" | ", relevantLines)}");
+            }
+            catch { }
+
+            var deadline = DateTime.UtcNow.AddSeconds(config.ConnectionTimeoutSeconds);
+            while (DateTime.UtcNow < deadline &&
+                   !await IsSocks5ReadyAsync("127.0.0.1", webPort, TimeSpan.FromSeconds(1), cancellationToken))
+            {
+                if (tunnel.HasExited) throw new IOException("KiTTY завершила веб-туннель до запуска SOCKS5.");
+                await Task.Delay(250, cancellationToken);
+            }
+            if (!await IsSocks5ReadyAsync("127.0.0.1", webPort, TimeSpan.FromSeconds(1), cancellationToken))
+                throw new TimeoutException("KiTTY не запустила динамический SOCKS5 за отведённое время.");
+
+            routedSession?.Dispose(); routedSession = null;
+            if (loginScript is not null)
+            {
+                PreserveTemporaryFile(loginScript.Path);
+                loginScript = null;
+            }
+
+            var probeDestination = useInternalResolver
+                ? new UriBuilder(originalDestination) { Host = "127.0.0.1" }.Uri
+                : destination;
+            var probe = await ProbeThroughSocksAsync("127.0.0.1", browserProxyPort, probeDestination,
+                TimeSpan.FromSeconds(8), cancellationToken);
+            RouteLog($"Web destination probe: session={serverName}; engine=kitty; exit=target; proxy=127.0.0.1:{browserProxyPort}; resolver={(useInternalResolver ? "internal" : "system")}; destination={destination.Host}:{destination.Port}; result={(probe.Success ? "PASS" : "FAIL")}; detail={probe.Detail}");
+            if (!probe.Success)
+                throw new IOException("KiTTY-туннель конечной сессии не смог открыть указанный веб-адрес. Подробности записаны в журнал.");
+
+            if (config.FindServer(serverId) is not { } targetServer || !targetServer.WebInterfaces.Any(w => w.Id == webId))
+                throw new OperationCanceledException("Сессия или веб-интерфейс были удалены во время подключения.");
+
+            if (containerBrowser?.IsRunning != true || !containerBrowser.Bridge.Connected)
+                throw new IOException("Firefox или расширение контейнеров недоступны.");
+
+            containerSessions.Add(containerKey, new ContainerWebSession(tunnel, route, resolver));
+            handedOff = true;
+
+            try
+            {
+                await containerBrowser.Bridge.OpenAsync(containerKey, $"{serverName} — {webName}",
+                    browserProxyPort, webUrl, cancellationToken);
+
+                if (config.FindServer(serverId) is not { } verifiedServer || !verifiedServer.WebInterfaces.Any(w => w.Id == webId))
+                {
+                    CloseContainerSession(containerKey, true);
+                    throw new OperationCanceledException("Сессия или веб-интерфейс были удалены во время подключения.");
+                }
+
+                RouteLog($"Firefox container opened: key={containerKey}; proxy=127.0.0.1:{browserProxyPort}");
+                Status($"Веб-интерфейс «{serverName} — {webName}» открыт.");
+            }
+            catch
+            {
+                CloseContainerSession(containerKey, true);
+                throw;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            Status($"Подключение к «{webName}» отменено.");
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"Ошибка подключения к веб-интерфейсу «{serverName} — {webName}»: {ex.Message}");
+            Status($"Ошибка подключения к «{webName}»: {ex.Message}");
+        }
+        finally
+        {
+            routedSession?.Dispose();
+            loginScript?.Dispose();
+            if (!handedOff)
+            {
+                if (resolver is not null) await resolver.DisposeAsync();
+                if (tunnel is not null) StopProcess(tunnel);
+                if (route is not null) ReleaseRoute(route);
+            }
+            pendingWebOpenings.Remove(containerKey);
+        }
     }
 
     private async Task<ActiveRoute> Connect(
@@ -2046,6 +2133,12 @@ public partial class MainWindow : Window
         IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
         var activeConfig = routeConfig ?? config;
+        var initialFingerprints = new Dictionary<Guid, (string Host, int Port, string Fingerprint)>();
+        if (persist && routeConfig is not null && !ReferenceEquals(routeConfig, config))
+        {
+            foreach (var s in activeConfig.AllServers())
+                initialFingerprints[s.Id] = (s.Host, s.Port, s.HostKeyFingerprint ?? "");
+        }
         if (forcedViaServerId is Guid requestedViaId)
             RouteLog($"Forced route request: target={server.Name}; via=" +
                      $"{activeConfig.FindServer(requestedViaId)?.Name ?? requestedViaId.ToString()}");
@@ -2096,6 +2189,64 @@ public partial class MainWindow : Window
                 server.PreferredRoute = RoutePreferencePolicy.FromSuccess(
                     result.Candidate, result.Duration, DateTimeOffset.UtcNow);
             server.LastOriginalSessionFallbackUtc = null;
+            var liveTarget = (routeConfig is not null && !ReferenceEquals(routeConfig, config)) ? config.FindServer(server.Id) : null;
+            if (persist && routeConfig is not null && !ReferenceEquals(routeConfig, config))
+            {
+                if (!result.Candidate.WithoutProxy)
+                    AccessGrantPolicy.RememberSuccessfulRoute(config, result.Candidate.Proxy.Id,
+                        result.Candidate.Servers.Select(item => item.Id), DateTimeOffset.UtcNow);
+                if (liveTarget is not null && forcedViaServerId is null &&
+                    string.Equals(liveTarget.Host, server.Host, StringComparison.OrdinalIgnoreCase) &&
+                    liveTarget.Port == server.Port)
+                {
+                    liveTarget.PreferredRoute = server.PreferredRoute;
+                    liveTarget.LastOriginalSessionFallbackUtc = null;
+                }
+                for (var i = 0; i < result.Candidate.Servers.Count; i++)
+                {
+                    var hop = result.Candidate.Servers[i];
+                    var liveHop = config.FindServer(hop.Id);
+                    if (liveHop is null) continue;
+
+                    var hopContext = i == 0
+                        ? EndpointContext.Direct(result.Candidate.Proxy.Id)
+                        : EndpointContext.Via(result.Candidate.Servers[i - 1].Id);
+                    var snapshotPref = hop.EndpointPreferences.FirstOrDefault(item =>
+                        item.ProxyId == hopContext.ProxyId &&
+                        item.PreviousServerId == hopContext.PreviousServerId);
+                    var effectiveEndpoint = snapshotPref?.Endpoint ??
+                        (i < result.Route.Hops.Count ? new ServerEndpoint(result.Route.Hops[i].Host, result.Route.Hops[i].Port) : null);
+                    if (effectiveEndpoint is not null)
+                    {
+                        var livePref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                            item.ProxyId == hopContext.ProxyId &&
+                            item.PreviousServerId == hopContext.PreviousServerId);
+                        if (livePref is null || snapshotPref is null || livePref.LastSuccessUtc <= snapshotPref.LastSuccessUtc)
+                        {
+                            ServerEndpointPolicy.Remember(liveHop, effectiveEndpoint, hopContext);
+                            if (snapshotPref is not null && snapshotPref.LastSuccessUtc != default)
+                            {
+                                var updatedPref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                                    item.ProxyId == hopContext.ProxyId &&
+                                    item.PreviousServerId == hopContext.PreviousServerId);
+                                if (updatedPref is not null)
+                                    updatedPref.LastSuccessUtc = snapshotPref.LastSuccessUtc;
+                            }
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
+                        initialFingerprints.TryGetValue(hop.Id, out var initial) &&
+                        string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) &&
+                        initial.Port == liveHop.Port &&
+                        string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? "", StringComparison.Ordinal))
+                    {
+                        liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
+                        liveHop.HostKeyAlgorithm = hop.HostKeyAlgorithm;
+                        liveHop.HostKeyBits = hop.HostKeyBits;
+                    }
+                }
+            }
             activeRoutes.Add(result.Route);
             var routeDisplay = FormatRouteDisplay(
                 result.Candidate.Proxy, result.Route.Hops, result.Candidate.WithoutProxy);
@@ -2111,17 +2262,18 @@ public partial class MainWindow : Window
                 RouteLog($"Forced route success: target={server.Name}; via=" +
                          $"{activeConfig.FindServer(successfulViaId)?.Name ?? successfulViaId.ToString()}; " +
                          $"route={RouteLabel(result.Candidate)}");
+            var probeTarget = liveTarget ?? server;
             if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly &&
                 RoutePreferencePolicy.BetterCandidates(candidates, result.Candidate).Count > 0)
-                ScheduleBetterRouteProbe(server, candidates, result.Candidate);
+                ScheduleBetterRouteProbe(probeTarget, candidates, result.Candidate);
             else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly && server.TryDirectWithoutJumphost &&
                      !result.Candidate.WithoutProxy)
-                ScheduleDirectRouteProbe(server, result.Candidate);
+                ScheduleDirectRouteProbe(probeTarget, result.Candidate);
             // Подключились обходным путём, а прямой доступ ещё не подтверждён —
             // пробуем доказать его в фоне, чтобы следующее подключение шло напрямую.
             else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly &&
                      result.Candidate.Servers.Count > 1 && !IsProvenDirect(server))
-                ScheduleDirectRouteProbe(server, result.Candidate);
+                ScheduleDirectRouteProbe(probeTarget, result.Candidate);
         }
 
         static string FormatRouteDisplay(
@@ -4526,6 +4678,7 @@ public partial class MainWindow : Window
                 pendingUpdateSession.Disarm();
                 pendingUpdateSession = null;
             }
+            ResetPendingExitState();
             e.Cancel = true; Hide(); EnsureTrayIcon(); trayIcon!.Visible = true; trayIcon.ShowBalloonTip(1500, "KiTTY Manager", "Приложение продолжает работать, активные туннели сохранены.", System.Windows.Forms.ToolTipIcon.Info); return;
         }
         if (batchTaskWindow is not null && !batchExitPending)
@@ -4537,32 +4690,45 @@ public partial class MainWindow : Window
         }
         if (tunnelService.HasActiveTunnels())
         {
-            var promptOwner = (activeTunnelsWindow is not null && activeTunnelsWindow.IsVisible)
-                ? (Window)activeTunnelsWindow
-                : this;
-
-            var choice = ThemedMessageDialog.ShowChoice(
-                promptOwner,
-                "Есть активные SSH-туннели. При выходе из программы все они будут остановлены.\n\nВы действительно хотите выйти и остановить туннели?",
-                "Активные туннели",
-                "Выйти и остановить",
-                "Не выходить",
-                MessageBoxImage.Warning);
-
-            if (choice != ThemedDialogChoice.Primary)
+            if (!tunnelsExitConfirmed)
             {
-                pendingUpdateSession?.Disarm();
-                pendingUpdateSession = null;
-                e.Cancel = true;
-                forceExit = false;
-                return;
+                var promptOwner = (activeTunnelsWindow is not null && activeTunnelsWindow.IsVisible)
+                    ? (Window)activeTunnelsWindow
+                    : this;
+
+                var choice = ThemedMessageDialog.ShowChoice(
+                    promptOwner,
+                    "Есть активные SSH-туннели. При выходе из программы все они будут остановлены.\n\nВы действительно хотите выйти и остановить туннели?",
+                    "Активные туннели",
+                    "Выйти и остановить",
+                    "Не выходить",
+                    MessageBoxImage.Warning);
+
+                if (choice != ThemedDialogChoice.Primary)
+                {
+                    pendingUpdateSession?.Disarm();
+                    pendingUpdateSession = null;
+                    ResetPendingExitState();
+                    e.Cancel = true;
+                    forceExit = false;
+                    return;
+                }
+
+                tunnelsExitConfirmed = true;
             }
 
             try { activeTunnelsWindow?.ForceClose(); } catch { }
         }
-        else
+
+        if (pendingWebOpenings.Count > 0 && !webExitCompleted)
         {
-            try { activeTunnelsWindow?.ForceClose(); } catch { }
+            e.Cancel = true;
+            if (!webExitPending)
+            {
+                webExitPending = true;
+                _ = StopWebAndExitAsync(webCts);
+            }
+            return;
         }
 
         // Verify update helper process is still alive and commit signal before irreversible cleanup
@@ -4577,6 +4743,7 @@ public partial class MainWindow : Window
                     "Ошибка обновления",
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
+                ResetPendingExitState();
                 e.Cancel = true;
                 forceExit = false;
                 return;
@@ -4612,10 +4779,45 @@ public partial class MainWindow : Window
             RouteLog("[BatchExit] Закрытие окна массовой задачи отменено пользователем.");
             pendingUpdateSession?.Disarm();
             pendingUpdateSession = null;
+            ResetPendingExitState();
             return;
         }
 
         _ = Dispatcher.BeginInvoke(new Action(Close));
+    }
+    private async Task StopWebAndExitAsync(CancellationTokenSource exitCts)
+    {
+        try
+        {
+            exitCts.Cancel();
+            while (pendingWebOpenings.Count > 0)
+            {
+                if (!ReferenceEquals(webCts, exitCts) || !webExitPending)
+                    return;
+                await Task.Delay(50);
+            }
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"[WebExit] Ошибка остановки веб-подключений: {ex.Message}");
+        }
+
+        if (!ReferenceEquals(webCts, exitCts) || !webExitPending)
+            return;
+
+        webExitCompleted = true;
+        _ = Dispatcher.BeginInvoke(new Action(Close));
+    }
+    private void ResetPendingExitState()
+    {
+        webExitPending = false;
+        webExitCompleted = false;
+        tunnelsExitConfirmed = false;
+        if (webCts.IsCancellationRequested)
+        {
+            try { webCts.Dispose(); } catch { }
+            webCts = new CancellationTokenSource();
+        }
     }
     private void EnsureTrayIcon()
     {
@@ -4631,6 +4833,7 @@ public partial class MainWindow : Window
     private void ExitApplication() { forceExit = true; Close(); }
     private void Cleanup()
     {
+        try { webCts.Cancel(); } catch { }
         updateSchedulerCancellation?.Cancel();
         operationCancellation?.Cancel();
         backgroundRouteProbes.CancelAll();
@@ -4648,6 +4851,8 @@ public partial class MainWindow : Window
         if (trayIcon is not null) { trayIcon.Visible = false; trayIcon.Dispose(); }
         KittyWindowInput.CleanupStaleLogs();
         pendingUpdateSession?.Commit();
+        try { webCts.Dispose(); } catch { }
+        try { firefoxStartupLock.Dispose(); } catch { }
     }
 
     private async Task BusyAsync(

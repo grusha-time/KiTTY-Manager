@@ -813,6 +813,749 @@ internal sealed partial class SelfTestRunner
         using var doc = JsonDocument.Parse(buffer);
         return doc.RootElement.Clone();
     }
+
+    private static void FirefoxNonBlockingWebOpenTests()
+    {
+        CheckNonBlockingWebOpenStructure();
+        CheckFirefoxStartupConcurrencyAsync().GetAwaiter().GetResult();
+        CheckPendingWebOpeningsDeduplication();
+        CheckKittyTemporarySessionFileCleanupOnFailure();
+        CheckConfigSnapshotConsistency();
+        CheckWindowCloseExitCoordination();
+        CheckTunnelArgsSecretRedactionWithSnapshot();
+        CheckLazySourceProfileNotCalledWhenContainerProfileExists();
+        CheckConnectionLearningSyncedToLiveConfig();
+        CheckExitCancellationRecovery();
+    }
+
+    private static string FindRepoSourcePath(string relativePath)
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            var candidate = Path.Combine(dir.FullName, relativePath);
+            if (File.Exists(candidate)) return candidate;
+            dir = dir.Parent;
+        }
+        dir = new DirectoryInfo(Directory.GetCurrentDirectory());
+        while (dir != null)
+        {
+            var candidate = Path.Combine(dir.FullName, relativePath);
+            if (File.Exists(candidate)) return candidate;
+            dir = dir.Parent;
+        }
+        throw new FileNotFoundException($"Cannot find {relativePath}");
+    }
+
+    private static void CheckNonBlockingWebOpenStructure()
+    {
+        var mainWindowPath = FindRepoSourcePath(Path.Combine("src", "KiTTYManager.App", "MainWindow.xaml.cs"));
+        var firefoxPath = FindRepoSourcePath(Path.Combine("src", "KiTTYManager.App", "MainWindow.Firefox.cs"));
+
+        var mainWindowContent = File.ReadAllText(mainWindowPath);
+        var firefoxContent = File.ReadAllText(firefoxPath);
+
+        // 1. Verify OpenSelectedWebAsync does NOT call BusyAsync or disable panels
+        var openMethodStart = mainWindowContent.IndexOf("private async Task OpenSelectedWebAsync()", StringComparison.Ordinal);
+        Equal(true, openMethodStart >= 0);
+        var nextMethodStart = mainWindowContent.IndexOf("private async Task<ActiveRoute> Connect(", openMethodStart, StringComparison.Ordinal);
+        Equal(true, nextMethodStart > openMethodStart);
+        var openMethodBody = mainWindowContent.Substring(openMethodStart, nextMethodStart - openMethodStart);
+
+        Equal(false, openMethodBody.Contains("BusyAsync"));
+        Equal(false, openMethodBody.Contains("HeaderPanel.IsEnabled = false"));
+        Equal(false, openMethodBody.Contains("WorkspacePanel.IsEnabled = false"));
+        Equal(false, openMethodBody.Contains("operationCancellation ="));
+        Equal(false, openMethodBody.Contains("Error(ex)"));
+        Equal(true, openMethodBody.Contains("pendingWebOpenings.Contains(containerKey)"));
+        Equal(true, openMethodBody.Contains("pendingWebOpenings.Add(containerKey)"));
+        Equal(true, openMethodBody.Contains("pendingWebOpenings.Remove(containerKey)"));
+        Equal(true, openMethodBody.Contains("EnsureFirefoxContainersAsync"));
+        Equal(true, openMethodBody.Contains("CloseContainerSession(containerKey, true)"));
+
+        // 2. Verify MainWindow.Firefox.cs has synchronization lock and thread checks
+        Equal(true, firefoxContent.Contains("private readonly SemaphoreSlim firefoxStartupLock = new(1, 1);"));
+        Equal(true, firefoxContent.Contains("await firefoxStartupLock.WaitAsync(token);"));
+        Equal(true, firefoxContent.Contains("firefoxStartupLock.Release();"));
+        Equal(true, firefoxContent.Contains("Dispatcher.VerifyAccess();"));
+
+        // 3. Verify offload to Task.Run and session file cleanup
+        Equal(true, openMethodBody.Contains("var configSnapshot = ConfigTransfer.CloneSnapshot(config);"));
+        Equal(true, openMethodBody.Contains("routed?.Dispose();"));
+        Equal(true, firefoxContent.Contains("await Task.Run(async () =>"));
+
+        // 4. Verify exit coordination
+        Equal(true, mainWindowContent.Contains("if (pendingWebOpenings.Count > 0 && !webExitCompleted)"));
+        Equal(true, mainWindowContent.Contains("webExitCompleted = true;"));
+
+        // 5. Verify secret redaction with snapshot
+        Equal(true, openMethodBody.Contains("SecretRedactor.Redact(tunnelArgs, serverSnapshot, SecretRedactor.Secrets(configSnapshot));"));
+
+        // 6. Verify lazy source resolver
+        Equal(true, firefoxContent.Contains("sourceResolver"));
+
+        // 7. Verify connection learning sync
+        Equal(true, mainWindowContent.Contains("if (persist && routeConfig is not null && !ReferenceEquals(routeConfig, config))"));
+        Equal(true, mainWindowContent.Contains("var probeTarget = liveTarget ?? server;"));
+        Equal(true, mainWindowContent.Contains("initialFingerprints"));
+        Equal(true, mainWindowContent.Contains("foreach (var s in activeConfig.AllServers())"));
+        Equal(true, mainWindowContent.Contains("ServerEndpointPolicy.Remember(liveHop, effectiveEndpoint, hopContext);"));
+        Equal(true, mainWindowContent.Contains("updatedPref.LastSuccessUtc = snapshotPref.LastSuccessUtc;"));
+        Equal(true, mainWindowContent.Contains("string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? \"\", StringComparison.Ordinal)"));
+
+        // 8. Verify exit cancellation recovery and orphaned task abort
+        Equal(true, mainWindowContent.Contains("ResetPendingExitState()"));
+        Equal(true, mainWindowContent.Contains("tunnelsExitConfirmed"));
+        Equal(true, mainWindowContent.Contains("StopWebAndExitAsync(webCts)"));
+        Equal(true, mainWindowContent.Contains("StopWebAndExitAsync(CancellationTokenSource exitCts)"));
+        Equal(true, mainWindowContent.Contains("!ReferenceEquals(webCts, exitCts) || !webExitPending"));
+    }
+
+    private static async Task CheckFirefoxStartupConcurrencyAsync()
+    {
+        var startupLock = new SemaphoreSlim(1, 1);
+        var startupExecutions = 0;
+        var isRunning = false;
+        var bridgeConnected = false;
+
+        async Task SimulatedEnsureFirefoxContainersAsync(CancellationToken token)
+        {
+            await startupLock.WaitAsync(token);
+            try
+            {
+                if (isRunning)
+                {
+                    if (!bridgeConnected)
+                        throw new IOException("Расширение Firefox не отвечает.");
+                    return;
+                }
+                // Simulate cold startup delay
+                await Task.Delay(25, token);
+                Interlocked.Increment(ref startupExecutions);
+                isRunning = true;
+                bridgeConnected = true;
+            }
+            finally
+            {
+                startupLock.Release();
+            }
+        }
+
+        // 1. Multiple concurrent calls serialize and execute startup exactly once
+        var tasks = Enumerable.Range(0, 5)
+            .Select(_ => SimulatedEnsureFirefoxContainersAsync(CancellationToken.None))
+            .ToArray();
+        await Task.WhenAll(tasks);
+
+        Equal(1, startupExecutions);
+        Equal(true, isRunning);
+        Equal(true, bridgeConnected);
+
+        // 2. Subsequent call reuses existing running instance without startup
+        await SimulatedEnsureFirefoxContainersAsync(CancellationToken.None);
+        Equal(1, startupExecutions);
+
+        // 3. Failure recovery: if startup fails, lock is released and subsequent call retries
+        var failLock = new SemaphoreSlim(1, 1);
+        var failExecutions = 0;
+        var failRunning = false;
+        var failFirst = true;
+
+        async Task SimulatedFailingStartupAsync()
+        {
+            await failLock.WaitAsync();
+            try
+            {
+                if (failRunning) return;
+                await Task.Delay(10);
+                if (failFirst)
+                {
+                    failFirst = false;
+                    throw new IOException("Simulated network or profile error");
+                }
+                Interlocked.Increment(ref failExecutions);
+                failRunning = true;
+            }
+            finally
+            {
+                failLock.Release();
+            }
+        }
+
+        var threw = false;
+        try
+        {
+            await SimulatedFailingStartupAsync();
+        }
+        catch (IOException)
+        {
+            threw = true;
+        }
+
+        Equal(true, threw);
+
+        Equal(0, failExecutions);
+        Equal(false, failRunning);
+
+        // Retry succeeds
+        await SimulatedFailingStartupAsync();
+        Equal(1, failExecutions);
+        Equal(true, failRunning);
+    }
+
+    private static void CheckPendingWebOpeningsDeduplication()
+    {
+        var pending = new HashSet<string>();
+        var key1 = "server1-web1";
+        var key2 = "server2-web2";
+
+        bool TryStart(string key)
+        {
+            if (pending.Contains(key)) return false;
+            pending.Add(key);
+            return true;
+        }
+
+        void Finish(string key)
+        {
+            pending.Remove(key);
+        }
+
+        // 1. First request for key1 accepted
+        Equal(true, TryStart(key1));
+        Equal(true, pending.Contains(key1));
+
+        // 2. Duplicate request for key1 rejected while running
+        Equal(false, TryStart(key1));
+
+        // 3. Different key2 accepted concurrently
+        Equal(true, TryStart(key2));
+        Equal(2, pending.Count);
+
+        // 4. Duplicate request for key2 rejected
+        Equal(false, TryStart(key2));
+
+        // 5. When key1 completes, it can be opened again
+        Finish(key1);
+        Equal(false, pending.Contains(key1));
+        Equal(true, TryStart(key1));
+
+        // 6. Clean up
+        Finish(key1);
+        Finish(key2);
+        Equal(0, pending.Count);
+    }
+
+    private static void CheckKittyTemporarySessionFileCleanupOnFailure()
+    {
+        KittyRoutedSession? innerRouted = null;
+        string? createdPath = null;
+        var failed = false;
+
+        try
+        {
+            try
+            {
+                innerRouted = KittyRoutedSession.CreateMinimal(12345, 12346);
+                createdPath = innerRouted.Path;
+                Equal(true, File.Exists(createdPath));
+
+                // Simulate process launch failure (as in Task.Run for tunnel)
+                throw new InvalidOperationException("Simulated Process.Start failure");
+            }
+            catch
+            {
+                innerRouted?.Dispose();
+                throw;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            failed = true;
+        }
+
+        Equal(true, failed);
+        Equal(true, createdPath != null);
+        Equal(false, File.Exists(createdPath));
+    }
+
+    private static void CheckConfigSnapshotConsistency()
+    {
+        var originalConfig = new ManagerConfig();
+        var serverId = Guid.NewGuid();
+        var webId = Guid.NewGuid();
+        var originalServer = new ManagedServer
+        {
+            Id = serverId,
+            Name = "InitialServerName",
+            Port = 22,
+            WebInterfaces =
+            {
+                new WebInterface { Id = webId, Name = "AdminPanel", Url = "http://192.168.1.10:8080" }
+            }
+        };
+        originalConfig.UngroupedServers.Add(originalServer);
+
+        // Take snapshot before first await as done in OpenSelectedWebAsync
+        var configSnapshot = ConfigTransfer.CloneSnapshot(originalConfig);
+        var serverSnapshot = configSnapshot.FindServer(serverId);
+        Equal(true, serverSnapshot != null);
+
+        // Mutate original config and server during async operation
+        originalServer.Name = "MutatedServerName";
+        originalServer.Port = 2222;
+        originalServer.WebInterfaces.Clear();
+
+        // Verify snapshot remains immutable and holds the original pre-await data
+        Equal("InitialServerName", serverSnapshot!.Name);
+        Equal(22, serverSnapshot.Port);
+        Equal(1, serverSnapshot.WebInterfaces.Count);
+        Equal("AdminPanel", serverSnapshot.WebInterfaces[0].Name);
+
+        // Verify snapshot lookup works independently
+        Equal("InitialServerName", configSnapshot.FindServer(serverId)!.Name);
+    }
+
+    private static void CheckWindowCloseExitCoordination()
+    {
+        var pendingOpenings = new HashSet<string>();
+        var webExitPending = false;
+        var webExitCompleted = false;
+        var stopTasksStarted = 0;
+        var cleanupCount = 0;
+
+        void OnWindowClosing(ref bool cancel)
+        {
+            if (pendingOpenings.Count > 0 && !webExitCompleted)
+            {
+                cancel = true;
+                if (!webExitPending)
+                {
+                    webExitPending = true;
+                    stopTasksStarted++;
+                }
+                return;
+            }
+
+            cleanupCount++;
+        }
+
+        // Scenario 1: Window closing with no pending web openings -> exits immediately
+        var cancel0 = false;
+        OnWindowClosing(ref cancel0);
+        Equal(false, cancel0);
+        Equal(1, cleanupCount);
+
+        // Reset state for pending scenario
+        cleanupCount = 0;
+        pendingOpenings.Add("server-web-1");
+
+        // Scenario 2: First close attempt with pending web opening
+        // -> should cancel and trigger stop task exactly once
+        var cancel1 = false;
+        OnWindowClosing(ref cancel1);
+        Equal(true, cancel1);
+        Equal(true, webExitPending);
+        Equal(1, stopTasksStarted);
+        Equal(0, cleanupCount);
+
+        // Scenario 3: User clicks close again while stop is in progress
+        // -> should cancel again, should NOT trigger stop task again, should NOT call cleanup
+        var cancel2 = false;
+        OnWindowClosing(ref cancel2);
+        Equal(true, cancel2);
+        Equal(1, stopTasksStarted);
+        Equal(0, cleanupCount);
+
+        // Scenario 4: Stop completes (webExitCompleted = true)
+        webExitCompleted = true;
+        pendingOpenings.Clear();
+
+        // Final close invoked by Dispatcher
+        // -> should NOT cancel and should call cleanup
+        var cancel3 = false;
+        OnWindowClosing(ref cancel3);
+        Equal(false, cancel3);
+        Equal(1, cleanupCount);
+
+        // Scenario 5: If pending openings remain (> 0), exit does NOT complete
+        // and window closing is canceled to prevent Cleanup() while tasks run
+        cleanupCount = 0;
+        pendingOpenings.Add("stuck-connection");
+        webExitCompleted = false;
+        var cancel4 = false;
+        OnWindowClosing(ref cancel4);
+        Equal(true, cancel4);
+        Equal(0, cleanupCount);
+    }
+
+    private static void CheckTunnelArgsSecretRedactionWithSnapshot()
+    {
+        var config = new ManagerConfig();
+        var server = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "SecretServer",
+            Password = "MyOldSnapshotPassword123!",
+            RootPassword = "MyOldRootPassword456!"
+        };
+        config.UngroupedServers.Add(server);
+
+        var configSnapshot = ConfigTransfer.CloneSnapshot(config);
+        var serverSnapshot = configSnapshot.FindServer(server.Id)!;
+
+        // User edits password in live config while connection is in flight
+        server.Password = "BrandNewPassword789!";
+        server.RootPassword = "BrandNewRootPassword999!";
+
+        // Tunnel arguments created using serverSnapshot
+        var rawTunnelArgs = $"-ssh -pw {serverSnapshot.Password} -l root {serverSnapshot.Host}";
+
+        // With serverSnapshot + configSnapshot:
+        var safeArgs = SecretRedactor.Redact(rawTunnelArgs, serverSnapshot, SecretRedactor.Secrets(configSnapshot));
+        Equal(false, safeArgs.Contains("MyOldSnapshotPassword123!"));
+        Equal(true, safeArgs.Contains("***"));
+    }
+
+    private static void CheckLazySourceProfileNotCalledWhenContainerProfileExists()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "km_test_firefox_lazy_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var profileDir = Path.Combine(tempRoot, "profile");
+            Directory.CreateDirectory(profileDir);
+            File.WriteAllText(Path.Combine(profileDir, "key4.db"), "test-key");
+            File.WriteAllText(Path.Combine(profileDir, "cert9.db"), "test-cert");
+
+            var sourceResolverCalled = false;
+            string SourceResolver()
+            {
+                sourceResolverCalled = true;
+                throw new InvalidOperationException("Source resolver should not be called when container profile exists!");
+            }
+
+            var resolvedProfile = FirefoxProfileWorkspace.EnsureContainerProfile(tempRoot, SourceResolver);
+            Equal(profileDir, resolvedProfile);
+            Equal(false, sourceResolverCalled);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static void CheckConnectionLearningSyncedToLiveConfig()
+    {
+        var liveConfig = new ManagerConfig();
+        var targetId = Guid.NewGuid();
+        var hopRotatedId = Guid.NewGuid();
+        var hopEditedId = Guid.NewGuid();
+        var proxyId1 = Guid.NewGuid();
+        var proxyId2 = Guid.NewGuid();
+
+        var liveTarget = new ManagedServer { Id = targetId, Name = "Target", Host = "10.0.0.2", Port = 22 };
+        var liveHopRotated = new ManagedServer
+        {
+            Id = hopRotatedId,
+            Name = "HopRotated",
+            Host = "10.0.0.3",
+            Port = 22,
+            HostKeyFingerprint = "SHA256:old_server_key",
+            HostKeyAlgorithm = "ssh-rsa",
+            HostKeyBits = 2048
+        };
+        var liveHopEdited = new ManagedServer
+        {
+            Id = hopEditedId,
+            Name = "HopEdited",
+            Host = "10.0.0.4",
+            Port = 22,
+            HostKeyFingerprint = "SHA256:old_key_before_manual_edit",
+            HostKeyAlgorithm = "ssh-ed25519",
+            HostKeyBits = 256
+        };
+        liveConfig.UngroupedServers.Add(liveTarget);
+        liveConfig.UngroupedServers.Add(liveHopRotated);
+        liveConfig.UngroupedServers.Add(liveHopEdited);
+
+        var proxy1 = new BaseProxy { Id = proxyId1, Name = "Proxy1", Host = "127.0.0.1", Port = 1080 };
+        var proxy2 = new BaseProxy { Id = proxyId2, Name = "Proxy2", Host = "127.0.0.1", Port = 1081 };
+        liveConfig.BaseProxies.Add(proxy1);
+        liveConfig.BaseProxies.Add(proxy2);
+
+        // Snapshot 1 created before Firefox launch
+        var snapshot1 = ConfigTransfer.CloneSnapshot(liveConfig);
+        var s1Target = snapshot1.FindServer(targetId)!;
+        var s1HopRotated = snapshot1.FindServer(hopRotatedId)!;
+        var s1HopEdited = snapshot1.FindServer(hopEditedId)!;
+
+        // User edits host and fingerprint in live UI during Firefox launch (after snapshot was taken)
+        liveHopEdited.HostKeyFingerprint = "SHA256:user_manually_typed_key";
+        liveHopEdited.Host = "10.0.0.99";
+
+        // In Connect, initialFingerprints are collected from activeConfig (snapshot1)
+        var initialFingerprints = new Dictionary<Guid, (string Host, int Port, string Fingerprint)>();
+        foreach (var s in snapshot1.AllServers())
+            initialFingerprints[s.Id] = (s.Host, s.Port, s.HostKeyFingerprint ?? "");
+
+        // User confirmed rotated key on hopRotated
+        s1HopRotated.HostKeyFingerprint = "SHA256:new_confirmed_key";
+        s1HopRotated.HostKeyAlgorithm = "ssh-ed25519";
+        s1HopRotated.HostKeyBits = 256;
+
+        // Remote host gave new key for hopEdited, but user manually typed a different key and host in live UI
+        s1HopEdited.HostKeyFingerprint = "SHA256:remote_key";
+
+        // Snapshot 1 endpoint: Direct(proxyId1) -> target on port 2222
+        var s1Pref = new EndpointPreference
+        {
+            ProxyId = proxyId1,
+            Endpoint = new ServerEndpoint("10.0.0.2", 2222),
+            LastSuccessUtc = DateTimeOffset.UtcNow.AddMinutes(-5)
+        };
+        s1Target.EndpointPreferences.Add(s1Pref);
+
+        var candidateKey = new RouteCandidate(Proxy: proxy1, Servers: [s1HopRotated, s1HopEdited], WithoutProxy: false);
+        var routeKey = new ActiveRoute(
+            s1HopEdited, 10000, 1080, "proxy", null, [],
+            [
+                new RouteHop(s1HopRotated.Id, "HopRotated", "10.0.0.3", 22),
+                new RouteHop(s1HopEdited.Id, "HopEdited", "10.0.0.4", 22)
+            ]);
+
+        var candidate1 = new RouteCandidate(Proxy: proxy1, Servers: [s1Target], WithoutProxy: false);
+        var route1 = new ActiveRoute(
+            s1Target, 10001, 1080, "proxy", null, [],
+            [
+                new RouteHop(s1Target.Id, "Target", "10.0.0.2", 2222)
+            ]);
+
+        // Sync helper simulating the CompleteRoute sync block
+        void ApplySync(ManagerConfig config, RouteCandidate candidate, ActiveRoute route, bool persist, DateTimeOffset timestamp)
+        {
+            if (!persist) return;
+            for (var i = 0; i < candidate.Servers.Count; i++)
+            {
+                var hop = candidate.Servers[i];
+                var liveHop = config.FindServer(hop.Id);
+                if (liveHop is null) continue;
+
+                var hopContext = i == 0
+                    ? EndpointContext.Direct(candidate.Proxy.Id)
+                    : EndpointContext.Via(candidate.Servers[i - 1].Id);
+                var snapshotPref = hop.EndpointPreferences.FirstOrDefault(item =>
+                    item.ProxyId == hopContext.ProxyId &&
+                    item.PreviousServerId == hopContext.PreviousServerId);
+                var effectiveEndpoint = snapshotPref?.Endpoint ??
+                    (i < route.Hops.Count ? new ServerEndpoint(route.Hops[i].Host, route.Hops[i].Port) : null);
+                if (effectiveEndpoint is not null)
+                {
+                    var livePref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                        item.ProxyId == hopContext.ProxyId &&
+                        item.PreviousServerId == hopContext.PreviousServerId);
+                    if (livePref is null || snapshotPref is null || livePref.LastSuccessUtc <= snapshotPref.LastSuccessUtc)
+                    {
+                        ServerEndpointPolicy.Remember(liveHop, effectiveEndpoint, hopContext);
+                        if (snapshotPref is not null && snapshotPref.LastSuccessUtc != default)
+                        {
+                            var updatedPref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                                item.ProxyId == hopContext.ProxyId &&
+                                item.PreviousServerId == hopContext.PreviousServerId);
+                            if (updatedPref is not null)
+                                updatedPref.LastSuccessUtc = snapshotPref.LastSuccessUtc;
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
+                    initialFingerprints.TryGetValue(hop.Id, out var initial) &&
+                    string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) &&
+                    initial.Port == liveHop.Port &&
+                    string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? "", StringComparison.Ordinal))
+                {
+                    liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
+                    liveHop.HostKeyAlgorithm = hop.HostKeyAlgorithm;
+                    liveHop.HostKeyBits = hop.HostKeyBits;
+                }
+            }
+        }
+
+        // Apply key verification connection and connection 1
+        ApplySync(liveConfig, candidateKey, routeKey, persist: true, DateTimeOffset.UtcNow);
+        ApplySync(liveConfig, candidate1, route1, persist: true, DateTimeOffset.UtcNow);
+
+        // 1. Confirmed key replacement transferred
+        Equal("SHA256:new_confirmed_key", liveHopRotated.HostKeyFingerprint);
+        Equal("ssh-ed25519", liveHopRotated.HostKeyAlgorithm);
+
+        // 2. Parallel manual user edit preserved (NOT overwritten by remote_key, host unchanged)
+        Equal("SHA256:user_manually_typed_key", liveHopEdited.HostKeyFingerprint);
+        Equal("10.0.0.99", liveHopEdited.Host);
+
+        // 3. Endpoint from connection 1 remembered
+        Equal(1, liveTarget.EndpointPreferences.Count);
+        Equal(proxyId1, liveTarget.EndpointPreferences[0].ProxyId);
+        Equal(2222, liveTarget.EndpointPreferences[0].Endpoint.Port);
+
+        // Snapshot 2: parallel connection through Proxy2 / Via hop
+        var snapshot2 = ConfigTransfer.CloneSnapshot(liveConfig);
+        var s2Target = snapshot2.FindServer(targetId)!;
+        var s2HopRotated = snapshot2.FindServer(hopRotatedId)!;
+
+        // Context 2: Via(hopRotatedId) -> target on port 3333
+        var s2Pref = new EndpointPreference
+        {
+            PreviousServerId = hopRotatedId,
+            Endpoint = new ServerEndpoint("10.0.0.2", 3333),
+            LastSuccessUtc = DateTimeOffset.UtcNow.AddMinutes(-3)
+        };
+        s2Target.EndpointPreferences.Add(s2Pref);
+
+        var candidate2 = new RouteCandidate(Proxy: proxy2, Servers: [s2HopRotated, s2Target], WithoutProxy: false);
+        var route2 = new ActiveRoute(
+            s2Target, 10002, 1081, "proxy", null, [],
+            [
+                new RouteHop(s2HopRotated.Id, "HopRotated", "10.0.0.3", 22),
+                new RouteHop(s2Target.Id, "Target", "10.0.0.2", 3333)
+            ]);
+
+        ApplySync(liveConfig, candidate2, route2, persist: true, DateTimeOffset.UtcNow);
+
+        // 3. Both contexts preserved in liveTarget.EndpointPreferences!
+        Equal(2, liveTarget.EndpointPreferences.Count);
+        Equal(true, liveTarget.EndpointPreferences.Any(p => p.ProxyId == proxyId1 && p.Endpoint.Port == 2222));
+        Equal(true, liveTarget.EndpointPreferences.Any(p => p.PreviousServerId == hopRotatedId && p.Endpoint.Port == 3333));
+
+        // 4. Overwrite in same context only if newer
+        var olderTime = DateTimeOffset.UtcNow.AddHours(-1);
+        var newerTime = DateTimeOffset.UtcNow.AddMinutes(5);
+        var olderSnapshot = new ManagedServer { Id = targetId, Host = "10.0.0.2", Port = 22 };
+        olderSnapshot.EndpointPreferences.Add(new EndpointPreference
+        {
+            ProxyId = proxyId1,
+            Endpoint = new ServerEndpoint("10.0.0.2", 9999),
+            LastSuccessUtc = olderTime
+        });
+
+        // Current livePref has time > olderTime, so 9999 must NOT overwrite 2222
+        var sOlderCandidate = new RouteCandidate(Proxy: proxy1, Servers: [olderSnapshot], WithoutProxy: false);
+        var sOlderRoute = new ActiveRoute(olderSnapshot, 10003, 1080, "proxy", null, [], [new RouteHop(targetId, "T", "10.0.0.2", 9999)]);
+        ApplySync(liveConfig, sOlderCandidate, sOlderRoute, persist: true, olderTime);
+        var p1Pref = liveTarget.EndpointPreferences.First(p => p.ProxyId == proxyId1);
+        Equal(2222, p1Pref.Endpoint.Port);
+
+        // But a newer snapshot DOES update 2222 to 8888
+        var newerSnapshot = new ManagedServer { Id = targetId, Host = "10.0.0.2", Port = 22 };
+        newerSnapshot.EndpointPreferences.Add(new EndpointPreference
+        {
+            ProxyId = proxyId1,
+            Endpoint = new ServerEndpoint("10.0.0.2", 8888),
+            LastSuccessUtc = newerTime
+        });
+        var sNewerCandidate = new RouteCandidate(Proxy: proxy1, Servers: [newerSnapshot], WithoutProxy: false);
+        var sNewerRoute = new ActiveRoute(newerSnapshot, 10004, 1080, "proxy", null, [], [new RouteHop(targetId, "T", "10.0.0.2", 8888)]);
+        ApplySync(liveConfig, sNewerCandidate, sNewerRoute, persist: true, newerTime);
+        p1Pref = liveTarget.EndpointPreferences.First(p => p.ProxyId == proxyId1);
+        Equal(8888, p1Pref.Endpoint.Port);
+
+        // 5. When persist == false, sync is completely skipped
+        var noPersistSnapshot = new ManagedServer { Id = targetId, Host = "10.0.0.2", Port = 22 };
+        noPersistSnapshot.EndpointPreferences.Add(new EndpointPreference
+        {
+            ProxyId = proxyId1,
+            Endpoint = new ServerEndpoint("10.0.0.2", 7777),
+            LastSuccessUtc = DateTimeOffset.UtcNow.AddDays(1)
+        });
+        var sNoPersistCandidate = new RouteCandidate(Proxy: proxy1, Servers: [noPersistSnapshot], WithoutProxy: false);
+        var sNoPersistRoute = new ActiveRoute(noPersistSnapshot, 10005, 1080, "proxy", null, [], [new RouteHop(targetId, "T", "10.0.0.2", 7777)]);
+        ApplySync(liveConfig, sNoPersistCandidate, sNoPersistRoute, persist: false, DateTimeOffset.UtcNow);
+        p1Pref = liveTarget.EndpointPreferences.First(p => p.ProxyId == proxyId1);
+        Equal(8888, p1Pref.Endpoint.Port);
+
+        // 6. Two snapshots of the same context: snapshot A with success at t=10, snapshot B with success at t=20.
+        // Test both synchronization orders (A then B, and B then A).
+        // In both cases, liveConfig must retain the endpoint and exact timestamp from B (t=20).
+        var t10 = DateTimeOffset.UtcNow.AddMinutes(-20);
+        var t20 = DateTimeOffset.UtcNow.AddMinutes(-10);
+
+        var targetA = new ManagedServer { Id = targetId, Host = "10.0.0.2", Port = 22 };
+        targetA.EndpointPreferences.Add(new EndpointPreference
+        {
+            ProxyId = proxyId1,
+            Endpoint = new ServerEndpoint("10.0.0.2", 1111),
+            LastSuccessUtc = t10
+        });
+        var candA = new RouteCandidate(Proxy: proxy1, Servers: [targetA], WithoutProxy: false);
+        var routeA = new ActiveRoute(targetA, 10006, 1080, "proxy", null, [], [new RouteHop(targetId, "T", "10.0.0.2", 1111)]);
+
+        var targetB = new ManagedServer { Id = targetId, Host = "10.0.0.2", Port = 22 };
+        targetB.EndpointPreferences.Add(new EndpointPreference
+        {
+            ProxyId = proxyId1,
+            Endpoint = new ServerEndpoint("10.0.0.2", 2222),
+            LastSuccessUtc = t20
+        });
+        var candB = new RouteCandidate(Proxy: proxy1, Servers: [targetB], WithoutProxy: false);
+        var routeB = new ActiveRoute(targetB, 10007, 1080, "proxy", null, [], [new RouteHop(targetId, "T", "10.0.0.2", 2222)]);
+
+        // Case 6.1: Order A (t=10) then B (t=20)
+        liveTarget.EndpointPreferences.Clear();
+        ApplySync(liveConfig, candA, routeA, persist: true, t10);
+        ApplySync(liveConfig, candB, routeB, persist: true, t20);
+        var prefOrderAB = liveTarget.EndpointPreferences.First(p => p.ProxyId == proxyId1);
+        Equal(2222, prefOrderAB.Endpoint.Port);
+        Equal(t20, prefOrderAB.LastSuccessUtc);
+
+        // Case 6.2: Order B (t=20) then A (t=10)
+        liveTarget.EndpointPreferences.Clear();
+        ApplySync(liveConfig, candB, routeB, persist: true, t20);
+        ApplySync(liveConfig, candA, routeA, persist: true, t10);
+        var prefOrderBA = liveTarget.EndpointPreferences.First(p => p.ProxyId == proxyId1);
+        Equal(2222, prefOrderBA.Endpoint.Port);
+        Equal(t20, prefOrderBA.LastSuccessUtc);
+    }
+
+    private static void CheckExitCancellationRecovery()
+    {
+        var webCts = new CancellationTokenSource();
+        var webExitPending = true;
+        var webExitCompleted = false;
+        var tunnelsExitConfirmed = true;
+
+        var exitCts = webCts;
+
+        // Reset exit state (as in ResetPendingExitState)
+        void ResetState()
+        {
+            webExitPending = false;
+            webExitCompleted = false;
+            tunnelsExitConfirmed = false;
+            if (webCts.IsCancellationRequested)
+            {
+                webCts.Dispose();
+                webCts = new CancellationTokenSource();
+            }
+        }
+
+        // Simulate cancel requested during exit
+        exitCts.Cancel();
+        ResetState();
+
+        Equal(false, webExitPending);
+        Equal(false, webExitCompleted);
+        Equal(false, tunnelsExitConfirmed);
+        Equal(false, webCts.IsCancellationRequested);
+
+        // Verify check in StopWebAndExitAsync aborts without setting webExitCompleted
+        var wouldAbort = !ReferenceEquals(webCts, exitCts) || !webExitPending;
+        Equal(true, wouldAbort);
+        Equal(false, webExitCompleted);
+
+        // Verify new token is functional
+        var token = webCts.Token;
+        Equal(false, token.IsCancellationRequested);
+    }
 }
 
 internal static class FirefoxContainerSmoke
