@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using KiTTYManager.App;
 using KiTTYManager.Core;
 using Renci.SshNet;
+using Renci.SshNet.Common;
 
 internal sealed partial class SelfTestRunner
 {
@@ -539,6 +540,193 @@ internal sealed partial class SelfTestRunner
         Equal(false, service.HasActiveTunnels());
         Equal(0, service.GetTunnels().Count);
 
+        service.Dispose();
+    }
+
+    private static void TunnelServiceTransientConnectionErrorsDoNotFaultTunnel()
+    {
+        var logs = new List<string>();
+        var server = new ManagedServer { Id = Guid.NewGuid(), Name = "Server-TransientTest" };
+        using var dummyClient = new SshClient("127.0.0.1", 2222, "user", "pass");
+
+        int openRouteCount = 0;
+        var releasedRoutes = new List<ActiveRoute>();
+        bool isHealthy = true;
+        TaskCompletionSource<bool>? reconnectAttemptTcs = null;
+
+        var service = new TunnelService(
+            openRoute: (_, _) =>
+            {
+                Interlocked.Increment(ref openRouteCount);
+                reconnectAttemptTcs?.TrySetResult(true);
+                return Task.FromResult(new ActiveRoute(server, 2222, 0, "direct", dummyClient, [], []));
+            },
+            releaseRoute: r =>
+            {
+                lock (releasedRoutes)
+                {
+                    releasedRoutes.Add(r);
+                }
+            },
+            log: msg =>
+            {
+                lock (logs)
+                {
+                    logs.Add(msg);
+                }
+            })
+        {
+            ReconnectRetryDelay = TimeSpan.FromMilliseconds(30),
+            HealthCheckInterval = TimeSpan.FromSeconds(5),
+            RoutePortAttacher = (_, _) => { },
+            PortStarter = _ => { }
+        };
+
+        service.HealthCheckProbe = _ => isHealthy;
+
+        // Verify direct IsTunnelHealthy behavior
+        var mockItem = new ActiveTunnelItem(new TunnelDefinition { ServerId = server.Id, BindPort = 1234 });
+        Equal(true, service.IsTunnelHealthy(mockItem));
+        isHealthy = false;
+        Equal(false, service.IsTunnelHealthy(mockItem));
+        service.HealthCheckProbe = null;
+        Equal(false, service.IsTunnelHealthy(mockItem));
+        service.HealthCheckProbe = _ => isHealthy;
+        isHealthy = true;
+
+        // a) Healthy tunnel: Dynamic, Local, Remote
+        var kinds = new[] { TunnelKind.Dynamic, TunnelKind.Local, TunnelKind.Remote };
+        int bindPort = 2000;
+
+        foreach (var kind in kinds)
+        {
+            var def = new TunnelDefinition
+            {
+                ServerId = server.Id,
+                ServerName = server.Name,
+                Kind = kind,
+                BindHost = "127.0.0.1",
+                BindPort = bindPort++,
+                DestinationHost = kind == TunnelKind.Dynamic ? "" : "192.168.1.100",
+                DestinationPort = kind == TunnelKind.Dynamic ? 0 : 8080
+            };
+
+            var item = service.StartTunnelAsync(def).GetAwaiter().GetResult();
+            Equal("Работает", item.Status);
+            Equal(true, item.IsRunning);
+            Equal(true, service.GetTunnels().Any(t => t.Id == item.Id && t.IsRunning));
+
+            var faultTcs = item.CurrentFaultTcs;
+            Equal(true, faultTcs != null);
+            Equal(false, faultTcs!.Task.IsCompleted);
+
+            int currentRouteCount = openRouteCount;
+
+            // Simulate SshOperationTimeoutException
+            var timeoutEx = new SshOperationTimeoutException("Session operation has timed out");
+            service.HandlePortException(item, faultTcs, timeoutEx);
+
+            Equal("Работает", item.Status);
+            Equal(true, item.IsRunning);
+            Equal(false, faultTcs.Task.IsCompleted);
+            Equal(currentRouteCount, openRouteCount);
+            lock (logs)
+            {
+                Equal(true, logs.Any(l => l.Contains("временная ошибка соединения — Session operation has timed out") && l.Contains(item.Summary)));
+            }
+
+            // Simulate SocketException
+            var socketEx = new SocketException((int)SocketError.TimedOut);
+            service.HandlePortException(item, faultTcs, socketEx);
+
+            Equal("Работает", item.Status);
+            Equal(true, item.IsRunning);
+            Equal(false, faultTcs.Task.IsCompleted);
+            Equal(currentRouteCount, openRouteCount);
+            lock (logs)
+            {
+                Equal(true, logs.Any(l => l.Contains("временная ошибка соединения") && l.Contains(socketEx.Message) && l.Contains(item.Summary)));
+            }
+
+            // Clean stop before next kind
+            service.StopTunnelAsync(item.Id).GetAwaiter().GetResult();
+            service.RemoveTunnelFromList(item.Id);
+            Equal(false, item.IsRunning);
+        }
+
+        // b) Unhealthy tunnel: when IsTunnelHealthy returns false, HandlePortException triggers faultTcs
+        var unhealthyDef = new TunnelDefinition
+        {
+            ServerId = server.Id,
+            ServerName = server.Name,
+            Kind = TunnelKind.Dynamic,
+            BindHost = "127.0.0.1",
+            BindPort = bindPort++,
+            DestinationHost = "",
+            DestinationPort = 0
+        };
+
+        var unhealthyItem = service.StartTunnelAsync(unhealthyDef).GetAwaiter().GetResult();
+        Equal("Работает", unhealthyItem.Status);
+        Equal(true, unhealthyItem.IsRunning);
+
+        var preFaultTcs = unhealthyItem.CurrentFaultTcs;
+        Equal(true, preFaultTcs != null);
+        Equal(false, preFaultTcs!.Task.IsCompleted);
+
+        var oldPortCallback = service.LastPortCallback;
+        Equal(true, oldPortCallback != null);
+
+        // Make tunnel unhealthy
+        isHealthy = false;
+        int routeCountBeforeFault = openRouteCount;
+        reconnectAttemptTcs = new TaskCompletionSource<bool>();
+
+        var faultEx = new SshOperationTimeoutException("Session operation has timed out on unhealthy connection");
+        service.HandlePortException(unhealthyItem, preFaultTcs, faultEx);
+
+        // faultTcs must be triggered immediately
+        Equal(true, preFaultTcs.Task.IsCompleted);
+        lock (logs)
+        {
+            Equal(true, logs.Any(l => l.Contains("Ошибка туннеля: Session operation has timed out on unhealthy connection")));
+        }
+
+        // Wait until recovery reconnect attempt begins
+        Equal(true, reconnectAttemptTcs.Task.Wait(TimeSpan.FromSeconds(3)));
+        Equal(true, openRouteCount > routeCountBeforeFault);
+
+        // Allow recovery to complete by making probe healthy again
+        isHealthy = true;
+
+        var sw = Stopwatch.StartNew();
+        while (unhealthyItem.Status != "Работает" && sw.ElapsedMilliseconds < 3000)
+        {
+            Thread.Sleep(10);
+        }
+
+        Equal("Работает", unhealthyItem.Status);
+        Equal(true, unhealthyItem.IsRunning);
+
+        // c) Isolation: stale callback with old faultTcs after recovery does not fault new connection
+        var recoveredFaultTcs = unhealthyItem.CurrentFaultTcs;
+        Equal(true, recoveredFaultTcs != null);
+        Equal(false, ReferenceEquals(preFaultTcs, recoveredFaultTcs));
+        Equal(false, recoveredFaultTcs!.Task.IsCompleted);
+
+        int routeCountAfterRecovery = openRouteCount;
+
+        isHealthy = false;
+        oldPortCallback!(new Exception("Поздняя ошибка старого порта"));
+        isHealthy = true;
+
+        // New connection TCS must NOT be faulted
+        Equal(false, recoveredFaultTcs.Task.IsCompleted);
+        Equal("Работает", unhealthyItem.Status);
+        Equal(true, unhealthyItem.IsRunning);
+        Equal(routeCountAfterRecovery, openRouteCount);
+
+        service.StopTunnelAsync(unhealthyItem.Id).GetAwaiter().GetResult();
         service.Dispose();
     }
 

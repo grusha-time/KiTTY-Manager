@@ -84,6 +84,7 @@ internal sealed partial class SelfTestRunner
         Test("Статус ошибки туннеля сохраняет защиту активных ресурсов и позволяет их освободить", TunnelServiceErrorStatusRetainsActiveResourceProtection);
         Test("Синхронная остановка всех туннелей освобождает ресурсы без блокировки", TunnelServiceSynchronousStopAllReleasesResourcesWithoutBlocking);
         Test("Автоматическое восстановление SSH-туннелей при обрыве соединения", TunnelServiceAutoReconnectLifecycle);
+        Test("Временные ошибки соединений туннеля не сбрасывают его рабочий статус", TunnelServiceTransientConnectionErrorsDoNotFaultTunnel);
         Test("Удаление и остановка восстанавливаемого SSH-туннеля освобождает ресурсы", TunnelServiceRemoveTunnelStopsRecoveryCleanly);
         Test("Удаление туннеля из списка не вызывает взаимную блокировку с UI-потоком", TunnelServiceRemoveTunnelDoesNotDeadlockWithSyncContext);
         Test("Остановка туннеля во время восстановления соблюдает блокировку жизненного цикла", TunnelServiceStopDuringRecoveryPreservesLifecycleLock);

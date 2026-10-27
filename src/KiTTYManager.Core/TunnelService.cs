@@ -82,6 +82,7 @@ public sealed class TunnelService : IDisposable
     internal Func<ActiveTunnelItem, bool>? HealthCheckProbe { get; set; }
     internal Action<ActiveRoute, ForwardedPort>? RoutePortAttacher { get; set; }
     internal Action<ForwardedPort>? PortStarter { get; set; }
+    internal Action<Exception?>? LastPortCallback { get; set; }
 
     internal void SimulateTunnelFault(Guid tunnelId, string faultMessage = "Сбой соединения")
     {
@@ -119,6 +120,44 @@ public sealed class TunnelService : IDisposable
         }
     }
 
+    internal bool IsTunnelHealthy(ActiveTunnelItem item)
+    {
+        if (HealthCheckProbe != null)
+        {
+            return HealthCheckProbe(item);
+        }
+
+        var client = item.Route?.Client;
+        var port = item.Port;
+        try
+        {
+            return client != null && client.IsConnected && port != null && port.IsStarted;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    internal void HandlePortException(
+        ActiveTunnelItem item,
+        TaskCompletionSource<string> faultTcs,
+        Exception? exception)
+    {
+        var exceptionMessage = exception?.Message ?? "Неизвестная ошибка";
+        var msg = "Ошибка туннеля: " + exceptionMessage;
+
+        if (IsTunnelHealthy(item))
+        {
+            log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): временная ошибка соединения — {exceptionMessage}");
+        }
+        else
+        {
+            log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): {msg}");
+            faultTcs.TrySetResult(msg);
+        }
+    }
+
     private async Task ConnectTunnelPortAsync(
         ActiveTunnelItem item,
         TaskCompletionSource<string> faultTcs,
@@ -145,12 +184,9 @@ public sealed class TunnelService : IDisposable
         var port = TunnelPortFactory.Create(item.Definition);
         item.Port = port;
 
-        port.Exception += (_, args) =>
-        {
-            var msg = "Ошибка туннеля: " + args.Exception.Message;
-            log?.Invoke($"Туннель «{item.Summary}» ({item.ServerName}): {msg}");
-            faultTcs.TrySetResult(msg);
-        };
+        Action<Exception?> callback = ex => HandlePortException(item, faultTcs, ex);
+        LastPortCallback = callback;
+        port.Exception += (_, args) => callback(args.Exception);
 
         if (route.Client is { } sshClient)
         {
@@ -319,12 +355,7 @@ public sealed class TunnelService : IDisposable
                     }
                     else
                     {
-                        var client = item.Route?.Client;
-                        var port = item.Port;
-                        bool isHealthy = HealthCheckProbe != null
-                            ? HealthCheckProbe(item)
-                            : (client != null && client.IsConnected && port != null && port.IsStarted);
-
+                        bool isHealthy = IsTunnelHealthy(item);
                         if (!isHealthy)
                         {
                             faulted = true;
