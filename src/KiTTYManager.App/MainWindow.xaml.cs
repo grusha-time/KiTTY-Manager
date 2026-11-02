@@ -1963,11 +1963,36 @@ public partial class MainWindow : Window
             if (liveServer is null || !liveServer.WebInterfaces.Any(w => w.Id == webId))
                 return;
 
+            route = await Connect(serverSnapshot, cancellationToken, true, routeConfig: configSnapshot);
+
+            var routeHops = route.Hops.Select(h => h.ServerId).ToList();
+            var proxyId = serverSnapshot.PreferredRoute?.ProxyId ?? route.Target.PreferredRoute?.ProxyId;
+            if (proxyId is { } pid && pid != Guid.Empty)
+            {
+                var activeProxy = configSnapshot.BaseProxies.FirstOrDefault(p => p.Id == pid);
+                if (activeProxy?.StartupServerId is { } startupSid && startupSid != Guid.Empty && !routeHops.Contains(startupSid))
+                    routeHops.Add(startupSid);
+            }
+            var sharedMappings = WebResolverMappingPlan.Build(configSnapshot, serverSnapshot, routeHops, proxyId);
+
+            string? resolvedAddress = null;
+            if (!string.IsNullOrWhiteSpace(resolverAddress))
+            {
+                resolvedAddress = resolverAddress.Trim();
+                if (!System.Net.IPAddress.TryParse(resolvedAddress, out _))
+                    throw new InvalidOperationException($"Для веб-интерфейса «{webName}» укажите IP в поле «Адрес DNS».");
+            }
+            else
+            {
+                var normalizedHost = ResolvingSocks5Relay.NormalizeDomain(originalDestination.DnsSafeHost);
+                resolvedAddress = sharedMappings
+                    .FirstOrDefault(m => string.Equals(ResolvingSocks5Relay.NormalizeDomain(m.Key), normalizedHost, StringComparison.OrdinalIgnoreCase))
+                    .Value;
+            }
+
             var webPort = SelectFreeLoopbackPort();
-            var useInternalResolver = !string.IsNullOrWhiteSpace(resolverAddress) &&
+            var useInternalResolver = resolvedAddress is not null &&
                 !System.Net.IPAddress.TryParse(originalDestination.Host, out _);
-            if (useInternalResolver && !System.Net.IPAddress.TryParse(resolverAddress.Trim(), out _))
-                throw new InvalidOperationException($"Для веб-интерфейса «{webName}» укажите IP в поле «Адрес DNS».");
 
             var destination = useInternalResolver
                 ? originalDestination
@@ -1976,18 +2001,16 @@ public partial class MainWindow : Window
             var resolverMappings = new List<KeyValuePair<string, string>>();
             if (useInternalResolver)
             {
-                resolverMappings.Add(new(originalDestination.DnsSafeHost, resolverAddress.Trim()));
-                resolverMappings.Add(new("127.0.0.1", resolverAddress.Trim()));
+                resolverMappings.Add(new(originalDestination.DnsSafeHost, resolvedAddress!));
+                resolverMappings.Add(new("127.0.0.1", resolvedAddress!));
             }
-            foreach (var pair in WebResolverMappingPlan.Build(serverSnapshot))
+            foreach (var pair in sharedMappings)
             {
                 if (!resolverMappings.Any(m => string.Equals(m.Key, pair.Key, StringComparison.OrdinalIgnoreCase)))
                     resolverMappings.Add(pair);
             }
             resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings, resolveUnmappedLocally: true);
             var browserProxyPort = resolver.Port;
-
-            route = await Connect(serverSnapshot, cancellationToken, true, routeConfig: configSnapshot);
 
             var kittyPath = configSnapshot.KittyPath;
             var (tunnelProc, session, tunnelArgs) = await Task.Run(() =>

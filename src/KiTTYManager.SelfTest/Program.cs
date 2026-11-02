@@ -237,6 +237,19 @@ internal sealed partial class SelfTestRunner
         Test("Web resolver пропускает IP и поддерживает IPv6 mapping", InternalWebResolverIpAndIpv6);
         Test("Web resolver изолирует одинаковый домен между сессиями", InternalWebResolverSessionIsolation);
         Test("План web resolver использует IP интерфейса и резервный IP сервера", InternalWebResolverMappingPlan);
+        Test("Web resolver разделяет DNS-сопоставления в плоской сети", SharedWebResolverFlatNetwork);
+        Test("Web resolver отдаёт приоритет собственному сопоставлению целевого сервера", SharedWebResolverTargetPriority);
+        Test("Web resolver отдаёт приоритет узлам активного маршрута перед удалёнными", SharedWebResolverRouteHopPrecedence);
+        Test("Web resolver изолирует сопоставления между разными шлюзами и прокси", SharedWebResolverGatewayAndProxyIsolation);
+        Test("Web resolver исключает конфликтующие домены при неоднозначности", SharedWebResolverAmbiguousConflictExclusion);
+        Test("Web resolver безопасно пропускает некорректные IP на сторонних серверах", SharedWebResolverForeignInvalidIpSafety);
+        Test("Web resolver возвращает детерминированный порядок независимо от конфига", SharedWebResolverDeterministicOrdering);
+        Test("Web resolver relay передаёт данные с сохранением Host для общих доменов", SharedWebResolverEndToEndRelay);
+        Test("Web resolver изолирует обратные связи между несовместимыми сетями", SharedWebResolverReverseLinkIsolation);
+        Test("Web resolver включает не открывавшиеся ранее источники с совместимым шлюзом", SharedWebResolverUnopenedSourceWithGateway);
+        Test("Web resolver включает вложенные обязательные шлюзы из активного маршрута", SharedWebResolverNestedGatewayActiveHops);
+        Test("Web resolver учитывает подтверждённую прямую связь при наличии шлюза цели", SharedWebResolverGatewayOutgoingLink);
+        Test("Web resolver включает сопоставления управляемого JumpHost активного прокси", SharedWebResolverActiveJumpHostStartupServer);
         Test("HTTP resolver работает без Firefox SOCKS DNS", InternalHttpResolverWithoutFirefoxDns);
         Test("HTTP resolver использует системный DNS без Firefox SOCKS", HttpResolverUsesSystemDns);
         Test("HTTP resolver сохраняет Host обычного HTTP", InternalHttpResolverPlainHttp);
@@ -1996,6 +2009,565 @@ internal sealed partial class SelfTestRunner
         try { WebResolverMappingPlan.Build(server); }
         catch (InvalidOperationException ex) { rejected = ex.Message.Contains("Основной", StringComparison.Ordinal); }
         Equal(true, rejected);
+    }
+
+    private static void SharedWebResolverFlatNetwork()
+    {
+        var targetServer = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Целевой сервер",
+            Host = "10.0.0.1",
+            WebInterfaces =
+            [
+                new() { Name = "Основная панель", Url = "https://panel.corp.local/", ResolverAddress = "" }
+            ]
+        };
+        var peerServer = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Соседний сервер",
+            Host = "10.0.0.2",
+            WebInterfaces =
+            [
+                new() { Name = "Панель узла", Url = "https://panel.corp.local/", ResolverAddress = "10.0.0.50" },
+                new() { Name = "База данных", Url = "https://db.corp.local:9000/", ResolverAddress = "10.0.0.60" }
+            ]
+        };
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [targetServer, peerServer]
+        };
+
+        var mappings = WebResolverMappingPlan.Build(config, targetServer);
+        Equal(2, mappings.Count);
+        var panelMapping = mappings.FirstOrDefault(m => m.Key == "panel.corp.local");
+        var dbMapping = mappings.FirstOrDefault(m => m.Key == "db.corp.local");
+        Equal("10.0.0.50", panelMapping.Value);
+        Equal("10.0.0.60", dbMapping.Value);
+    }
+
+    private static void SharedWebResolverTargetPriority()
+    {
+        var targetServer = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Целевой сервер",
+            Host = "10.0.0.1",
+            WebInterfaces =
+            [
+                new() { Name = "Своя панель", Url = "https://app.test/", ResolverAddress = "10.0.0.10" }
+            ]
+        };
+        var peerServer = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Соседний сервер",
+            Host = "10.0.0.2",
+            WebInterfaces =
+            [
+                new() { Name = "Чужая панель", Url = "https://app.test/", ResolverAddress = "10.0.0.99" }
+            ]
+        };
+        var config = new ManagerConfig { UngroupedServers = [targetServer, peerServer] };
+
+        var mappings = WebResolverMappingPlan.Build(config, targetServer);
+        Equal(1, mappings.Count);
+        Equal("app.test", mappings[0].Key);
+        Equal("10.0.0.10", mappings[0].Value);
+    }
+
+    private static void SharedWebResolverRouteHopPrecedence()
+    {
+        var target = new ManagedServer { Id = Guid.NewGuid(), Name = "Target", Host = "10.0.0.1" };
+        var hop = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "HopServer",
+            Host = "10.0.0.2",
+            WebInterfaces = [new() { Name = "HopService", Url = "https://service.internal/", ResolverAddress = "10.10.10.1" }]
+        };
+        var other = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "OtherServer",
+            Host = "10.0.0.3",
+            WebInterfaces = [new() { Name = "OtherService", Url = "https://service.internal/", ResolverAddress = "10.20.20.2" }]
+        };
+        var config = new ManagerConfig { UngroupedServers = [target, hop, other] };
+
+        var mappings = WebResolverMappingPlan.Build(config, target, routeHopServerIds: [hop.Id]);
+        Equal(1, mappings.Count);
+        Equal("service.internal", mappings[0].Key);
+        Equal("10.10.10.1", mappings[0].Value);
+    }
+
+    private static void SharedWebResolverGatewayAndProxyIsolation()
+    {
+        var gw1 = new ManagedServer { Id = Guid.NewGuid(), Name = "GW1", Host = "10.1.0.1" };
+        var gw2 = new ManagedServer { Id = Guid.NewGuid(), Name = "GW2", Host = "10.2.0.1" };
+
+        var serverA = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerA",
+            Host = "10.1.0.10",
+            RequiredPreviousServerId = gw1.Id,
+            WebInterfaces =
+            [
+                new() { Name = "A-App", Url = "https://internal.test/", ResolverAddress = "10.1.0.100" },
+                new() { Name = "A-Only", Url = "https://a-only.test/", ResolverAddress = "10.1.0.101" }
+            ]
+        };
+        var serverB = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerB",
+            Host = "10.1.0.20",
+            RequiredPreviousServerId = gw1.Id,
+            WebInterfaces =
+            [
+                new() { Name = "B-Shared", Url = "https://b-shared.test/", ResolverAddress = "10.1.0.200" }
+            ]
+        };
+        var serverC = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerC",
+            Host = "10.2.0.30",
+            RequiredPreviousServerId = gw2.Id,
+            WebInterfaces =
+            [
+                new() { Name = "C-App", Url = "https://internal.test/", ResolverAddress = "10.2.0.100" },
+                new() { Name = "C-Only", Url = "https://c-only.test/", ResolverAddress = "10.2.0.101" }
+            ]
+        };
+
+        var proxy1 = new BaseProxy { Id = Guid.NewGuid(), Name = "Proxy1", Host = "127.0.0.1", Port = 1081 };
+        var proxy2 = new BaseProxy { Id = Guid.NewGuid(), Name = "Proxy2", Host = "127.0.0.1", Port = 1082 };
+
+        var serverP1 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerP1",
+            Host = "172.16.1.10",
+            PreferredProxyId = proxy1.Id,
+            WebInterfaces = [new() { Name = "P1-App", Url = "https://proxy-app.test/", ResolverAddress = "172.16.1.1" }]
+        };
+        var serverP2 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerP2",
+            Host = "172.16.2.20",
+            PreferredProxyId = proxy2.Id,
+            WebInterfaces = [new() { Name = "P2-App", Url = "https://proxy-app.test/", ResolverAddress = "172.16.2.2" }]
+        };
+
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [gw1, gw2, serverA, serverB, serverC, serverP1, serverP2],
+            BaseProxies = [proxy1, proxy2]
+        };
+
+        var mappingsA = WebResolverMappingPlan.Build(config, serverA);
+        var mapA = mappingsA.ToDictionary(m => m.Key, m => m.Value);
+        Equal("10.1.0.100", mapA["internal.test"]);
+        Equal("10.1.0.101", mapA["a-only.test"]);
+        Equal("10.1.0.200", mapA["b-shared.test"]);
+        Equal(false, mapA.ContainsKey("c-only.test"));
+        Equal(false, mapA.ContainsKey("proxy-app.test"));
+
+        var mappingsP1 = WebResolverMappingPlan.Build(config, serverP1, proxyId: proxy1.Id);
+        var mapP1 = mappingsP1.ToDictionary(m => m.Key, m => m.Value);
+        Equal(1, mapP1.Count);
+        Equal("172.16.1.1", mapP1["proxy-app.test"]);
+    }
+
+    private static void SharedWebResolverAmbiguousConflictExclusion()
+    {
+        var target = new ManagedServer { Id = Guid.NewGuid(), Name = "Target", Host = "10.0.0.1" };
+        var s1 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S1",
+            Host = "10.0.0.2",
+            WebInterfaces = [new() { Name = "ConflictApp", Url = "https://conflict.local/", ResolverAddress = "10.0.0.10" }]
+        };
+        var s2 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S2",
+            Host = "10.0.0.3",
+            WebInterfaces = [new() { Name = "ConflictApp", Url = "https://conflict.local/", ResolverAddress = "10.0.0.20" }]
+        };
+        var s3 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S3",
+            Host = "10.0.0.4",
+            WebInterfaces = [new() { Name = "AgreedApp", Url = "https://agreed.local/", ResolverAddress = "10.0.0.30" }]
+        };
+        var s4 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S4",
+            Host = "10.0.0.5",
+            WebInterfaces = [new() { Name = "AgreedApp", Url = "https://agreed.local/", ResolverAddress = "10.0.0.30" }]
+        };
+
+        var config = new ManagerConfig { UngroupedServers = [target, s1, s2, s3, s4] };
+        var mappings = WebResolverMappingPlan.Build(config, target);
+        Equal(1, mappings.Count);
+        Equal("agreed.local", mappings[0].Key);
+        Equal("10.0.0.30", mappings[0].Value);
+        Equal(false, mappings.Any(m => m.Key == "conflict.local"));
+    }
+
+    private static void SharedWebResolverForeignInvalidIpSafety()
+    {
+        var target = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Target",
+            Host = "10.0.0.1",
+            WebInterfaces = [new() { Name = "Valid", Url = "https://valid.test/", ResolverAddress = "10.0.0.5" }]
+        };
+        var foreign = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ForeignBad",
+            Host = "10.0.0.2",
+            WebInterfaces =
+            [
+                new() { Name = "BadIp", Url = "https://bad.test/", ResolverAddress = "not-an-ip-address" },
+                new() { Name = "GoodForeign", Url = "https://good.test/", ResolverAddress = "10.0.0.6" }
+            ]
+        };
+        var config = new ManagerConfig { UngroupedServers = [target, foreign] };
+
+        var mappings = WebResolverMappingPlan.Build(config, target);
+        Equal(2, mappings.Count);
+        Equal("good.test", mappings[0].Key);
+        Equal("10.0.0.6", mappings[0].Value);
+        Equal("valid.test", mappings[1].Key);
+        Equal("10.0.0.5", mappings[1].Value);
+
+        target.WebInterfaces[0].ResolverAddress = "invalid-target-ip";
+        var rejected = false;
+        try { WebResolverMappingPlan.Build(config, target); }
+        catch (InvalidOperationException ex) { rejected = ex.Message.Contains("Valid", StringComparison.Ordinal); }
+        Equal(true, rejected);
+    }
+
+    private static void SharedWebResolverDeterministicOrdering()
+    {
+        var target = new ManagedServer { Id = Guid.NewGuid(), Name = "Target", Host = "10.0.0.1" };
+        var s1 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S1",
+            Host = "10.0.0.2",
+            WebInterfaces = [new() { Name = "Zeta", Url = "https://zeta.test/", ResolverAddress = "10.0.0.1" }]
+        };
+        var s2 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S2",
+            Host = "10.0.0.3",
+            WebInterfaces = [new() { Name = "Alpha", Url = "https://alpha.test/", ResolverAddress = "10.0.0.2" }]
+        };
+        var s3 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "S3",
+            Host = "10.0.0.4",
+            WebInterfaces = [new() { Name = "Beta", Url = "https://beta.test/", ResolverAddress = "10.0.0.3" }]
+        };
+
+        var configForward = new ManagerConfig { UngroupedServers = [target, s1, s2, s3] };
+        var configReverse = new ManagerConfig { UngroupedServers = [s3, s2, s1, target] };
+
+        var res1 = WebResolverMappingPlan.Build(configForward, target);
+        var res2 = WebResolverMappingPlan.Build(configReverse, target);
+
+        Equal(3, res1.Count);
+        Equal(3, res2.Count);
+        for (var i = 0; i < 3; i++)
+        {
+            Equal(res1[i].Key, res2[i].Key);
+            Equal(res1[i].Value, res2[i].Value);
+        }
+        Equal("alpha.test", res1[0].Key);
+        Equal("beta.test", res1[1].Key);
+        Equal("zeta.test", res1[2].Key);
+    }
+
+    private static void SharedWebResolverEndToEndRelay()
+    {
+        var target = new ManagedServer { Id = Guid.NewGuid(), Name = "Target", Host = "10.0.0.1" };
+        var peer = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "Peer",
+            Host = "10.0.0.2",
+            WebInterfaces = [new() { Name = "RemoteApp", Url = "https://remote-service.internal/", ResolverAddress = "192.0.2.77" }]
+        };
+        var config = new ManagerConfig { UngroupedServers = [target, peer] };
+        var mappings = WebResolverMappingPlan.Build(config, target);
+
+        var observed = ExerciseResolvingRelayAsync(
+            mappings, "REMOTE-SERVICE.INTERNAL.", "GET /api HTTP/1.1\r\nHost: remote-service.internal\r\n\r\n")
+            .GetAwaiter().GetResult();
+
+        Equal((byte)0x01, observed.Type);
+        Equal("192.0.2.77", observed.Host);
+        Equal("GET /api HTTP/1.1\r\nHost: remote-service.internal\r\n\r\n", observed.Payload);
+    }
+
+    private static void SharedWebResolverReverseLinkIsolation()
+    {
+        var proxy1 = new BaseProxy { Id = Guid.NewGuid(), Name = "Proxy1", Host = "127.0.0.1", Port = 1081 };
+        var proxy2 = new BaseProxy { Id = Guid.NewGuid(), Name = "Proxy2", Host = "127.0.0.1", Port = 1082 };
+
+        var targetA = new ManagedServer { Id = Guid.NewGuid(), Name = "TargetA", Host = "10.1.0.1", PreferredProxyId = proxy1.Id };
+        var peerC = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "PeerC",
+            Host = "10.1.0.2",
+            PreferredProxyId = proxy1.Id,
+            WebInterfaces = [new() { Name = "App", Url = "https://conflict.domain/", ResolverAddress = "10.1.1.1" }]
+        };
+        var foreignB = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ForeignB",
+            Host = "10.2.0.2",
+            PreferredProxyId = proxy2.Id,
+            WebInterfaces = [new() { Name = "App", Url = "https://conflict.domain/", ResolverAddress = "10.2.2.2" }]
+        };
+
+        // Only reverse link B -> A is confirmed
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [targetA, peerC, foreignB],
+            BaseProxies = [proxy1, proxy2],
+            Links = [new() { FromServerId = foreignB.Id, ToServerId = targetA.Id, LastSuccessUtc = DateTimeOffset.UtcNow }]
+        };
+
+        // B's conflicting mapping must NOT override C's mapping
+        var mappings = WebResolverMappingPlan.Build(config, targetA, proxyId: proxy1.Id);
+        Equal(1, mappings.Count);
+        Equal("conflict.domain", mappings[0].Key);
+        Equal("10.1.1.1", mappings[0].Value);
+
+        // Adding directed link A -> B enables the override
+        config.Links.Add(new() { FromServerId = targetA.Id, ToServerId = foreignB.Id, LastSuccessUtc = DateTimeOffset.UtcNow });
+        var mappingsWithDirected = WebResolverMappingPlan.Build(config, targetA, proxyId: proxy1.Id);
+        Equal(1, mappingsWithDirected.Count);
+        Equal("conflict.domain", mappingsWithDirected[0].Key);
+        Equal("10.2.2.2", mappingsWithDirected[0].Value);
+    }
+
+    private static void SharedWebResolverUnopenedSourceWithGateway()
+    {
+        var gw1 = new ManagedServer { Id = Guid.NewGuid(), Name = "GW1", Host = "10.1.0.1" };
+        var gw2 = new ManagedServer { Id = Guid.NewGuid(), Name = "GW2", Host = "10.2.0.1" };
+        var proxy1 = new BaseProxy { Id = Guid.NewGuid(), Name = "Proxy1", Host = "127.0.0.1", Port = 1081 };
+
+        var targetA = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "TargetA",
+            Host = "10.1.0.10",
+            RequiredPreviousServerId = gw1.Id,
+            PreferredProxyId = proxy1.Id
+        };
+        var unopenedB = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "UnopenedB",
+            Host = "10.1.0.20",
+            RequiredPreviousServerId = gw1.Id,
+            PreferredProxyId = null,
+            PreferredRoute = null,
+            WebInterfaces = [new() { Name = "Shared", Url = "https://unopened.corp/", ResolverAddress = "10.1.0.55" }]
+        };
+        var differentC = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "DifferentC",
+            Host = "10.2.0.30",
+            RequiredPreviousServerId = gw2.Id,
+            PreferredProxyId = null,
+            PreferredRoute = null,
+            WebInterfaces = [new() { Name = "Other", Url = "https://other-gw.corp/", ResolverAddress = "10.2.0.55" }]
+        };
+
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [gw1, gw2, targetA, unopenedB, differentC],
+            BaseProxies = [proxy1]
+        };
+
+        var mappings = WebResolverMappingPlan.Build(config, targetA, proxyId: proxy1.Id);
+        var map = mappings.ToDictionary(m => m.Key, m => m.Value);
+        Equal(true, map.ContainsKey("unopened.corp"));
+        Equal("10.1.0.55", map["unopened.corp"]);
+        Equal(false, map.ContainsKey("other-gw.corp"));
+    }
+
+    private static void SharedWebResolverNestedGatewayActiveHops()
+    {
+        var serverH = new ManagedServer { Id = Guid.NewGuid(), Name = "ServerH", Host = "10.0.0.1" };
+        var serverG = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerG",
+            Host = "10.0.0.2",
+            RequiredPreviousServerId = serverH.Id,
+            WebInterfaces = [new() { Name = "NestedApp", Url = "https://nested.local/", ResolverAddress = "10.0.0.20" }]
+        };
+        var serverT = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "ServerT",
+            Host = "10.0.0.3",
+            RequiredPreviousServerId = serverG.Id
+        };
+        var unrelatedU = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "UnrelatedU",
+            Host = "10.0.0.4",
+            WebInterfaces = [new() { Name = "NestedApp", Url = "https://nested.local/", ResolverAddress = "10.0.0.99" }]
+        };
+
+        var config = new ManagerConfig { UngroupedServers = [serverH, serverG, serverT, unrelatedU] };
+
+        var mappings = WebResolverMappingPlan.Build(config, serverT, routeHopServerIds: [serverH.Id, serverG.Id, serverT.Id]);
+        Equal(1, mappings.Count);
+        Equal("nested.local", mappings[0].Key);
+        Equal("10.0.0.20", mappings[0].Value);
+    }
+
+    private static void SharedWebResolverGatewayOutgoingLink()
+    {
+        var proxyP = new BaseProxy { Id = Guid.NewGuid(), Name = "ProxyP", Host = "127.0.0.1", Port = 1081 };
+        var proxyOther = new BaseProxy { Id = Guid.NewGuid(), Name = "ProxyOther", Host = "127.0.0.1", Port = 1082 };
+
+        var gatewayG = new ManagedServer { Id = Guid.NewGuid(), Name = "GatewayG", Host = "10.0.0.1" };
+        var gatewayG2 = new ManagedServer { Id = Guid.NewGuid(), Name = "GatewayG2", Host = "10.0.0.2" };
+        var targetT = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "TargetT",
+            Host = "10.0.0.10",
+            RequiredPreviousServerId = gatewayG.Id,
+            PreferredProxyId = proxyP.Id
+        };
+        var candidateS = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "CandidateS",
+            Host = "10.0.0.20",
+            RequiredPreviousServerId = null,
+            WebInterfaces = [new() { Name = "OutgoingService", Url = "https://outgoing.local/", ResolverAddress = "10.0.0.50" }]
+        };
+
+        var linkTS = new ServerLink
+        {
+            FromServerId = targetT.Id,
+            ToServerId = candidateS.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        LinkStatisticsPolicy.Remember(linkTS, proxyP.Id, DateTimeOffset.UtcNow, 15.0, "direct");
+
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [gatewayG, gatewayG2, targetT, candidateS],
+            BaseProxies = [proxyP, proxyOther],
+            Links = [linkTS]
+        };
+
+        // Confirmed directed link T -> S exists with compatible proxy evidence: S is included (candReq is null)
+        var mappings = WebResolverMappingPlan.Build(config, targetT, proxyId: proxyP.Id);
+        Equal(1, mappings.Count);
+        Equal("outgoing.local", mappings[0].Key);
+        Equal("10.0.0.50", mappings[0].Value);
+
+        // Also test when candidate S requires a different gateway G2: confirmed link T -> S still admits S
+        candidateS.RequiredPreviousServerId = gatewayG2.Id;
+        var mappingsDifferentGateway = WebResolverMappingPlan.Build(config, targetT, proxyId: proxyP.Id);
+        Equal(1, mappingsDifferentGateway.Count);
+        Equal("outgoing.local", mappingsDifferentGateway[0].Key);
+        Equal("10.0.0.50", mappingsDifferentGateway[0].Value);
+
+        // If link proxy evidence is incompatible (for a different proxy), S is excluded
+        LinkStatisticsPolicy.Clear(linkTS);
+        LinkStatisticsPolicy.Remember(linkTS, proxyOther.Id, DateTimeOffset.UtcNow, 15.0, "direct");
+        var mappingsIncompatibleProxy = WebResolverMappingPlan.Build(config, targetT, proxyId: proxyP.Id);
+        Equal(0, mappingsIncompatibleProxy.Count);
+
+        // If link is removed entirely, S is excluded
+        config.Links.Clear();
+        var mappingsNoLink = WebResolverMappingPlan.Build(config, targetT, proxyId: proxyP.Id);
+        Equal(0, mappingsNoLink.Count);
+    }
+
+    private static void SharedWebResolverActiveJumpHostStartupServer()
+    {
+        var jh1 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "JumpHost1",
+            Host = "10.1.0.1",
+            WebInterfaces = [new() { Name = "JH1-Panel", Url = "https://jh1.internal/", ResolverAddress = "10.1.0.1" }]
+        };
+        var jh2 = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "JumpHost2",
+            Host = "10.2.0.1",
+            WebInterfaces = [new() { Name = "JH2-Panel", Url = "https://jh2.internal/", ResolverAddress = "10.2.0.1" }]
+        };
+
+        var proxy1 = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "Proxy1",
+            Host = "127.0.0.1",
+            Port = 1081,
+            StartupServerId = jh1.Id
+        };
+        var proxy2 = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "Proxy2",
+            Host = "127.0.0.1",
+            Port = 1082,
+            StartupServerId = jh2.Id
+        };
+
+        var targetT = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "TargetT",
+            Host = "10.1.0.10",
+            PreferredProxyId = proxy1.Id
+        };
+
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [jh1, jh2, targetT],
+            BaseProxies = [proxy1, proxy2]
+        };
+
+        var mappings = WebResolverMappingPlan.Build(config, targetT, proxyId: proxy1.Id);
+        var map = mappings.ToDictionary(m => m.Key, m => m.Value);
+        Equal(true, map.ContainsKey("jh1.internal"));
+        Equal("10.1.0.1", map["jh1.internal"]);
+        Equal(false, map.ContainsKey("jh2.internal"));
     }
 
     private static void InternalHttpResolverWithoutFirefoxDns()
