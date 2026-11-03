@@ -2170,7 +2170,26 @@ public partial class MainWindow : Window
             if (liveServer is null || !liveServer.WebInterfaces.Any(w => w.Id == webId))
                 return;
 
-            route = await Connect(serverSnapshot, cancellationToken, true, routeConfig: configSnapshot);
+            var webSsh = new SshConnectionService
+            {
+                Timeout = TimeSpan.FromSeconds(configSnapshot.ConnectionTimeoutSeconds),
+                EndpointProbeTimeout = TimeSpan.FromSeconds(configSnapshot.EndpointProbeTimeoutSeconds),
+                HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, cancellationToken),
+                HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, cancellationToken),
+                Trace = traceEvent =>
+                {
+                    var logMessage = $"SSH stage={traceEvent.Stage}; subject={traceEvent.Subject}; status={traceEvent.Status}" +
+                                     (traceEvent.Error is null ? "" : "; exceptions=" + string.Join(" --> ", ExceptionChain(traceEvent.Error).Select(item => $"{item.GetType().Name}: {item.Message}")));
+                    if (Dispatcher.HasShutdownStarted) return;
+                    _ = Dispatcher.BeginInvoke(() =>
+                    {
+                        RouteLog(logMessage);
+                        Status(FormatSshStatus(traceEvent));
+                    });
+                }
+            };
+
+            route = await Connect(serverSnapshot, cancellationToken, true, routeConfig: configSnapshot, sshService: webSsh);
 
             var routeHops = route.Hops.Select(h => h.ServerId).ToList();
             var proxyId = serverSnapshot.PreferredRoute?.ProxyId ?? route.Target.PreferredRoute?.ProxyId;
@@ -2964,7 +2983,12 @@ public partial class MainWindow : Window
                 item.PreviousServerId == hopContext.PreviousServerId);
             var effectiveEndpoint = snapshotPref?.Endpoint ??
                 (i < probeResult.Route.Hops.Count ? new ServerEndpoint(probeResult.Route.Hops[i].Host, probeResult.Route.Hops[i].Port) : null);
-            if (effectiveEndpoint is not null)
+            var hasInitial = initFingerprints.TryGetValue(hop.Id, out var initial);
+            var isHostPortCurrent = hasInitial
+                ? string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) && initial.Port == liveHop.Port
+                : string.Equals(hop.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) && hop.Port == liveHop.Port;
+
+            if (effectiveEndpoint is not null && isHostPortCurrent)
             {
                 var livePref = liveHop.EndpointPreferences.FirstOrDefault(item =>
                     item.ProxyId == hopContext.ProxyId &&
@@ -2984,9 +3008,8 @@ public partial class MainWindow : Window
             }
 
             if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
-                initFingerprints.TryGetValue(hop.Id, out var initial) &&
-                string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) &&
-                initial.Port == liveHop.Port &&
+                hasInitial &&
+                isHostPortCurrent &&
                 string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? "", StringComparison.Ordinal))
             {
                 liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
@@ -3035,16 +3058,24 @@ public partial class MainWindow : Window
                             probeConfig, candidate, probe.Token, true);
                         SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
+                        var liveServer = config.FindServer(server.Id) ?? server;
+                        if (initialFingerprints.TryGetValue(server.Id, out var initial) &&
+                            (!string.Equals(initial.Host, liveServer.Host, StringComparison.OrdinalIgnoreCase) ||
+                             initial.Port != liveServer.Port))
+                        {
+                            RouteLog($"Fallback probe discarded for {server.Name}: host/port changed during probe");
+                            return;
+                        }
                         // Success! Clear fallback and save the preferred route.
-                        server.LastOriginalSessionFallbackUtc = null;
-                        server.PreferredRoute = RoutePreferencePolicy.FromSuccess(
+                        liveServer.LastOriginalSessionFallbackUtc = null;
+                        liveServer.PreferredRoute = RoutePreferencePolicy.FromSuccess(
                             candidate, result.Duration, DateTimeOffset.UtcNow);
                         if (!candidate.WithoutProxy)
                             AccessGrantPolicy.RememberSuccessfulRoute(config, candidate.Proxy.Id,
                                 candidate.Servers.Select(item => item.Id), DateTimeOffset.UtcNow);
                         SaveConfig();
-                        RouteLog($"Fallback probe success: target={server.Name}; route={RouteLabel(candidate)}; will use managed route next time");
-                        Status($"Для «{server.Name}» снова доступен управляемый маршрут");
+                        RouteLog($"Fallback probe success: target={liveServer.Name}; route={RouteLabel(candidate)}; will use managed route next time");
+                        Status($"Для «{liveServer.Name}» снова доступен управляемый маршрут");
                         return;
                     }
                     catch (Exception ex)
@@ -3098,14 +3129,22 @@ public partial class MainWindow : Window
                             probeConfig, candidate, probe.Token, true);
                         SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
-                        if (!RoutePreferencePolicy.CanCommitBackgroundResult(
-                                server.PreferredRoute, current, candidate))
+                        var liveServer = config.FindServer(server.Id) ?? server;
+                        if (initialFingerprints.TryGetValue(server.Id, out var initial) &&
+                            (!string.Equals(initial.Host, liveServer.Host, StringComparison.OrdinalIgnoreCase) ||
+                             initial.Port != liveServer.Port))
+                        {
+                            RouteLog($"Background route recovery discarded for {server.Name}: host/port changed during probe");
                             return;
-                        server.PreferredRoute = RoutePreferencePolicy.FromSuccess(
+                        }
+                        if (!RoutePreferencePolicy.CanCommitBackgroundResult(
+                                liveServer.PreferredRoute, current, candidate))
+                            return;
+                        liveServer.PreferredRoute = RoutePreferencePolicy.FromSuccess(
                             candidate, result.Duration, DateTimeOffset.UtcNow);
                         SaveConfig();
-                        RouteLog($"Background route recovery: target={server.Name}; recovered={RouteLabel(candidate)}");
-                        Status($"Для «{server.Name}» снова доступен более быстрый маршрут");
+                        RouteLog($"Background route recovery: target={liveServer.Name}; recovered={RouteLabel(candidate)}");
+                        Status($"Для «{liveServer.Name}» снова доступен более быстрый маршрут");
                         return;
                     }
                     catch (Exception ex)
@@ -3178,13 +3217,21 @@ public partial class MainWindow : Window
                             probeConfig, candidate, probe.Token, true);
                         SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
-                        if (server.TryDirectWithoutJumphost &&
-                            IsProvenDirectWithoutJumphost(server)) return;
-                        server.PreferredRoute = RoutePreferencePolicy.FromSuccess(
+                        var liveServer = config.FindServer(server.Id) ?? server;
+                        if (initialFingerprints.TryGetValue(server.Id, out var initial) &&
+                            (!string.Equals(initial.Host, liveServer.Host, StringComparison.OrdinalIgnoreCase) ||
+                             initial.Port != liveServer.Port))
+                        {
+                            RouteLog($"Background direct probe discarded for {server.Name}: host/port changed during probe");
+                            return;
+                        }
+                        if (liveServer.TryDirectWithoutJumphost &&
+                            IsProvenDirectWithoutJumphost(liveServer)) return;
+                        liveServer.PreferredRoute = RoutePreferencePolicy.FromSuccess(
                             candidate, result.Duration, DateTimeOffset.UtcNow);
                         SaveConfig();
-                        RouteLog($"Background direct probe: target={server.Name}; direct confirmed={RouteLabel(candidate)}");
-                        Status($"Для «{server.Name}» подтверждён прямой доступ — дальше будет использоваться он");
+                        RouteLog($"Background direct probe: target={liveServer.Name}; direct confirmed={RouteLabel(candidate)}");
+                        Status($"Для «{liveServer.Name}» подтверждён прямой доступ — дальше будет использоваться он");
                         return;
                     }
                     catch (Exception ex)

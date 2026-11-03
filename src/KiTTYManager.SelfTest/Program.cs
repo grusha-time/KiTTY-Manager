@@ -249,6 +249,7 @@ internal sealed partial class SelfTestRunner
         Test("Web resolver включает не открывавшиеся ранее источники с совместимым шлюзом", SharedWebResolverUnopenedSourceWithGateway);
         Test("Web resolver включает вложенные обязательные шлюзы из активного маршрута", SharedWebResolverNestedGatewayActiveHops);
         Test("Web resolver учитывает подтверждённую прямую связь при наличии шлюза цели", SharedWebResolverGatewayOutgoingLink);
+        Test("Web resolver исключает связи исключительно через JumpHost при прямом подключении", SharedWebResolverDirectConnectionExcludesJumpHostOnlyLinks);
         Test("Web resolver включает сопоставления управляемого JumpHost активного прокси", SharedWebResolverActiveJumpHostStartupServer);
         Test("HTTP resolver работает без Firefox SOCKS DNS", InternalHttpResolverWithoutFirefoxDns);
         Test("HTTP resolver использует системный DNS без Firefox SOCKS", HttpResolverUsesSystemDns);
@@ -2514,6 +2515,70 @@ internal sealed partial class SelfTestRunner
         config.Links.Clear();
         var mappingsNoLink = WebResolverMappingPlan.Build(config, targetT, proxyId: proxyP.Id);
         Equal(0, mappingsNoLink.Count);
+    }
+
+    private static void SharedWebResolverDirectConnectionExcludesJumpHostOnlyLinks()
+    {
+        var jumpHostProxy = new BaseProxy
+        {
+            Id = Guid.NewGuid(),
+            Name = "JumpHostProxy",
+            Host = "127.0.0.1",
+            Port = 1080
+        };
+        var targetT = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "DirectTarget",
+            Host = "192.168.1.10",
+            PreferredProxyId = jumpHostProxy.Id,
+            WebInterfaces = [new() { Name = "DirectWeb", Url = "https://target.local/", ResolverAddress = "192.168.1.10" }]
+        };
+        var isolatedS = new ManagedServer
+        {
+            Id = Guid.NewGuid(),
+            Name = "IsolatedServer",
+            Host = "10.0.0.50",
+            PreferredProxyId = jumpHostProxy.Id,
+            WebInterfaces = [new() { Name = "IsolatedWeb", Url = "https://isolated.local/", ResolverAddress = "10.0.0.50" }]
+        };
+        var linkTS = new ServerLink
+        {
+            FromServerId = targetT.Id,
+            ToServerId = isolatedS.Id,
+            LastSuccessUtc = DateTimeOffset.UtcNow
+        };
+        // Link only verified through JumpHost
+        LinkStatisticsPolicy.Remember(linkTS, jumpHostProxy.Id, DateTimeOffset.UtcNow, 15.0, "direct");
+
+        var config = new ManagerConfig
+        {
+            UngroupedServers = [targetT, isolatedS],
+            BaseProxies = [jumpHostProxy],
+            Links = [linkTS]
+        };
+
+        // When target has PreferredProxyId = jumpHostProxy.Id, an explicit direct context (proxyId: Guid.Empty)
+        // must override PreferredProxyId and exclude JumpHost-only links.
+        var mappings = WebResolverMappingPlan.Build(config, targetT, proxyId: Guid.Empty);
+        Equal(1, mappings.Count);
+        Equal("target.local", mappings[0].Key);
+
+        // When PreferredProxyId is cleared, omitting proxyId (null) also defaults to direct and excludes JumpHost-only links.
+        targetT.PreferredProxyId = null;
+        var mappingsNullProxy = WebResolverMappingPlan.Build(config, targetT);
+        Equal(1, mappingsNullProxy.Count);
+        Equal("target.local", mappingsNullProxy[0].Key);
+
+        // If link has direct context evidence (Guid.Empty), it is included
+        LinkStatisticsPolicy.Remember(linkTS, Guid.Empty, DateTimeOffset.UtcNow, 5.0, "direct");
+        var mappingsDirectLink = WebResolverMappingPlan.Build(config, targetT, proxyId: Guid.Empty);
+        Equal(2, mappingsDirectLink.Count);
+
+        // If link has no proxy evidence at all (legacy link), it is also included for compatibility
+        LinkStatisticsPolicy.Clear(linkTS);
+        var mappingsLegacyLink = WebResolverMappingPlan.Build(config, targetT, proxyId: Guid.Empty);
+        Equal(2, mappingsLegacyLink.Count);
     }
 
     private static void SharedWebResolverActiveJumpHostStartupServer()

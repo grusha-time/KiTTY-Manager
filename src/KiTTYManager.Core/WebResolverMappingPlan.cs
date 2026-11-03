@@ -40,8 +40,8 @@ public static class WebResolverMappingPlan
         }
 
         var activeHops = routeHopServerIds != null ? new HashSet<Guid>(routeHopServerIds) : [];
-        var effectiveTargetProxyId = (proxyId.HasValue && proxyId.Value != Guid.Empty)
-            ? proxyId.Value
+        var effectiveTargetProxyId = proxyId.HasValue
+            ? (proxyId.Value != Guid.Empty ? proxyId.Value : (Guid?)null)
             : (targetServer.PreferredProxyId is { } pId && pId != Guid.Empty
                 ? pId
                 : (targetServer.PreferredRoute?.ProxyId is { } rId && rId != Guid.Empty ? rId : (Guid?)null));
@@ -64,8 +64,8 @@ public static class WebResolverMappingPlan
         bool IsLinkCompatibleWithTargetProxy(ServerLink link)
         {
             if (link.LastSuccessUtc is null) return false;
-            if (!targetUsesProxy) return true;
-            return LinkStatisticsPolicy.ForProxy(link, effectiveTargetProxyId!.Value) is not null ||
+            var targetContextProxyId = effectiveTargetProxyId ?? Guid.Empty;
+            return LinkStatisticsPolicy.ForProxy(link, targetContextProxyId) is not null ||
                    !LinkStatisticsPolicy.HasProxyEvidence(link);
         }
 

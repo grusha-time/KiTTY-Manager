@@ -742,6 +742,22 @@ internal sealed partial class SelfTestRunner
         Equal(true, ContainsUncommentedCode(syncBackgroundBody, "probeConfig.Links"));
         Equal(true, ContainsUncommentedCode(syncBackgroundBody, "if (liveLink is null) continue;"));
         Equal(false, ContainsUncommentedCode(syncBackgroundBody, "config.Links.Add(liveLink)"));
+        Equal(true, ContainsUncommentedCode(syncBackgroundBody, "isHostPortCurrent"));
+        Equal(true, ContainsUncommentedCode(syncBackgroundBody, "if (effectiveEndpoint is not null && isHostPortCurrent)"));
+        Equal(true, ContainsUncommentedCode(syncBackgroundBody, "ServerEndpointPolicy.Remember(liveHop, effectiveEndpoint, hopContext);"));
+
+        var openWebBody = ExtractMethodBody(csText, "async Task OpenSelectedWebAsync(");
+        Equal(true, ContainsUncommentedCode(openWebBody, "HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, cancellationToken)"));
+        Equal(true, ContainsUncommentedCode(openWebBody, "HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, cancellationToken)"));
+        Equal(true, ContainsUncommentedCode(openWebBody, "sshService: webSsh"));
+
+        Equal(true, ContainsUncommentedCode(directProbeBody, "if (initialFingerprints.TryGetValue(server.Id, out var initial) &&"));
+        Equal(true, ContainsUncommentedCode(directProbeBody, "(!string.Equals(initial.Host, liveServer.Host, StringComparison.OrdinalIgnoreCase) ||"));
+        Equal(true, ContainsUncommentedCode(directProbeBody, "initial.Port != liveServer.Port))"));
+        Equal(true, ContainsUncommentedCode(directProbeBody, "liveServer.PreferredRoute = RoutePreferencePolicy.FromSuccess("));
+        var directProbeGuardIdx = directProbeBody.IndexOf("host/port changed during probe", StringComparison.Ordinal);
+        var directProbeCommitIdx = directProbeBody.IndexOf("liveServer.PreferredRoute = RoutePreferencePolicy.FromSuccess", StringComparison.Ordinal);
+        Equal(true, directProbeGuardIdx > 0 && directProbeGuardIdx < directProbeCommitIdx);
 
         var importBody = ExtractMethodBody(csText, "void ImportConfig_Click(");
         var rollbackBody = ExtractMethodBody(csText, "void RollbackLastImport(");
@@ -987,6 +1003,54 @@ internal sealed partial class SelfTestRunner
                                     listenerA.Stop();
                                     listenerExt.Stop();
                                 }
+                            }
+
+                            var syncMethod = mainWindowType.GetMethod("SyncBackgroundProbeHops",
+                                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                            if (syncMethod is not null)
+                            {
+                                var srvId = Guid.NewGuid();
+                                var liveServerObj = new ManagedServer
+                                {
+                                    Id = srvId, Name = "Srv1", Host = "10.0.0.1", Port = 22,
+                                    HostKeyFingerprint = "OLD_FP"
+                                };
+                                var testCfg = new ManagerConfig { UngroupedServers = [liveServerObj], BaseProxies = [], Links = [] };
+                                configField?.SetValue(instance, testCfg);
+
+                                var initFps = new Dictionary<Guid, (string Host, int Port, string Fingerprint)>
+                                {
+                                    [srvId] = (Host: "10.0.0.1", Port: 22, Fingerprint: "OLD_FP")
+                                };
+                                var hopObj = new ManagedServer
+                                {
+                                    Id = srvId, Name = "Srv1", Host = "10.0.0.1", Port = 22,
+                                    HostKeyFingerprint = "NEW_FP", HostKeyAlgorithm = "ssh-ed25519",
+                                    EndpointPreferences = [new EndpointPreference { ProxyId = Guid.Empty, Endpoint = new ServerEndpoint("10.0.0.1", 22), LastSuccessUtc = DateTimeOffset.UtcNow }]
+                                };
+                                var candidateObj = new RouteCandidate(new BaseProxy { Id = Guid.Empty }, [hopObj]);
+                                var routeObj = new ActiveRoute(hopObj, 0, 0, "Direct", null, [], [new RouteHop(srvId, "Srv1", "10.0.0.1", 22)]);
+                                var probeResultObj = (Route: routeObj, Candidate: candidateObj, Duration: TimeSpan.FromMilliseconds(50));
+
+                                // Case A1: User changed live port during probe -> SyncBackgroundProbeHops must NOT update liveServerObj
+                                liveServerObj.Port = 2222;
+                                syncMethod.Invoke(instance, [probeResultObj, initFps, testCfg]);
+                                Equal(0, liveServerObj.EndpointPreferences.Count);
+                                Equal("OLD_FP", liveServerObj.HostKeyFingerprint);
+
+                                // Case A2: User changed live host during probe -> SyncBackgroundProbeHops must NOT update liveServerObj
+                                liveServerObj.Port = 22;
+                                liveServerObj.Host = "10.0.0.99";
+                                syncMethod.Invoke(instance, [probeResultObj, initFps, testCfg]);
+                                Equal(0, liveServerObj.EndpointPreferences.Count);
+                                Equal("OLD_FP", liveServerObj.HostKeyFingerprint);
+
+                                // Case B: Host and port match initial -> updates applied
+                                liveServerObj.Host = "10.0.0.1";
+                                liveServerObj.Port = 22;
+                                syncMethod.Invoke(instance, [probeResultObj, initFps, testCfg]);
+                                Equal(1, liveServerObj.EndpointPreferences.Count);
+                                Equal("NEW_FP", liveServerObj.HostKeyFingerprint);
                             }
                         }
                     }
@@ -2079,7 +2143,12 @@ internal sealed partial class SelfTestRunner
                 var snapshotPref = hop.EndpointPreferences.FirstOrDefault(item =>
                     item.ProxyId == hopContext.ProxyId &&
                     item.PreviousServerId == hopContext.PreviousServerId);
-                if (snapshotPref is not null)
+                var hasInitial = probeInitFingerprints.TryGetValue(hop.Id, out var initial);
+                var isHostPortCurrent = hasInitial
+                    ? string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) && initial.Port == liveHop.Port
+                    : string.Equals(hop.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) && hop.Port == liveHop.Port;
+
+                if (snapshotPref is not null && isHostPortCurrent)
                 {
                     ServerEndpointPolicy.Remember(liveHop, snapshotPref.Endpoint, hopContext);
                     var updatedPref = liveHop.EndpointPreferences.FirstOrDefault(item =>
@@ -2089,9 +2158,8 @@ internal sealed partial class SelfTestRunner
                         updatedPref.LastSuccessUtc = snapshotPref.LastSuccessUtc;
                 }
                 if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
-                    probeInitFingerprints.TryGetValue(hop.Id, out var initial) &&
-                    string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) &&
-                    initial.Port == liveHop.Port &&
+                    hasInitial &&
+                    isHostPortCurrent &&
                     string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? "", StringComparison.Ordinal))
                 {
                     liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
@@ -2105,6 +2173,42 @@ internal sealed partial class SelfTestRunner
             Equal(4096, probeLiveHop.HostKeyBits);
             Equal(1, probeLiveHop.EndpointPreferences.Count);
             Equal(proxyId, probeLiveHop.EndpointPreferences[0].ProxyId);
+
+            // Stale probe test: if user changed Host or Port during probe, results must not overwrite
+            probeLiveHop.Port = 2222;
+            probeLiveHop.EndpointPreferences.Clear();
+            probeLiveHop.HostKeyFingerprint = "ORIGINAL_KEY";
+
+            for (var i = 0; i < 1; i++)
+            {
+                var hop = probeHopServer;
+                var liveHop = probeLiveConfig.FindServer(hop.Id);
+                if (liveHop is null) continue;
+                var hopContext = EndpointContext.Direct(proxyId);
+                var snapshotPref = hop.EndpointPreferences.FirstOrDefault(item =>
+                    item.ProxyId == hopContext.ProxyId &&
+                    item.PreviousServerId == hopContext.PreviousServerId);
+                var hasInitial = probeInitFingerprints.TryGetValue(hop.Id, out var initial);
+                var isHostPortCurrent = hasInitial
+                    ? string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) && initial.Port == liveHop.Port
+                    : string.Equals(hop.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) && hop.Port == liveHop.Port;
+
+                if (snapshotPref is not null && isHostPortCurrent)
+                {
+                    ServerEndpointPolicy.Remember(liveHop, snapshotPref.Endpoint, hopContext);
+                }
+                if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
+                    hasInitial &&
+                    isHostPortCurrent &&
+                    string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? "", StringComparison.Ordinal))
+                {
+                    liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
+                }
+            }
+            // Preferences and host key must NOT be updated when port changed
+            Equal(0, probeLiveHop.EndpointPreferences.Count);
+            Equal("ORIGINAL_KEY", probeLiveHop.HostKeyFingerprint);
+            probeLiveHop.Port = 22; // restore port for remaining tests
 
             // Remark 2: SyncBackgroundProbeHops does not recreate deleted links
             var linkFromId = probeHopId;
