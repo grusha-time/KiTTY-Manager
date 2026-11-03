@@ -519,6 +519,7 @@ internal sealed partial class SelfTestRunner
         Test("Умное массовое добавление: журнал не раскрывает пароли", DiscoveryLoggingRedactionTests);
         Test("Умное массовое добавление: предпросмотр конфига до создания сессий", SmartDiscoveryPreviewConfigTests);
         Test("Умное массовое добавление: расширения Issue #26", SmartDiscoveryIssue26EnhancementsTests);
+        Test("Неблокирующее открытие SSH-сессий и точек входа", NonBlockingSessionOpeningTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {

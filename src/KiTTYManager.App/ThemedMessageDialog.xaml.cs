@@ -37,6 +37,61 @@ public partial class ThemedMessageDialog : Window
         return dialog.result;
     }
 
+    public static async Task<MessageBoxResult> ShowModelessAsync(Window? owner, string message, string title,
+        MessageBoxButton buttons = MessageBoxButton.OK, MessageBoxImage image = MessageBoxImage.None,
+        CancellationToken cancellationToken = default)
+    {
+        var dispatcher = owner?.Dispatcher ?? WpfApplication.Current?.Dispatcher;
+        if (dispatcher is not null && !dispatcher.CheckAccess())
+        {
+            return await dispatcher.InvokeAsync(() => ShowModelessAsync(owner, message, title, buttons, image, cancellationToken)).Task.Unwrap();
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var dialog = new ThemedMessageDialog(message, title, buttons, image);
+        owner ??= WpfApplication.Current?.MainWindow;
+        if (owner is { IsLoaded: true } && !ReferenceEquals(owner, dialog)) dialog.Owner = owner;
+
+        var tcs = new TaskCompletionSource<MessageBoxResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnClosed(object? sender, EventArgs e)
+        {
+            tcs.TrySetResult(dialog.result);
+        }
+
+        dialog.Closed += OnClosed;
+
+        CancellationTokenRegistration registration = default;
+        if (cancellationToken.CanBeCanceled)
+        {
+            registration = cancellationToken.Register(() =>
+            {
+                _ = dialog.Dispatcher.InvokeAsync(() =>
+                {
+                    try
+                    {
+                        if (dialog.IsLoaded) dialog.Close();
+                    }
+                    catch { }
+                    tcs.TrySetCanceled(cancellationToken);
+                });
+            });
+        }
+
+        dialog.Show();
+
+        try
+        {
+            return await tcs.Task;
+        }
+        finally
+        {
+            registration.Dispose();
+            dialog.Closed -= OnClosed;
+        }
+    }
+
     public static ThemedDialogChoice ShowChoice(Window? owner, string message, string title,
         string primaryText, string secondaryText, MessageBoxImage image = MessageBoxImage.Question,
         ThemedDialogChoice cancelChoice = ThemedDialogChoice.Primary)
@@ -103,9 +158,14 @@ public partial class ThemedMessageDialog : Window
             IsCancel = cancel
         };
         if (primary) button.SetResourceReference(StyleProperty, "PrimaryButton");
-        button.Click += (_, _) => { result = buttonResult; DialogResult = true; };
+        button.Click += (_, _) =>
+        {
+            result = buttonResult;
+            try { DialogResult = true; } catch (InvalidOperationException) { Close(); }
+        };
         ButtonsPanel.Children.Add(button);
     }
+
 
     private static MediaBrush BrushFrom(string value) => (MediaBrush)new BrushConverter().ConvertFromString(value)!;
 }

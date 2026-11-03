@@ -52,7 +52,12 @@ public partial class MainWindow : Window
     private SmartDiscoveryWindow? smartDiscoveryWindow;
     private readonly TunnelService tunnelService;
     private readonly Dictionary<Guid, QuickDuplicateDialog> quickDuplicateWindows = [];
+    private readonly Dictionary<Guid, SavedLinksDialog> savedLinksWindows = [];
     private bool batchExitPending;
+    private readonly HashSet<(Guid ServerId, Guid? ForcedViaServerId)> pendingSessionOpenings = [];
+    private CancellationTokenSource sessionCts = new();
+    private bool sessionExitPending;
+    private bool sessionExitCompleted;
     private bool configAvailable = true;
     private RequiredRouteOption[] requiredRouteOptions = [];
     private RequiredRouteOption? selectedRequiredRouteOption;
@@ -1308,35 +1313,84 @@ public partial class MainWindow : Window
     }
 
     private void OpenOriginalSession_Click(object sender, RoutedEventArgs e) => OpenOriginalSession();
-    private void OpenOriginalSession(ManagedServer? requestedServer = null)
+    private void OpenOriginalSession(ManagedServer? requestedServer = null, bool nonModal = false)
     {
         var server = requestedServer ?? SelectedRow()?.Server ?? selectedServer; if (server is null) return;
-        if (string.IsNullOrWhiteSpace(server.SourceSessionPath) || !File.Exists(server.SourceSessionPath)) { Warn("Это не импортированная сессия KiTTY. Используйте «Подключиться» либо укажите сервер вручную."); return; }
+        _ = OpenOriginalSessionAsync(server, nonModal);
+    }
+
+    private async Task OpenOriginalSessionAsync(ManagedServer requestedServer, bool nonModal = false, CancellationToken cancellationToken = default)
+    {
+        var server = requestedServer;
         try
         {
-            var kitty = FindKittyNearSession(server.SourceSessionPath) ?? ResolveProgram(config.KittyPath);
-            KittyLoginScript? loginScript = null;
-            try
+            var (success, missingFile) = await Task.Run(() =>
             {
-                loginScript = KittyLoginScript.Create(server);
-                var startInfo = new ProcessStartInfo(kitty)
+                if (string.IsNullOrWhiteSpace(server.SourceSessionPath) || !File.Exists(server.SourceSessionPath))
                 {
-                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
-                    WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
-                };
-                foreach (var argument in KittyLaunchPlan.OriginalSessionArguments(server, loginScript?.Path))
-                    startInfo.ArgumentList.Add(argument);
-                Process.Start(startInfo);
-                if (loginScript is not null)
-                {
-                    PreserveTemporaryFile(loginScript.Path);
-                    loginScript = null;
+                    return (false, true);
                 }
+                var kitty = FindKittyNearSession(server.SourceSessionPath) ?? ResolveProgram(config.KittyPath);
+                KittyLoginScript? loginScript = null;
+                try
+                {
+                    loginScript = KittyLoginScript.Create(server);
+                    var startInfo = new ProcessStartInfo(kitty)
+                    {
+                        WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                        WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
+                    };
+                    foreach (var argument in KittyLaunchPlan.OriginalSessionArguments(server, loginScript?.Path))
+                        startInfo.ArgumentList.Add(argument);
+
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var process = Process.Start(startInfo);
+                    if (process is null)
+                    {
+                        throw new InvalidOperationException("Не удалось запустить процесс KiTTY.");
+                    }
+                    if (loginScript is not null)
+                    {
+                        PreserveTemporaryFile(loginScript.Path);
+                        loginScript = null;
+                    }
+                    return (true, false);
+                }
+                finally { loginScript?.Dispose(); }
+            }, cancellationToken);
+
+            if (missingFile)
+            {
+                if (nonModal)
+                {
+                    Status("Это не импортированная сессия KiTTY. Используйте «Подключиться» либо укажите сервер вручную.");
+                    RouteLog("OpenOriginalSession: not an imported session or file missing");
+                }
+                else
+                {
+                    Warn("Это не импортированная сессия KiTTY. Используйте «Подключиться» либо укажите сервер вручную.");
+                }
+                return;
             }
-            finally { loginScript?.Dispose(); }
+
             Log($"Открыта исходная сессия KiTTY: {server.Name}");
         }
-        catch (Exception ex) { Error(ex); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            if (nonModal)
+            {
+                RouteLog($"Ошибка открытия исходной сессии KiTTY «{server.Name}»: {ex.Message}");
+                Status($"Ошибка открытия сессии «{server.Name}»: {ex.Message}");
+            }
+            else
+            {
+                Error(ex);
+            }
+        }
     }
 
     private static string? FindKittyNearSession(string sessionPath)
@@ -1443,209 +1497,470 @@ public partial class MainWindow : Window
         ManagerConfig? routeConfig = null, bool persist = true, bool enableBackgroundProbing = true,
         IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
-        if (BlockIfOperationRunning()) return;
-        if (server.UsePam && string.IsNullOrWhiteSpace(server.PamSshCommand))
+        if (sessionExitPending || sessionExitCompleted) return;
+        var openingKey = (server.Id, forcedViaServerId);
+        if (!pendingSessionOpenings.Add(openingKey))
         {
-            Warn("Для сессии с PAM-авторизацией необходимо указать SSH-команду PAM.");
+            Status($"Подключение к «{server.Name}» уже выполняется…");
             return;
         }
-        if (server.UsePam)
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(sessionCts.Token, externalCancellationToken);
+        var cancellationToken = linkedCts.Token;
+
+        var snapshotConfig = routeConfig ?? ConfigTransfer.CloneSnapshot(config);
+        var snapshotServer = snapshotConfig.FindServer(server.Id);
+        if (snapshotServer is null)
         {
-            ssh.ClearFailureCache();
-            await BusyAsync("Строю SSH-маршрут с PAM-авторизацией…", async cancellationToken =>
+            pendingSessionOpenings.Remove(openingKey);
+            RouteLog($"OpenRoutedConsoleAsync: server not found in configuration: {server.Name} ({server.Id})");
+            Status($"Сессия «{server.Name}» не найдена в конфигурации.");
+            return;
+        }
+
+        var openingSsh = new SshConnectionService
+        {
+            Timeout = TimeSpan.FromSeconds(snapshotConfig.ConnectionTimeoutSeconds),
+            EndpointProbeTimeout = TimeSpan.FromSeconds(snapshotConfig.EndpointProbeTimeoutSeconds),
+            HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, cancellationToken),
+            HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, cancellationToken),
+            Trace = traceEvent =>
             {
-                var jumpHostCandidates = ResolveJumpHostCandidates(server, forcedViaServerId, routeConfig);
+                var logMessage = $"SSH stage={traceEvent.Stage}; subject={traceEvent.Subject}; status={traceEvent.Status}" +
+                                 (traceEvent.Error is null ? "" : "; exceptions=" + string.Join(" --> ", ExceptionChain(traceEvent.Error).Select(item => $"{item.GetType().Name}: {item.Message}")));
+                if (Dispatcher.HasShutdownStarted) return;
+                _ = Dispatcher.BeginInvoke(() =>
+                {
+                    RouteLog(logMessage);
+                    Status(FormatSshStatus(traceEvent));
+                });
+            }
+        };
+
+        try
+        {
+            if (snapshotServer.UsePam)
+            {
+                if (string.IsNullOrWhiteSpace(snapshotServer.PamSshCommand))
+                {
+                    Status("Для сессии с PAM-авторизацией необходимо указать SSH-команду PAM.");
+                    RouteLog($"PAM launch rejected: empty PAM SSH command for {snapshotServer.Name}");
+                    return;
+                }
+
+                Status("Строю SSH-маршрут с PAM-авторизацией…");
+                var jumpHostCandidates = ResolveJumpHostCandidates(snapshotServer, forcedViaServerId, snapshotConfig);
                 ActiveRoute? route = null;
                 ManagedServer? connectedJumpHost = null;
                 BaseProxy? connectedProxy = null;
                 RouteCandidate? connectedCandidate = null;
                 Exception? lastException = null;
+                var handedOff = false;
 
-                foreach (var item in jumpHostCandidates)
+                try
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var jumpHostKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(item.JumpHost.PrivateKeyPath, "SSH-ключ");
-                    if (ManagerPathResolver.MissingConfiguredFileMessage(item.JumpHost.PrivateKeyPath, "SSH-ключ") is { } missingJumpHostKeyMessage)
+                    foreach (var item in jumpHostCandidates)
                     {
-                        RouteLog($"JumpHost {item.JumpHost.Name} skipped: {missingJumpHostKeyMessage}");
-                        continue;
-                    }
-                    var jumpHostKey = PrivateKeyInspector.Inspect(jumpHostKeyPath ?? "");
-                    if (jumpHostKey.Encrypted == true && item.JumpHost.PrivateKeyPassphrase.Length == 0)
-                    {
-                        RouteLog($"JumpHost {item.JumpHost.Name} skipped: required encrypted key passphrase is empty");
-                        continue;
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var (jumpHostKeyPath, missingJumpHostKeyMessage, jumpHostKey) = await Task.Run(() =>
+                        {
+                            var resolved = ManagerPathResolver.ResolveOptionalExistingFile(item.JumpHost.PrivateKeyPath, "SSH-ключ");
+                            var missing = ManagerPathResolver.MissingConfiguredFileMessage(item.JumpHost.PrivateKeyPath, "SSH-ключ");
+                            var inspected = PrivateKeyInspector.Inspect(resolved ?? "");
+                            return (resolved, missing, inspected);
+                        }, cancellationToken);
+                        if (missingJumpHostKeyMessage is not null)
+                        {
+                            RouteLog($"JumpHost {item.JumpHost.Name} skipped: {missingJumpHostKeyMessage}");
+                            continue;
+                        }
+                        if (jumpHostKey.Encrypted == true && item.JumpHost.PrivateKeyPassphrase.Length == 0)
+                        {
+                            RouteLog($"JumpHost {item.JumpHost.Name} skipped: required encrypted key passphrase is empty");
+                            continue;
+                        }
+
+                        try
+                        {
+                            Status($"Подключаюсь к JumpHost «{item.JumpHost.Name}»…");
+                            route = await Connect(item.JumpHost, cancellationToken, true,
+                                routeConfig: snapshotConfig, sshService: openingSsh, persist: persist, enableBackgroundProbing: enableBackgroundProbing);
+                            connectedJumpHost = item.JumpHost;
+                            connectedProxy = item.Proxy;
+                            connectedCandidate = item.Candidate;
+                            break;
+                        }
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            lastException = ex;
+                            RouteLog($"Connect to JumpHost {item.JumpHost.Name} failed: {ex.Message}");
+                        }
                     }
 
+                    if (route is null || connectedJumpHost is null)
+                    {
+                        throw new InvalidOperationException(
+                            $"Не удалось подключиться ни к одному JumpHost для PAM-авторизации сессии «{snapshotServer.Name}».", lastException);
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Synchronized safe TOTP window check for JumpHost proxy and PAM TOTP
+                    while (true)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var now = DateTimeOffset.UtcNow;
+                        var needDelaySeconds = 0;
+
+                        if (connectedProxy is not null && connectedProxy.StartupServerId == connectedJumpHost.Id && connectedProxy.TotpSecret.Length > 0)
+                        {
+                            var jhPeriod = Math.Max(1, connectedProxy.TotpPeriodSeconds);
+                            var jhRemaining = jhPeriod - (now.ToUnixTimeSeconds() % jhPeriod);
+                            if (jhRemaining < PamLoginPlan.SafeMargin(jhPeriod))
+                                needDelaySeconds = Math.Max(needDelaySeconds, (int)jhRemaining + 1);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(snapshotServer.PamTotpSecret))
+                        {
+                            var pamPeriod = snapshotServer.PamTotpPeriodSeconds >= 1 ? snapshotServer.PamTotpPeriodSeconds : 30;
+                            var pamRemaining = pamPeriod - (now.ToUnixTimeSeconds() % pamPeriod);
+                            if (pamRemaining < PamLoginPlan.SafeMargin(pamPeriod))
+                                needDelaySeconds = Math.Max(needDelaySeconds, (int)pamRemaining + 1);
+                        }
+
+                        if (needDelaySeconds == 0)
+                            break;
+
+                        Status($"Ожидание безопасного окна TOTP ({needDelaySeconds} с)…");
+                        await Task.Delay(TimeSpan.FromSeconds(needDelaySeconds), cancellationToken);
+                    }
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    Process? process = null;
+                    KittyRoutedSession? routedSession = null;
+                    KittyLoginScript? loginScript = null;
+                    string? sessionLogPath = null;
                     try
                     {
-                        Status($"Подключаюсь к JumpHost «{item.JumpHost.Name}»…");
-                        route = await Connect(item.JumpHost, cancellationToken, true, routeConfig: routeConfig, persist: persist, enableBackgroundProbing: enableBackgroundProbing);
-                        connectedJumpHost = item.JumpHost;
-                        connectedProxy = item.Proxy;
-                        connectedCandidate = item.Candidate;
-                        break;
+                        var directEndpoint = route.CanDetachDirectConsole
+                            ? route.Hops.Single()
+                            : null;
+                        var needsJhOtp = connectedProxy is not null && connectedProxy.StartupServerId == connectedJumpHost.Id && connectedProxy.TotpSecret.Length > 0;
+                        var needsPamOtp = snapshotServer.UsePam && !string.IsNullOrWhiteSpace(snapshotServer.PamTotpSecret);
+
+                        var (startedProc, createdRouted, createdScript, logPath, wasSavedSessionLoaded) = await Task.Run(() =>
+                        {
+                            var loadSavedSession = !string.IsNullOrWhiteSpace(connectedJumpHost.SourceSessionPath) &&
+                                                   File.Exists(connectedJumpHost.SourceSessionPath);
+                            var kitty = loadSavedSession
+                                ? FindKittyNearSession(connectedJumpHost.SourceSessionPath!) ?? ResolveProgram(snapshotConfig.KittyPath)
+                                : ResolveProgram(snapshotConfig.KittyPath);
+                            KittyRoutedSession? routed = null;
+                            KittyLoginScript? script = null;
+                            try
+                            {
+                                if (loadSavedSession)
+                                    routed = directEndpoint is null
+                                        ? KittyRoutedSession.Create(
+                                            connectedJumpHost.SourceSessionPath!, route.LocalSshPort, "",
+                                            true, maximize: snapshotConfig.MaximizeKittyWindows, server: connectedJumpHost)
+                                        : KittyRoutedSession.CreateDirect(
+                                            connectedJumpHost.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
+                                            "", true, maximize: snapshotConfig.MaximizeKittyWindows, server: connectedJumpHost);
+                                else
+                                    routed = directEndpoint is null
+                                        ? KittyRoutedSession.CreateMinimal(
+                                            "127.0.0.1", route.LocalSshPort, "",
+                                            true, maximize: snapshotConfig.MaximizeKittyWindows, server: connectedJumpHost)
+                                        : KittyRoutedSession.CreateMinimal(
+                                            directEndpoint.Host, directEndpoint.Port, "",
+                                            true, maximize: snapshotConfig.MaximizeKittyWindows, server: connectedJumpHost);
+
+                                var steps = PamLoginPlan.BuildPromptResponses(snapshotServer, connectedJumpHost, DateTimeOffset.UtcNow, connectedProxy);
+                                script = KittyLoginScript.Create(steps);
+
+                                string? innerLogPath = null;
+                                if (needsJhOtp || needsPamOtp)
+                                {
+                                    innerLogPath = Path.Combine(Path.GetTempPath(), $"kitty-manager-jh-otp-{Guid.NewGuid():N}.log");
+                                }
+
+                                var startInfo = new ProcessStartInfo(kitty)
+                                {
+                                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                                    WindowStyle = snapshotConfig.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
+                                };
+                                var shouldUseSavedSession = routed is not null;
+                                var arguments = directEndpoint is null
+                                    ? KittyLaunchPlan.PamRoutedConsoleArguments(
+                                        snapshotServer, connectedJumpHost, route.LocalSshPort, shouldUseSavedSession,
+                                        routed?.Path, script?.Path)
+                                    : KittyLaunchPlan.PamDirectConsoleArguments(
+                                        snapshotServer, connectedJumpHost, directEndpoint.Host, directEndpoint.Port,
+                                        shouldUseSavedSession, routed?.Path, script?.Path);
+                                foreach (var argument in arguments)
+                                    startInfo.ArgumentList.Add(argument);
+                                if (innerLogPath is not null)
+                                {
+                                    startInfo.ArgumentList.Add("-sessionlog");
+                                    startInfo.ArgumentList.Add(innerLogPath);
+                                }
+                                cancellationToken.ThrowIfCancellationRequested();
+                                var proc = Process.Start(startInfo)
+                                    ?? throw new InvalidOperationException("Не удалось запустить процесс KiTTY.");
+                                return (proc, routed, script, innerLogPath, loadSavedSession);
+                            }
+                            catch
+                            {
+                                routed?.Dispose();
+                                script?.Dispose();
+                                throw;
+                            }
+                        }, cancellationToken);
+
+                        process = startedProc;
+                        routedSession = createdRouted;
+                        loginScript = createdScript;
+                        sessionLogPath = logPath;
+
+                        RouteLog($"KiTTY PAM launch: target={snapshotServer.Name}; via={connectedJumpHost.Name}; " +
+                                 $"local=127.0.0.1:{route.LocalSshPort}; loghost={connectedJumpHost.Host}:{connectedJumpHost.Port}; " +
+                                 $"saved-session={wasSavedSessionLoaded}; login-script={(loginScript is not null ? "present" : "none")}; " +
+                                 $"jh-otp-log={(sessionLogPath is not null ? "present" : "none")}");
+
+                        handedOff = true;
+                        lastRouteDisplays[snapshotServer.Id] = $"Использован маршрут: PAM через {connectedJumpHost.Name}";
+                        if (directEndpoint is not null)
+                        {
+                            ReleaseRoute(route);
+                            RouteLog($"Direct KiTTY console detached from manager: target={connectedJumpHost.Name}; " +
+                                     $"endpoint={directEndpoint.Host}:{directEndpoint.Port}");
+                        }
+
+                        if (routedSession is not null)
+                        {
+                            var cleanup = routedSession;
+                            routedSession = null;
+                            _ = Task.Run(async () =>
+                            {
+                                await Task.Delay(TimeSpan.FromSeconds(10));
+                                cleanup.Dispose();
+                            });
+                        }
+                        if (loginScript is not null)
+                        {
+                            PreserveTemporaryFile(loginScript.Path);
+                            loginScript = null;
+                        }
+
+                        if (sessionLogPath is not null)
+                        {
+                            KittyWindowInput.SpawnDetachedLogCleanupWatcher(process, sessionLogPath);
+
+                            var consumedOffset = 0;
+                            if (needsJhOtp)
+                            {
+                                var jhPrompt = string.IsNullOrWhiteSpace(connectedProxy!.TotpPrompt) ? "OTP" : connectedProxy.TotpPrompt.Trim();
+                                consumedOffset = await KittyWindowInput.SendLineAfterPromptAsync(
+                                    process, sessionLogPath, jhPrompt,
+                                    () => TotpGenerator.Generate(connectedProxy.TotpSecret, DateTimeOffset.UtcNow,
+                                        connectedProxy.TotpDigits, connectedProxy.TotpPeriodSeconds, connectedProxy.TotpAlgorithm),
+                                    TimeSpan.FromSeconds(20), cancellationToken);
+                            }
+
+                            if (needsPamOtp)
+                            {
+                                var pamPrompt = string.IsNullOrWhiteSpace(snapshotServer.PamTotpPrompt) ? "OTP" : snapshotServer.PamTotpPrompt.Trim();
+                                var pamCommand = snapshotServer.PamSshCommand.Trim();
+                                var pamResult = await KittyWindowInput.SendLineAfterPromptAsync(
+                                    process, sessionLogPath, pamPrompt,
+                                    () => TotpGenerator.Generate(snapshotServer.PamTotpSecret, DateTimeOffset.UtcNow,
+                                        snapshotServer.PamTotpDigits, snapshotServer.PamTotpPeriodSeconds, snapshotServer.PamTotpAlgorithm),
+                                    TimeSpan.FromSeconds(30), cancellationToken,
+                                    optional: true,
+                                    minOffset: consumedOffset,
+                                    progressionCheck: text => text.Contains(pamCommand, StringComparison.OrdinalIgnoreCase)
+                                        || text.Contains("exec sh -c", StringComparison.OrdinalIgnoreCase),
+                                    completionCheck: text => KittyWindowInput.IsActiveShellPrompt(text, snapshotServer.ShellPrompt));
+
+                                if (pamResult.Sent)
+                                    RouteLog("PAM OTP: код подтверждения успешно передан.");
+                                else
+                                    RouteLog("PAM OTP: запрос OTP не поступил от сервера; продолжено без ввода OTP.");
+                            }
+                        }
+
+                        Log($"Открыта сессия «{snapshotServer.Name}» с PAM-авторизацией через «{connectedJumpHost.Name}»");
                     }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    finally
                     {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        lastException = ex;
-                        RouteLog($"Connect to JumpHost {item.JumpHost.Name} failed: {ex.Message}");
+                        if (sessionLogPath is not null)
+                        {
+                            KittyWindowInput.CleanTemporaryLogOnExit(process, sessionLogPath);
+                        }
+                        routedSession?.Dispose();
+                        loginScript?.Dispose();
                     }
                 }
-
-                if (route is null || connectedJumpHost is null)
+                finally
                 {
-                    throw new InvalidOperationException(
-                        $"Не удалось подключиться ни к одному JumpHost для PAM-авторизации сессии «{server.Name}».", lastException);
+                    if (!handedOff && route is not null)
+                    {
+                        ReleaseRoute(route);
+                    }
                 }
+                return;
+            }
 
-                cancellationToken.ThrowIfCancellationRequested();
+            var (keyPath, missingKeyMessage, key, hasSourceSessionFile) = await Task.Run(() =>
+            {
+                var resolved = ManagerPathResolver.ResolveOptionalExistingFile(snapshotServer.PrivateKeyPath, "SSH-ключ");
+                var missing = ManagerPathResolver.MissingConfiguredFileMessage(snapshotServer.PrivateKeyPath, "SSH-ключ");
+                var inspected = PrivateKeyInspector.Inspect(resolved ?? "");
+                var sourceSessionExists = !string.IsNullOrWhiteSpace(snapshotServer.SourceSessionPath) &&
+                                          File.Exists(snapshotServer.SourceSessionPath);
+                return (resolved, missing, inspected, sourceSessionExists);
+            }, cancellationToken);
+            if (missingKeyMessage is not null)
+            {
+                Status(missingKeyMessage);
+                RouteLog($"Private key missing for {snapshotServer.Name}: {missingKeyMessage}");
+                return;
+            }
+            if (key.Encrypted == true && snapshotServer.PrivateKeyPassphrase.Length == 0)
+            {
+                if (hasSourceSessionFile)
+                {
+                    var choice = await ThemedMessageDialog.ShowModelessAsync(this,
+                        "Для автоматической SSH-аутентификации нужен пароль зашифрованного ключа. Он не хранится в исходной сессии KiTTY.\n\nОткрыть сохранённую сессию напрямую и ввести пароль ключа в штатном окне KiTTY?",
+                        "Зашифрованный SSH-ключ", MessageBoxButton.YesNo, MessageBoxImage.Information, cancellationToken);
+                    if (choice == MessageBoxResult.Yes)
+                    {
+                        await OpenOriginalSessionAsync(snapshotServer, nonModal: true, cancellationToken);
+                        return;
+                    }
+                }
+                Status("Введите пароль ключа в поле «Пароль ключа» и сохраните изменения либо откройте исходную сессию KiTTY напрямую.");
+                RouteLog($"Encrypted key check failed for {snapshotServer.Name}: passphrase missing");
+                return;
+            }
 
-                // Synchronized safe TOTP window check for JumpHost proxy and PAM TOTP
-                while (true)
+            Status("Строю SSH-маршрут…");
+            ActiveRoute? nonPamRoute = null;
+            var nonPamHandedOff = false;
+            try
+            {
+                try
+                {
+                    nonPamRoute = await Connect(snapshotServer, cancellationToken, true, forcedViaServerId,
+                        routeConfig: snapshotConfig, sshService: openingSsh, persist: persist, enableBackgroundProbing: enableBackgroundProbing,
+                        explicitCandidates: explicitCandidates);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (InvalidOperationException ex) when (
+                    ex.Message.StartsWith("Не найден рабочий маршрут.", StringComparison.Ordinal) &&
+                    forcedViaServerId is null &&
+                    hasSourceSessionFile)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    var now = DateTimeOffset.UtcNow;
-                    var needDelaySeconds = 0;
-
-                    if (connectedProxy is not null && connectedProxy.StartupServerId == connectedJumpHost.Id && connectedProxy.TotpSecret.Length > 0)
+                    RouteLog($"Managed routes exhausted: target={snapshotServer.Name}; fallback=original-session; error={ex.Message}");
+                    Status($"Управляемые маршруты недоступны. Открываю исходную сессию KiTTY «{snapshotServer.Name}»…");
+                    snapshotServer.LastOriginalSessionFallbackUtc = DateTimeOffset.UtcNow;
+                    if (persist)
                     {
-                        var jhPeriod = Math.Max(1, connectedProxy.TotpPeriodSeconds);
-                        var jhRemaining = jhPeriod - (now.ToUnixTimeSeconds() % jhPeriod);
-                        if (jhRemaining < PamLoginPlan.SafeMargin(jhPeriod))
-                            needDelaySeconds = Math.Max(needDelaySeconds, (int)jhRemaining + 1);
+                        var liveTarget = config.FindServer(snapshotServer.Id);
+                        if (liveTarget is not null &&
+                            string.Equals(liveTarget.Host, snapshotServer.Host, StringComparison.OrdinalIgnoreCase) &&
+                            liveTarget.Port == snapshotServer.Port)
+                        {
+                            liveTarget.LastOriginalSessionFallbackUtc = snapshotServer.LastOriginalSessionFallbackUtc;
+                        }
+                        SaveConfig();
                     }
-
-                    if (!string.IsNullOrWhiteSpace(server.PamTotpSecret))
-                    {
-                        var pamPeriod = server.PamTotpPeriodSeconds >= 1 ? server.PamTotpPeriodSeconds : 30;
-                        var pamRemaining = pamPeriod - (now.ToUnixTimeSeconds() % pamPeriod);
-                        if (pamRemaining < PamLoginPlan.SafeMargin(pamPeriod))
-                            needDelaySeconds = Math.Max(needDelaySeconds, (int)pamRemaining + 1);
-                    }
-
-                    if (needDelaySeconds == 0)
-                        break;
-
-                    Status($"Ожидание безопасного окна TOTP ({needDelaySeconds} с)…");
-                    await Task.Delay(TimeSpan.FromSeconds(needDelaySeconds), cancellationToken);
+                    await OpenOriginalSessionAsync(snapshotServer, nonModal: true, cancellationToken);
+                    return;
                 }
-
                 cancellationToken.ThrowIfCancellationRequested();
-
-                var loadSavedSession = !string.IsNullOrWhiteSpace(connectedJumpHost.SourceSessionPath) &&
-                                       File.Exists(connectedJumpHost.SourceSessionPath);
-                var kitty = loadSavedSession
-                    ? FindKittyNearSession(connectedJumpHost.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
-                    : ResolveProgram(config.KittyPath);
+                var loadSavedSession = hasSourceSessionFile;
                 Process? process = null;
                 KittyRoutedSession? routedSession = null;
                 KittyLoginScript? loginScript = null;
-                string? sessionLogPath = null;
                 try
                 {
-                    var directEndpoint = route.CanDetachDirectConsole
-                        ? route.Hops.Single()
+                    var directEndpoint = nonPamRoute.CanDetachDirectConsole
+                        ? nonPamRoute.Hops.Single()
                         : null;
-                    if (loadSavedSession)
-                        routedSession = directEndpoint is null
-                            ? KittyRoutedSession.Create(
-                                connectedJumpHost.SourceSessionPath!, route.LocalSshPort, null,
-                                true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost)
-                            : KittyRoutedSession.CreateDirect(
-                                connectedJumpHost.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
-                                null, true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost);
-                    else
-                        routedSession = directEndpoint is null
-                            ? KittyRoutedSession.CreateMinimal(
-                                "127.0.0.1", route.LocalSshPort, null,
-                                true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost)
-                            : KittyRoutedSession.CreateMinimal(
-                                directEndpoint.Host, directEndpoint.Port, null,
-                                true, maximize: config.MaximizeKittyWindows, server: connectedJumpHost);
 
-                    var steps = PamLoginPlan.BuildPromptResponses(server, connectedJumpHost, DateTimeOffset.UtcNow, connectedProxy);
-                    loginScript = KittyLoginScript.Create(steps);
-
-                    var needsJhOtp = connectedProxy is not null && connectedProxy.StartupServerId == connectedJumpHost.Id && connectedProxy.TotpSecret.Length > 0;
-                    var needsPamOtp = server.UsePam && !string.IsNullOrWhiteSpace(server.PamTotpSecret);
-
-                    if (needsJhOtp || needsPamOtp)
+                    var (startedProc, createdRouted, createdScript) = await Task.Run(() =>
                     {
-                        sessionLogPath = Path.Combine(Path.GetTempPath(), $"kitty-manager-jh-otp-{Guid.NewGuid():N}.log");
-                    }
-
-                    var startInfo = new ProcessStartInfo(kitty)
-                    {
-                        WorkingDirectory = Path.GetDirectoryName(kitty)!,
-                        WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
-                    };
-                    var shouldUseSavedSession = routedSession is not null;
-                    var arguments = directEndpoint is null
-                        ? KittyLaunchPlan.PamRoutedConsoleArguments(
-                            server, connectedJumpHost, route.LocalSshPort, shouldUseSavedSession,
-                            routedSession?.Path, loginScript?.Path)
-                        : KittyLaunchPlan.PamDirectConsoleArguments(
-                            server, connectedJumpHost, directEndpoint.Host, directEndpoint.Port,
-                            shouldUseSavedSession, routedSession?.Path, loginScript?.Path);
-                    foreach (var argument in arguments)
-                        startInfo.ArgumentList.Add(argument);
-                    if (sessionLogPath is not null)
-                    {
-                        startInfo.ArgumentList.Add("-sessionlog");
-                        startInfo.ArgumentList.Add(sessionLogPath);
-                    }
-                    RouteLog($"KiTTY PAM launch: target={server.Name}; via={connectedJumpHost.Name}; " +
-                             $"local=127.0.0.1:{route.LocalSshPort}; loghost={connectedJumpHost.Host}:{connectedJumpHost.Port}; " +
-                             $"saved-session={loadSavedSession}; login-script={(loginScript is not null ? "present" : "none")}; " +
-                             $"jh-otp-log={(sessionLogPath is not null ? "present" : "none")}");
-                    process = Process.Start(startInfo);
-                    if (process is not null && sessionLogPath is not null)
-                    {
-                        KittyWindowInput.SpawnDetachedLogCleanupWatcher(process, sessionLogPath);
-
-                        var consumedOffset = 0;
-                        if (needsJhOtp)
+                        var kitty = loadSavedSession
+                            ? FindKittyNearSession(snapshotServer.SourceSessionPath!) ?? ResolveProgram(snapshotConfig.KittyPath)
+                            : ResolveProgram(snapshotConfig.KittyPath);
+                        KittyRoutedSession? routed = null;
+                        KittyLoginScript? script = null;
+                        try
                         {
-                            var jhPrompt = string.IsNullOrWhiteSpace(connectedProxy!.TotpPrompt) ? "OTP" : connectedProxy.TotpPrompt.Trim();
-                            consumedOffset = await KittyWindowInput.SendLineAfterPromptAsync(
-                                process, sessionLogPath, jhPrompt,
-                                () => TotpGenerator.Generate(connectedProxy.TotpSecret, DateTimeOffset.UtcNow,
-                                    connectedProxy.TotpDigits, connectedProxy.TotpPeriodSeconds, connectedProxy.TotpAlgorithm),
-                                TimeSpan.FromSeconds(20), cancellationToken);
-                        }
-
-                        if (needsPamOtp)
-                        {
-                            var pamPrompt = string.IsNullOrWhiteSpace(server.PamTotpPrompt) ? "OTP" : server.PamTotpPrompt.Trim();
-                            var pamCommand = server.PamSshCommand.Trim();
-                            var pamResult = await KittyWindowInput.SendLineAfterPromptAsync(
-                                process, sessionLogPath, pamPrompt,
-                                () => TotpGenerator.Generate(server.PamTotpSecret, DateTimeOffset.UtcNow,
-                                    server.PamTotpDigits, server.PamTotpPeriodSeconds, server.PamTotpAlgorithm),
-                                TimeSpan.FromSeconds(30), cancellationToken,
-                                optional: true,
-                                minOffset: consumedOffset,
-                                progressionCheck: text => text.Contains(pamCommand, StringComparison.OrdinalIgnoreCase)
-                                    || text.Contains("exec sh -c", StringComparison.OrdinalIgnoreCase),
-                                completionCheck: text => KittyWindowInput.IsActiveShellPrompt(text, server.ShellPrompt));
-
-                            if (pamResult.Sent)
-                                RouteLog("PAM OTP: код подтверждения успешно передан.");
+                            if (loadSavedSession)
+                                routed = directEndpoint is null
+                                    ? KittyRoutedSession.Create(
+                                        snapshotServer.SourceSessionPath!, nonPamRoute.LocalSshPort, snapshotServer.ImportedCommand,
+                                        snapshotServer.IgnoreImportedCommand, maximize: snapshotConfig.MaximizeKittyWindows, server: snapshotServer)
+                                    : KittyRoutedSession.CreateDirect(
+                                        snapshotServer.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
+                                        snapshotServer.ImportedCommand, snapshotServer.IgnoreImportedCommand, maximize: snapshotConfig.MaximizeKittyWindows, server: snapshotServer);
                             else
-                                RouteLog("PAM OTP: запрос OTP не поступил от сервера; продолжено без ввода OTP.");
+                                routed = directEndpoint is null
+                                    ? KittyRoutedSession.CreateMinimal(
+                                        "127.0.0.1", nonPamRoute.LocalSshPort, snapshotServer.ImportedCommand,
+                                        snapshotServer.IgnoreImportedCommand, maximize: snapshotConfig.MaximizeKittyWindows, server: snapshotServer)
+                                    : KittyRoutedSession.CreateMinimal(
+                                        directEndpoint.Host, directEndpoint.Port, snapshotServer.ImportedCommand,
+                                        snapshotServer.IgnoreImportedCommand, maximize: snapshotConfig.MaximizeKittyWindows, server: snapshotServer);
+                            script = KittyLoginScript.Create(snapshotServer);
+                            var startInfo = new ProcessStartInfo(kitty)
+                            {
+                                WorkingDirectory = Path.GetDirectoryName(kitty)!,
+                                WindowStyle = snapshotConfig.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
+                            };
+                            var arguments = directEndpoint is null
+                                ? KittyLaunchPlan.RoutedConsoleArguments(
+                                    snapshotServer, nonPamRoute.LocalSshPort, true, routed?.Path,
+                                    script?.Path)
+                                : KittyLaunchPlan.DirectConsoleArguments(
+                                    snapshotServer, directEndpoint.Host, directEndpoint.Port, true,
+                                    routed?.Path, script?.Path);
+                            foreach (var argument in arguments)
+                                startInfo.ArgumentList.Add(argument);
+                            cancellationToken.ThrowIfCancellationRequested();
+                            var proc = Process.Start(startInfo)
+                                ?? throw new InvalidOperationException("Не удалось запустить процесс KiTTY.");
+                            return (proc, routed, script);
                         }
-                    }
+                        catch
+                        {
+                            routed?.Dispose();
+                            script?.Dispose();
+                            throw;
+                        }
+                    }, cancellationToken);
 
-                    lastRouteDisplays[server.Id] = $"Использован маршрут: PAM через {connectedJumpHost.Name}";
+                    process = startedProc;
+                    routedSession = createdRouted;
+                    loginScript = createdScript;
+
+                    RouteLog($"KiTTY launch: target={snapshotServer.Name}; local=127.0.0.1:{nonPamRoute.LocalSshPort}; " +
+                             $"loghost={snapshotServer.Host}:{snapshotServer.Port}; hostkey=stable-cache; " +
+                             $"saved-session={loadSavedSession}; login-script={(loginScript is not null ? "present" : "none")}");
+                    nonPamHandedOff = true;
                     if (directEndpoint is not null)
                     {
-                        ReleaseRoute(route);
-                        RouteLog($"Direct KiTTY console detached from manager: target={connectedJumpHost.Name}; " +
+                        ReleaseRoute(nonPamRoute);
+                        RouteLog($"Direct KiTTY console detached from manager: target={snapshotServer.Name}; " +
                                  $"endpoint={directEndpoint.Host}:{directEndpoint.Port}");
                     }
                     if (routedSession is not null)
@@ -1666,142 +1981,34 @@ public partial class MainWindow : Window
                 }
                 finally
                 {
-                    if (sessionLogPath is not null)
-                    {
-                        KittyWindowInput.CleanTemporaryLogOnExit(process, sessionLogPath);
-                    }
                     routedSession?.Dispose();
                     loginScript?.Dispose();
                 }
-                Log($"Открыта сессия «{server.Name}» с PAM-авторизацией через «{connectedJumpHost.Name}»");
-            }, externalCancellationToken);
-            return;
-        }
-        var keyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
-        if (ManagerPathResolver.MissingConfiguredFileMessage(
-                server.PrivateKeyPath, "SSH-ключ") is { } missingKeyMessage)
-        {
-            Warn(missingKeyMessage);
-            return;
-        }
-        var key = PrivateKeyInspector.Inspect(keyPath ?? "");
-        if (key.Encrypted == true && server.PrivateKeyPassphrase.Length == 0)
-        {
-            if (!string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath) &&
-                ThemedMessageDialog.Show(this,
-                    "Для автоматической SSH-аутентификации нужен пароль зашифрованного ключа. Он не хранится в исходной сессии KiTTY.\n\nОткрыть сохранённую сессию напрямую и ввести пароль ключа в штатном окне KiTTY?",
-                    "Зашифрованный SSH-ключ", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
-            {
-                OpenOriginalSession(server);
-                return;
-            }
-            Warn("Введите пароль ключа в поле «Пароль ключа» и сохраните изменения либо откройте исходную сессию KiTTY напрямую.");
-            return;
-        }
-        ssh.ClearFailureCache();
-        await BusyAsync("Строю SSH-маршрут…", async cancellationToken =>
-        {
-            ActiveRoute route;
-            try
-            {
-                route = await Connect(server, cancellationToken, true, forcedViaServerId,
-                    routeConfig: routeConfig, persist: persist, enableBackgroundProbing: enableBackgroundProbing,
-                    explicitCandidates: explicitCandidates);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (InvalidOperationException ex) when (
-                ex.Message.StartsWith("Не найден рабочий маршрут.", StringComparison.Ordinal) &&
-                forcedViaServerId is null &&
-                !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
-                File.Exists(server.SourceSessionPath))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                RouteLog($"Managed routes exhausted: target={server.Name}; fallback=original-session; error={ex.Message}");
-                Status($"Управляемые маршруты недоступны. Открываю исходную сессию KiTTY «{server.Name}»…");
-                server.LastOriginalSessionFallbackUtc = DateTimeOffset.UtcNow;
-                if (persist) SaveConfig();
-                OpenOriginalSession(server);
-                return;
-            }
-            cancellationToken.ThrowIfCancellationRequested();
-            var loadSavedSession = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
-                                   File.Exists(server.SourceSessionPath);
-            var kitty = loadSavedSession
-                ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
-                : ResolveProgram(config.KittyPath);
-            KittyRoutedSession? routedSession = null;
-            KittyLoginScript? loginScript = null;
-            try
-            {
-                var directEndpoint = route.CanDetachDirectConsole
-                    ? route.Hops.Single()
-                    : null;
-                if (loadSavedSession)
-                    routedSession = directEndpoint is null
-                        ? KittyRoutedSession.Create(
-                            server.SourceSessionPath!, route.LocalSshPort, server.ImportedCommand,
-                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server)
-                        : KittyRoutedSession.CreateDirect(
-                            server.SourceSessionPath!, directEndpoint.Host, directEndpoint.Port,
-                            server.ImportedCommand, server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server);
-                else
-                    routedSession = directEndpoint is null
-                        ? KittyRoutedSession.CreateMinimal(
-                            "127.0.0.1", route.LocalSshPort, server.ImportedCommand,
-                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server)
-                        : KittyRoutedSession.CreateMinimal(
-                            directEndpoint.Host, directEndpoint.Port, server.ImportedCommand,
-                            server.IgnoreImportedCommand, maximize: config.MaximizeKittyWindows, server: server);
-                loginScript = KittyLoginScript.Create(server);
-                var startInfo = new ProcessStartInfo(kitty)
-                {
-                    WorkingDirectory = Path.GetDirectoryName(kitty)!,
-                    WindowStyle = config.MaximizeKittyWindows ? ProcessWindowStyle.Maximized : ProcessWindowStyle.Normal
-                };
-                var arguments = directEndpoint is null
-                    ? KittyLaunchPlan.RoutedConsoleArguments(
-                        server, route.LocalSshPort, true, routedSession?.Path,
-                        loginScript?.Path)
-                    : KittyLaunchPlan.DirectConsoleArguments(
-                        server, directEndpoint.Host, directEndpoint.Port, true,
-                        routedSession?.Path, loginScript?.Path);
-                foreach (var argument in arguments)
-                    startInfo.ArgumentList.Add(argument);
-                RouteLog($"KiTTY launch: target={server.Name}; local=127.0.0.1:{route.LocalSshPort}; " +
-                         $"loghost={server.Host}:{server.Port}; hostkey=stable-cache; " +
-                         $"saved-session={loadSavedSession}; login-script={(loginScript is not null ? "present" : "none")}");
-                Process.Start(startInfo);
-                if (directEndpoint is not null)
-                {
-                    ReleaseRoute(route);
-                    RouteLog($"Direct KiTTY console detached from manager: target={server.Name}; " +
-                             $"endpoint={directEndpoint.Host}:{directEndpoint.Port}");
-                }
-                if (routedSession is not null)
-                {
-                    var cleanup = routedSession;
-                    routedSession = null;
-                    _ = Task.Run(async () =>
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(10));
-                        cleanup.Dispose();
-                    });
-                }
-                if (loginScript is not null)
-                {
-                    PreserveTemporaryFile(loginScript.Path);
-                    loginScript = null;
-                }
+                Log(loadSavedSession
+                    ? $"Открыта сессия KiTTY «{snapshotServer.Name}» через автоматический маршрут с исходными туннелями и login script"
+                    : $"Открыта сессия «{snapshotServer.Name}» через автоматический маршрут");
             }
             finally
             {
-                routedSession?.Dispose();
-                loginScript?.Dispose();
+                if (!nonPamHandedOff && nonPamRoute is not null)
+                {
+                    ReleaseRoute(nonPamRoute);
+                }
             }
-            Log(loadSavedSession
-                ? $"Открыта сессия KiTTY «{server.Name}» через автоматический маршрут с исходными туннелями и login script"
-                : $"Открыта сессия «{server.Name}» через автоматический маршрут");
-        }, externalCancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            Status($"Подключение к «{snapshotServer.Name}» отменено.");
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"Ошибка подключения к «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
+            Status($"Ошибка подключения к «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
+        }
+        finally
+        {
+            pendingSessionOpenings.Remove(openingKey);
+        }
     }
 
     private static void PreserveTemporaryFile(string path)
@@ -2152,29 +2359,36 @@ public partial class MainWindow : Window
     private async Task<ActiveRoute> Connect(
         ManagedServer server, CancellationToken cancellationToken, bool consoleOnly = false,
         Guid? forcedViaServerId = null, Action<SshConnectionProgress>? progress = null,
-        ManagerConfig? routeConfig = null, bool persist = true, bool enableBackgroundProbing = true,
+        ManagerConfig? routeConfig = null, SshConnectionService? sshService = null, bool persist = true, bool enableBackgroundProbing = true,
         IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
-        var activeConfig = routeConfig ?? config;
+        var activeConfig = routeConfig ?? ConfigTransfer.CloneSnapshot(config);
+        var activeSsh = sshService ?? ssh;
+        var targetServer = activeConfig.FindServer(server.Id) ?? server;
         var initialFingerprints = new Dictionary<Guid, (string Host, int Port, string Fingerprint)>();
         if (persist && routeConfig is not null && !ReferenceEquals(routeConfig, config))
         {
             foreach (var s in activeConfig.AllServers())
                 initialFingerprints[s.Id] = (s.Host, s.Port, s.HostKeyFingerprint ?? "");
         }
+        else if (persist && !ReferenceEquals(activeConfig, config))
+        {
+            foreach (var s in activeConfig.AllServers())
+                initialFingerprints[s.Id] = (s.Host, s.Port, s.HostKeyFingerprint ?? "");
+        }
         if (forcedViaServerId is Guid requestedViaId)
-            RouteLog($"Forced route request: target={server.Name}; via=" +
+            RouteLog($"Forced route request: target={targetServer.Name}; via=" +
                      $"{activeConfig.FindServer(requestedViaId)?.Name ?? requestedViaId.ToString()}");
         IReadOnlyList<RouteCandidate> ranked = explicitCandidates is { Count: > 0 }
             ? explicitCandidates
             : forcedViaServerId is Guid viaId
-                ? RoutePlanner.ForcedFinalHopCandidates(activeConfig, viaId, server.Id)
-                : RoutePlanner.Candidates(activeConfig, server.Id);
+                ? RoutePlanner.ForcedFinalHopCandidates(activeConfig, viaId, targetServer.Id)
+                : RoutePlanner.Candidates(activeConfig, targetServer.Id);
         if (ranked.Count == 0)
         {
-            if (!server.TryDirectWithoutJumphost && activeConfig.BaseProxies.All(p => !p.Enabled))
+            if (!targetServer.TryDirectWithoutJumphost && activeConfig.BaseProxies.All(p => !p.Enabled))
                 throw new InvalidOperationException("Сначала настройте точку входа: назначьте сессию jumphost либо добавьте внешний SOCKS5.");
-            var required = server.RequiredPreviousServerId is Guid requiredId
+            var required = targetServer.RequiredPreviousServerId is Guid requiredId
                 ? activeConfig.FindServer(requiredId)
                 : null;
             throw new InvalidOperationException(forcedViaServerId is Guid forcedId
@@ -2190,16 +2404,16 @@ public partial class MainWindow : Window
         var candidates = explicitCandidates is { Count: > 0 }
             ? ranked
             : forcedViaServerId is null
-                ? RoutePlanner.OrderPreferred(activeConfig, ranked, server.PreferredRoute)
+                ? RoutePlanner.OrderPreferred(activeConfig, ranked, targetServer.PreferredRoute)
                 : ranked;
         if (explicitCandidates is { Count: > 0 })
-            RouteLog($"Route order for {server.Name}: preview-explicit; candidates=" + string.Join(" | ", candidates.Select(RouteLabel)));
+            RouteLog($"Route order for {targetServer.Name}: preview-explicit; candidates=" + string.Join(" | ", candidates.Select(RouteLabel)));
         else
-            RouteLog($"Route order for {server.Name}: preferred=" +
-                     (server.PreferredRoute is null ? "none" :
-                         $"proxy={server.PreferredRoute.ProxyId}; servers={string.Join('>', server.PreferredRoute.ServerIds)}") +
+            RouteLog($"Route order for {targetServer.Name}: preferred=" +
+                     (targetServer.PreferredRoute is null ? "none" :
+                         $"proxy={targetServer.PreferredRoute.ProxyId}; servers={string.Join('>', targetServer.PreferredRoute.ServerIds)}") +
                      "; candidates=" + string.Join(" | ", candidates.Select(candidate =>
-                         $"[{RoutePlanner.CandidateReason(activeConfig, server.Id, candidate, server.PreferredRoute)}] " +
+                         $"[{RoutePlanner.CandidateReason(activeConfig, targetServer.Id, candidate, targetServer.PreferredRoute)}] " +
                          RouteLabel(candidate))));
 
         void CompleteRoute(
@@ -2209,21 +2423,79 @@ public partial class MainWindow : Window
                 AccessGrantPolicy.RememberSuccessfulRoute(activeConfig, result.Candidate.Proxy.Id,
                     result.Candidate.Servers.Select(item => item.Id), DateTimeOffset.UtcNow);
             if (forcedViaServerId is null)
-                server.PreferredRoute = RoutePreferencePolicy.FromSuccess(
+                targetServer.PreferredRoute = RoutePreferencePolicy.FromSuccess(
                     result.Candidate, result.Duration, DateTimeOffset.UtcNow);
-            server.LastOriginalSessionFallbackUtc = null;
-            var liveTarget = (routeConfig is not null && !ReferenceEquals(routeConfig, config)) ? config.FindServer(server.Id) : null;
-            if (persist && routeConfig is not null && !ReferenceEquals(routeConfig, config))
+            targetServer.LastOriginalSessionFallbackUtc = null;
+            if (!ReferenceEquals(server, targetServer))
+            {
+                if (forcedViaServerId is null)
+                    server.PreferredRoute = targetServer.PreferredRoute;
+                server.LastOriginalSessionFallbackUtc = null;
+            }
+            var isSnapshot = !ReferenceEquals(activeConfig, config);
+            var liveTarget = isSnapshot ? config.FindServer(server.Id) : null;
+            if (persist && isSnapshot && liveTarget is not null)
             {
                 if (!result.Candidate.WithoutProxy)
                     AccessGrantPolicy.RememberSuccessfulRoute(config, result.Candidate.Proxy.Id,
                         result.Candidate.Servers.Select(item => item.Id), DateTimeOffset.UtcNow);
-                if (liveTarget is not null && forcedViaServerId is null &&
-                    string.Equals(liveTarget.Host, server.Host, StringComparison.OrdinalIgnoreCase) &&
-                    liveTarget.Port == server.Port)
+                if (string.Equals(liveTarget.Host, targetServer.Host, StringComparison.OrdinalIgnoreCase) &&
+                    liveTarget.Port == targetServer.Port)
                 {
-                    liveTarget.PreferredRoute = server.PreferredRoute;
+                    if (forcedViaServerId is null)
+                    {
+                        liveTarget.PreferredRoute = targetServer.PreferredRoute;
+                        liveTarget.PreferredProxyId = targetServer.PreferredProxyId;
+                    }
                     liveTarget.LastOriginalSessionFallbackUtc = null;
+                }
+                if (!result.Candidate.WithoutProxy)
+                {
+                    var liveProxy = config.BaseProxies.FirstOrDefault(p => p.Id == result.Candidate.Proxy.Id);
+                    if (liveProxy is not null && (liveProxy.LastSuccessUtc is null || result.Candidate.Proxy.LastSuccessUtc >= liveProxy.LastSuccessUtc))
+                    {
+                        liveProxy.LastSuccessUtc = result.Candidate.Proxy.LastSuccessUtc;
+                        liveProxy.LastConnectLatencyMs = result.Candidate.Proxy.LastConnectLatencyMs;
+                    }
+                }
+                for (var index = 0; index < result.Candidate.Servers.Count - 1; index++)
+                {
+                    var from = result.Candidate.Servers[index].Id;
+                    var to = result.Candidate.Servers[index + 1].Id;
+                    var snapLink = activeConfig.Links.FirstOrDefault(l => l.FromServerId == from && l.ToServerId == to);
+                    var liveLink = config.Links.FirstOrDefault(l => l.FromServerId == from && l.ToServerId == to);
+                    if (snapLink is not null && liveLink is not null)
+                    {
+                        if (liveLink.LastSuccessUtc is null || snapLink.LastSuccessUtc >= liveLink.LastSuccessUtc)
+                        {
+                            liveLink.LastSuccessUtc = snapLink.LastSuccessUtc;
+                            liveLink.LastSuccessfulProxyId = snapLink.LastSuccessfulProxyId;
+                            liveLink.LastLatencyMs = snapLink.LastLatencyMs;
+                            liveLink.LastStrategy = snapLink.LastStrategy;
+                        }
+                        var successfulProxyId = result.Candidate.Proxy.Id;
+                        var snapStat = snapLink.ProxyStatistics.FirstOrDefault(s => s.ProxyId == successfulProxyId);
+                        if (snapStat is not null)
+                        {
+                            var existing = liveLink.ProxyStatistics.FirstOrDefault(s => s.ProxyId == successfulProxyId);
+                            if (existing is null)
+                            {
+                                liveLink.ProxyStatistics.Add(new LinkProxyStatistic
+                                {
+                                    ProxyId = snapStat.ProxyId,
+                                    LastSuccessUtc = snapStat.LastSuccessUtc,
+                                    LatencyMs = snapStat.LatencyMs,
+                                    Strategy = snapStat.Strategy
+                                });
+                            }
+                            else if (snapStat.LastSuccessUtc >= existing.LastSuccessUtc)
+                            {
+                                existing.LastSuccessUtc = snapStat.LastSuccessUtc;
+                                existing.LatencyMs = snapStat.LatencyMs;
+                                existing.Strategy = snapStat.Strategy;
+                            }
+                        }
+                    }
                 }
                 for (var i = 0; i < result.Candidate.Servers.Count; i++)
                 {
@@ -2282,21 +2554,21 @@ public partial class MainWindow : Window
             if (persist) SaveConfig();
             Log($"{result.Candidate.Proxy.Name} → {string.Join(" → ", result.Candidate.Servers.Select(s => s.Name))}");
             if (forcedViaServerId is Guid successfulViaId)
-                RouteLog($"Forced route success: target={server.Name}; via=" +
+                RouteLog($"Forced route success: target={targetServer.Name}; via=" +
                          $"{activeConfig.FindServer(successfulViaId)?.Name ?? successfulViaId.ToString()}; " +
                          $"route={RouteLabel(result.Candidate)}");
             var probeTarget = liveTarget ?? server;
             if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly &&
                 RoutePreferencePolicy.BetterCandidates(candidates, result.Candidate).Count > 0)
-                ScheduleBetterRouteProbe(probeTarget, candidates, result.Candidate);
-            else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly && server.TryDirectWithoutJumphost &&
+                ScheduleBetterRouteProbe(probeTarget, candidates, result.Candidate, activeConfig);
+            else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly && targetServer.TryDirectWithoutJumphost &&
                      !result.Candidate.WithoutProxy)
-                ScheduleDirectRouteProbe(probeTarget, result.Candidate);
+                ScheduleDirectRouteProbe(probeTarget, result.Candidate, activeConfig);
             // Подключились обходным путём, а прямой доступ ещё не подтверждён —
             // пробуем доказать его в фоне, чтобы следующее подключение шло напрямую.
             else if (enableBackgroundProbing && forcedViaServerId is null && consoleOnly &&
-                     result.Candidate.Servers.Count > 1 && !IsProvenDirect(server))
-                ScheduleDirectRouteProbe(probeTarget, result.Candidate);
+                     result.Candidate.Servers.Count > 1 && !IsProvenDirect(targetServer))
+                ScheduleDirectRouteProbe(probeTarget, result.Candidate, activeConfig);
         }
 
         static string FormatRouteDisplay(
@@ -2311,32 +2583,46 @@ public partial class MainWindow : Window
             return "Использован маршрут: " + string.Join(" → ", parts);
         }
 
+        foreach (var candidate in candidates)
+        {
+            if (!candidate.WithoutProxy && jumphostProcesses.TryGetAliveManaged(candidate.Proxy, out var existingManaged) && !IsLiveConfigProxy(candidate.Proxy))
+            {
+                candidate.Proxy.Host = existingManaged.Host;
+                candidate.Proxy.Port = existingManaged.Port;
+            }
+        }
+
         return await RouteCandidateConnector.ConnectCandidatesAsync(
             config: activeConfig,
-            server: server,
+            server: targetServer,
             candidates: candidates,
-            ssh: ssh,
+            ssh: activeSsh,
             cancellationToken: cancellationToken,
             consoleOnly: consoleOnly,
             forcedViaServerId: forcedViaServerId,
             progress: progress,
             ensureManagedJumphost: async (proxy, ct) =>
             {
-                var ready = await EnsureManagedJumphostAsync(ct, true, proxyId: proxy.Id,
-                    accessTargetServerId: server.Id, persist: persist);
-                if (ready && routeConfig is not null)
+                var ok = await EnsureManagedJumphostAsync(ct, true, proxyId: proxy.Id,
+                    accessTargetServerId: targetServer.Id, persist: persist, runConfig: activeConfig);
+                if (ok && jumphostProcesses.TryGetAliveManaged(proxy, out var m) && !IsLiveConfigProxy(proxy))
                 {
-                    var liveProxy = config.BaseProxies.FirstOrDefault(p => p.Id == proxy.Id);
-                    if (liveProxy is not null)
-                    {
-                        proxy.Host = liveProxy.Host;
-                        proxy.Port = liveProxy.Port;
-                    }
+                    proxy.Host = m.Host;
+                    proxy.Port = m.Port;
                 }
-                return ready;
+                return ok;
             },
-            isSocks5Ready: (proxy, timeout, ct) => IsSocks5ReadyAsync(proxy, timeout, ct),
-            tryRestoreAccess: enableBackgroundProbing ? (cands, ct) => TryRestoreAccessAsync(cands, ct) : null,
+            isSocks5Ready: async (proxy, timeout, ct) =>
+            {
+                var ok = await IsProxyReadyAndPreparedAsync(proxy, timeout, ct);
+                if (ok && jumphostProcesses.TryGetAliveManaged(proxy, out var m) && !IsLiveConfigProxy(proxy))
+                {
+                    proxy.Host = m.Host;
+                    proxy.Port = m.Port;
+                }
+                return ok;
+            },
+            tryRestoreAccess: enableBackgroundProbing ? (cands, ct) => TryRestoreAccessAsync(cands, ct, runConfig: activeConfig) : null,
             status: s => Status(s),
             routeLog: l => RouteLog(l),
             onHopFailed: (sourceId, targetId) =>
@@ -2347,17 +2633,17 @@ public partial class MainWindow : Window
             },
             onRouteSucceeded: CompleteRoute,
             onPreferredRouteFailed: enableBackgroundProbing
-                ? (candidate, ct) => RestoreFailedPreferredAccessAsync(candidate, ct)
+                ? (candidate, ct) => RestoreFailedPreferredAccessAsync(candidate, ct, runConfig: activeConfig)
                 : null);
     }
 
     private async Task RestoreFailedPreferredAccessAsync(
-        RouteCandidate candidate, CancellationToken cancellationToken)
+        RouteCandidate candidate, CancellationToken cancellationToken, ManagerConfig? runConfig = null)
     {
         try
         {
             RouteLog($"Preferred JH failed; checking access in background: proxy={candidate.Proxy.Name}");
-            await TryRestoreAccessAsync([candidate], cancellationToken);
+            await TryRestoreAccessAsync([candidate], cancellationToken, runConfig: runConfig);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
@@ -2373,8 +2659,9 @@ public partial class MainWindow : Window
     /// </summary>
     private async Task<bool> TryRestoreAccessAsync(
         IReadOnlyList<RouteCandidate> candidates, CancellationToken cancellationToken,
-        bool routeFailure = false)
+        bool routeFailure = false, ManagerConfig? runConfig = null)
     {
+        var activeConfig = runConfig ?? config;
         var now = DateTimeOffset.UtcNow;
         var proxiesToCheck = candidates
             .Select(c => c.Proxy)
@@ -2396,12 +2683,12 @@ public partial class MainWindow : Window
 
             RouteLog($"Access expired detected: proxy={proxy.Name}; all {proxy.AccessProbeServerIds.Count} controls unreachable; sending script");
             Status($"Доступ через «{proxy.Name}» истёк. Готовлю запуск скрипта…");
-            var jumphostServer = config.FindServer(proxy.StartupServerId ?? Guid.Empty);
+            var jumphostServer = activeConfig.FindServer(proxy.StartupServerId ?? Guid.Empty);
             if (jumphostServer is null) continue;
             try
             {
                 restored |= await RunAccessScriptWithConsoleChoiceAsync(
-                    proxy, jumphostServer, null, "failure-recovery", cancellationToken);
+                    proxy, jumphostServer, null, "failure-recovery", cancellationToken, runConfig: activeConfig);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex)
@@ -2438,46 +2725,67 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunAccessScriptInExistingConsoleAsync(
         BaseProxy proxy, ManagedServer server, int processId, Guid? targetServerId,
-        CancellationToken cancellationToken, bool persist = true)
+        CancellationToken cancellationToken, bool persist = true, ManagerConfig? runConfig = null)
     {
+        var activeConfig = runConfig ?? config;
         var proxyId = proxy.Id;
         var requestedAfter = proxy.LastAccessScriptAttemptUtc;
         var gate = accessScriptGates.GetOrAdd(proxyId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken);
         try
         {
-            proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId)
-                ?? throw new InvalidOperationException("Точка входа была удалена во время запуска скрипта.");
-            if (proxy.LastAccessScriptAttemptUtc != requestedAfter)
-                return proxy.LastAccessScriptResult == "Verified";
-            AccessGrantPolicy.MarkScriptAttempt(proxy, DateTimeOffset.UtcNow);
+            var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+            var sharedLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+            if (sharedLive is not null && sharedLive.LastAccessScriptAttemptUtc != requestedAfter)
+                return sharedLive.LastAccessScriptResult == "Verified";
+            if (executionProxy.LastAccessScriptAttemptUtc != requestedAfter)
+                return executionProxy.LastAccessScriptResult == "Verified";
+
+            var now = DateTimeOffset.UtcNow;
+            AccessGrantPolicy.MarkScriptAttempt(executionProxy, now);
+            var liveProxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+            if (liveProxy is not null && !ReferenceEquals(liveProxy, executionProxy))
+                AccessGrantPolicy.MarkScriptAttempt(liveProxy, now);
             if (persist) SaveConfig();
             try
             {
                 using var existing = Process.GetProcessById(processId);
                 await KittyWindowInput.SendLinesAsync(existing,
-                    JumphostStartupPlan.BuildPostLogin(proxy, server, true)
+                    JumphostStartupPlan.BuildPostLogin(executionProxy, server, true)
                         .Select(step => step.Response).ToArray(), cancellationToken);
-                if (proxy.PostCommandReadyDelaySeconds > 0)
-                    await Task.Delay(TimeSpan.FromSeconds(proxy.PostCommandReadyDelaySeconds), cancellationToken);
-                var controls = await VerifyAccessControlsAsync(proxy, targetServerId, cancellationToken);
-                proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+                if (executionProxy.PostCommandReadyDelaySeconds > 0)
+                    await Task.Delay(TimeSpan.FromSeconds(executionProxy.PostCommandReadyDelaySeconds), cancellationToken);
+                var controls = await VerifyAccessControlsAsync(executionProxy, targetServerId, cancellationToken);
                 if (controls.Count == 0)
                 {
-                    AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
+                    var failNow = DateTimeOffset.UtcNow;
+                    AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, failNow);
+                    var currentLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                    if (currentLive is not null && !ReferenceEquals(currentLive, executionProxy))
+                        AccessGrantPolicy.MarkScriptUnconfirmed(currentLive, failNow);
                     if (persist) SaveConfig();
                     return false;
                 }
-                AccessGrantPolicy.MarkScriptSuccess(proxy, DateTimeOffset.UtcNow);
+                var successNow = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptSuccess(executionProxy, successNow);
+                var currentLiveSuccess = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (currentLiveSuccess is not null && !ReferenceEquals(currentLiveSuccess, executionProxy))
+                    AccessGrantPolicy.MarkScriptSuccess(currentLiveSuccess, successNow);
                 AccessGrantPolicy.RememberReachableControls(
-                    config, proxy.Id, controls, DateTimeOffset.UtcNow);
+                    config, executionProxy.Id, controls, successNow);
+                if (!ReferenceEquals(activeConfig, config))
+                    AccessGrantPolicy.RememberReachableControls(
+                        activeConfig, executionProxy.Id, controls, successNow);
                 if (persist) SaveConfig();
                 return true;
             }
             catch
             {
-                proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-                AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
+                var errNow = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, errNow);
+                var currentLiveErr = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (currentLiveErr is not null && !ReferenceEquals(currentLiveErr, executionProxy))
+                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveErr, errNow);
                 if (persist) SaveConfig();
                 throw;
             }
@@ -2487,8 +2795,9 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunAccessScriptWithConsoleChoiceAsync(
         BaseProxy proxy, ManagedServer server, Guid? targetServerId, string trigger,
-        CancellationToken cancellationToken, bool persist = true)
+        CancellationToken cancellationToken, bool persist = true, ManagerConfig? runConfig = null)
     {
+        var activeConfig = runConfig ?? config;
         var entryTitle = JumphostConsoleTitles.EntryTitle(server.Name, proxy.Name);
         var accessTitle = JumphostConsoleTitles.AccessTitle(server.Name, proxy.Name);
         var managedMain = jumphostProcesses.TryGetAliveManaged(proxy, out var mainIdentity);
@@ -2523,24 +2832,24 @@ public partial class MainWindow : Window
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner={identity.Kind}; choice=existing-main; pid={mainIdentity.ProcessId}");
             return await RunAccessScriptInExistingConsoleAsync(
-                proxy, server, mainIdentity.ProcessId, targetServerId, cancellationToken, persist);
+                proxy, server, mainIdentity.ProcessId, targetServerId, cancellationToken, persist, runConfig: activeConfig);
         }
         if (target == AccessScriptConsoleTarget.ExistingAccess && accessPid is int existingPid)
         {
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner={identity.Kind}; choice=existing-access; pid={existingPid}");
             return await RunAccessScriptInExistingConsoleAsync(
-                proxy, server, existingPid, targetServerId, cancellationToken, persist);
+                proxy, server, existingPid, targetServerId, cancellationToken, persist, runConfig: activeConfig);
         }
         if (target == AccessScriptConsoleTarget.PromptUnknown)
         {
-            var choice = await Dispatcher.InvokeAsync(() => ThemedMessageDialog.Show(this,
+            var choice = await ThemedMessageDialog.ShowModelessAsync(this,
                 $"Порт SOCKS5 {proxy.Host}:{proxy.Port} принадлежит неизвестной KiTTY " +
                 $"(PID {identity.ProcessId}, «{identity.WindowTitle}»).\n\n" +
                 "«Да» — использовать эту консоль.\n" +
                 "«Нет» — открыть отдельную служебную консоль.\n" +
                 "«Отмена» — не запускать скрипт.",
-                "Неизвестная консоль JH", MessageBoxButton.YesNoCancel, MessageBoxImage.Question));
+                "Неизвестная консоль JH", MessageBoxButton.YesNoCancel, MessageBoxImage.Question, cancellationToken);
             if (choice == MessageBoxResult.Cancel)
             {
                 accessPromptCancelledUtc[proxy.Id] = DateTimeOffset.UtcNow;
@@ -2563,7 +2872,7 @@ public partial class MainWindow : Window
                 RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                          $"owner=unknown-kitty; choice=existing-adopted; pid={pid}");
                 return await RunAccessScriptInExistingConsoleAsync(
-                    proxy, server, pid, targetServerId, cancellationToken, persist);
+                    proxy, server, pid, targetServerId, cancellationToken, persist, runConfig: activeConfig);
             }
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner=unknown-kitty; choice=isolated; pid={identity.ProcessId}");
@@ -2573,7 +2882,7 @@ public partial class MainWindow : Window
             RouteLog($"Access script console choice: proxy={proxy.Name}; trigger={trigger}; " +
                      $"owner={identity.Kind}; choice=isolated; pid={identity.ProcessId}");
         }
-        return await RunAccessScriptAndConfirmAsync(proxy, server, targetServerId, cancellationToken, persist);
+        return await RunAccessScriptAndConfirmAsync(proxy, server, targetServerId, cancellationToken, persist, runConfig: activeConfig);
     }
 
     private static string RouteLabel(RouteCandidate candidate) =>
@@ -2586,9 +2895,117 @@ public partial class MainWindow : Window
     /// Background probe: when the fallback (original session) is active,
     /// periodically try managed routes. If one succeeds, clear the fallback
     /// flag so next time the managed route is used directly.
-    /// </summary>
-    private void ScheduleFallbackRouteProbe(ManagedServer server, IReadOnlyList<RouteCandidate> ranked)
+    private void SyncBackgroundProbeHops(
+        (ActiveRoute Route, RouteCandidate Candidate, TimeSpan Duration) probeResult,
+        IReadOnlyDictionary<Guid, (string Host, int Port, string Fingerprint)> initFingerprints,
+        ManagerConfig probeConfig)
     {
+        if (!probeResult.Candidate.WithoutProxy)
+        {
+            var liveProxy = config.BaseProxies.FirstOrDefault(p => p.Id == probeResult.Candidate.Proxy.Id);
+            if (liveProxy is not null && probeResult.Candidate.Proxy.LastSuccessUtc is not null &&
+                (liveProxy.LastSuccessUtc is null || probeResult.Candidate.Proxy.LastSuccessUtc >= liveProxy.LastSuccessUtc))
+            {
+                liveProxy.LastSuccessUtc = probeResult.Candidate.Proxy.LastSuccessUtc;
+                liveProxy.LastConnectLatencyMs = probeResult.Candidate.Proxy.LastConnectLatencyMs;
+            }
+        }
+
+        for (var index = 0; index < probeResult.Candidate.Servers.Count - 1; index++)
+        {
+            var from = probeResult.Candidate.Servers[index].Id;
+            var to = probeResult.Candidate.Servers[index + 1].Id;
+            var snapLink = probeConfig.Links.FirstOrDefault(l => l.FromServerId == from && l.ToServerId == to);
+            if (snapLink is null) continue;
+            var liveLink = config.Links.FirstOrDefault(l => l.FromServerId == from && l.ToServerId == to);
+            if (liveLink is null) continue;
+            if (liveLink.LastSuccessUtc is null || snapLink.LastSuccessUtc >= liveLink.LastSuccessUtc)
+            {
+                liveLink.LastSuccessUtc = snapLink.LastSuccessUtc;
+                liveLink.LastSuccessfulProxyId = snapLink.LastSuccessfulProxyId;
+                liveLink.LastLatencyMs = snapLink.LastLatencyMs;
+                liveLink.LastStrategy = snapLink.LastStrategy;
+            }
+            var successfulProxyId = probeResult.Candidate.Proxy.Id;
+            var snapStat = snapLink.ProxyStatistics.FirstOrDefault(s => s.ProxyId == successfulProxyId);
+            if (snapStat is not null)
+            {
+                var existing = liveLink.ProxyStatistics.FirstOrDefault(s => s.ProxyId == successfulProxyId);
+                if (existing is null)
+                {
+                    liveLink.ProxyStatistics.Add(new LinkProxyStatistic
+                    {
+                        ProxyId = snapStat.ProxyId,
+                        LastSuccessUtc = snapStat.LastSuccessUtc,
+                        LatencyMs = snapStat.LatencyMs,
+                        Strategy = snapStat.Strategy
+                    });
+                }
+                else if (snapStat.LastSuccessUtc >= existing.LastSuccessUtc)
+                {
+                    existing.LastSuccessUtc = snapStat.LastSuccessUtc;
+                    existing.LatencyMs = snapStat.LatencyMs;
+                    existing.Strategy = snapStat.Strategy;
+                }
+            }
+        }
+
+        for (var i = 0; i < probeResult.Candidate.Servers.Count; i++)
+        {
+            var hop = probeResult.Candidate.Servers[i];
+            var liveHop = config.FindServer(hop.Id);
+            if (liveHop is null) continue;
+
+            var hopContext = i == 0
+                ? EndpointContext.Direct(probeResult.Candidate.Proxy.Id)
+                : EndpointContext.Via(probeResult.Candidate.Servers[i - 1].Id);
+            var snapshotPref = hop.EndpointPreferences.FirstOrDefault(item =>
+                item.ProxyId == hopContext.ProxyId &&
+                item.PreviousServerId == hopContext.PreviousServerId);
+            var effectiveEndpoint = snapshotPref?.Endpoint ??
+                (i < probeResult.Route.Hops.Count ? new ServerEndpoint(probeResult.Route.Hops[i].Host, probeResult.Route.Hops[i].Port) : null);
+            if (effectiveEndpoint is not null)
+            {
+                var livePref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                    item.ProxyId == hopContext.ProxyId &&
+                    item.PreviousServerId == hopContext.PreviousServerId);
+                if (livePref is null || snapshotPref is null || livePref.LastSuccessUtc <= snapshotPref.LastSuccessUtc)
+                {
+                    ServerEndpointPolicy.Remember(liveHop, effectiveEndpoint, hopContext);
+                    if (snapshotPref is not null && snapshotPref.LastSuccessUtc != default)
+                    {
+                        var updatedPref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                            item.ProxyId == hopContext.ProxyId &&
+                            item.PreviousServerId == hopContext.PreviousServerId);
+                        if (updatedPref is not null)
+                            updatedPref.LastSuccessUtc = snapshotPref.LastSuccessUtc;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
+                initFingerprints.TryGetValue(hop.Id, out var initial) &&
+                string.Equals(initial.Host, liveHop.Host, StringComparison.OrdinalIgnoreCase) &&
+                initial.Port == liveHop.Port &&
+                string.Equals(initial.Fingerprint, liveHop.HostKeyFingerprint ?? "", StringComparison.Ordinal))
+            {
+                liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
+                liveHop.HostKeyAlgorithm = hop.HostKeyAlgorithm;
+                liveHop.HostKeyBits = hop.HostKeyBits;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Background probe: when the fallback (original session) is active,
+    /// periodically try managed routes. If one succeeds, clear the fallback
+    /// flag so next time the managed route is used directly.
+    /// </summary>
+    private void ScheduleFallbackRouteProbe(ManagedServer server, IReadOnlyList<RouteCandidate> ranked, ManagerConfig? runConfig = null)
+    {
+        var probeConfig = runConfig ?? config;
+        var initialFingerprints = probeConfig.AllServers()
+            .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
         var lease = backgroundRouteProbes.TryStart(server.Id);
         if (lease is null)
         {
@@ -2615,7 +3032,8 @@ public partial class MainWindow : Window
                     try
                     {
                         var result = await ssh.ConnectCandidateAsync(
-                            config, candidate, probe.Token, true);
+                            probeConfig, candidate, probe.Token, true);
+                        SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
                         // Success! Clear fallback and save the preferred route.
                         server.LastOriginalSessionFallbackUtc = null;
@@ -2646,8 +3064,11 @@ public partial class MainWindow : Window
     }
 
     private void ScheduleBetterRouteProbe(
-        ManagedServer server, IReadOnlyList<RouteCandidate> ranked, RouteCandidate current)
+        ManagedServer server, IReadOnlyList<RouteCandidate> ranked, RouteCandidate current, ManagerConfig? runConfig = null)
     {
+        var probeConfig = runConfig ?? config;
+        var initialFingerprints = probeConfig.AllServers()
+            .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
         var lease = backgroundRouteProbes.TryStart(server.Id);
         if (lease is null)
         {
@@ -2674,7 +3095,8 @@ public partial class MainWindow : Window
                     try
                     {
                         var result = await ssh.ConnectCandidateAsync(
-                            config, candidate, probe.Token, true);
+                            probeConfig, candidate, probe.Token, true);
+                        SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
                         if (!RoutePreferencePolicy.CanCommitBackgroundResult(
                                 server.PreferredRoute, current, candidate))
@@ -2716,9 +3138,12 @@ public partial class MainWindow : Window
     /// точку входа (с учётом резервных адресов). При успехе прямой путь
     /// запоминается и дальше используется первым.
     /// </summary>
-    private void ScheduleDirectRouteProbe(ManagedServer server, RouteCandidate used)
+    private void ScheduleDirectRouteProbe(ManagedServer server, RouteCandidate used, ManagerConfig? runConfig = null)
     {
-        var directCandidates = RoutePlanner.DirectCandidates(config, server.Id)
+        var probeConfig = runConfig ?? config;
+        var initialFingerprints = probeConfig.AllServers()
+            .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
+        var directCandidates = RoutePlanner.DirectCandidates(probeConfig, server.Id)
             .OrderByDescending(candidate => candidate.WithoutProxy)
             .ThenByDescending(candidate => candidate.Proxy.Id == used.Proxy.Id)
             .ToArray();
@@ -2750,7 +3175,8 @@ public partial class MainWindow : Window
                     try
                     {
                         var result = await ssh.ConnectCandidateAsync(
-                            config, candidate, probe.Token, true);
+                            probeConfig, candidate, probe.Token, true);
+                        SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
                         if (server.TryDirectWithoutJumphost &&
                             IsProvenDirectWithoutJumphost(server)) return;
@@ -2936,49 +3362,77 @@ public partial class MainWindow : Window
 
     private async Task<bool> RunAccessScriptAndConfirmAsync(
         BaseProxy proxy, ManagedServer server, Guid? targetServerId,
-        CancellationToken cancellationToken, bool persist = true)
+        CancellationToken cancellationToken, bool persist = true, ManagerConfig? runConfig = null)
     {
+        var activeConfig = runConfig ?? config;
         var proxyId = proxy.Id;
         var requestedAfter = proxy.LastAccessScriptAttemptUtc;
         var gate = accessScriptGates.GetOrAdd(proxyId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(cancellationToken);
         try
         {
-            proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId)
-                ?? throw new InvalidOperationException("Точка входа была удалена во время запуска скрипта.");
-            if (proxy.LastAccessScriptAttemptUtc != requestedAfter)
+            var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+            var sharedLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+            if (sharedLive is not null && sharedLive.LastAccessScriptAttemptUtc != requestedAfter)
             {
-                RouteLog($"Access script reused completed operation: proxy={proxy.Name}");
-                return proxy.LastAccessScriptResult == "Verified";
+                RouteLog($"Access script reused completed operation: proxy={executionProxy.Name}");
+                return sharedLive.LastAccessScriptResult == "Verified";
+            }
+            if (executionProxy.LastAccessScriptAttemptUtc != requestedAfter)
+            {
+                RouteLog($"Access script reused completed operation: proxy={executionProxy.Name}");
+                return executionProxy.LastAccessScriptResult == "Verified";
             }
             return await RunAccessScriptAndConfirmCoreAsync(
-                proxy, server, targetServerId, cancellationToken, persist);
+                executionProxy, server, targetServerId, cancellationToken, persist, runConfig: activeConfig);
         }
         finally { gate.Release(); }
     }
 
     private async Task<bool> RunAccessScriptAndConfirmCoreAsync(
         BaseProxy proxy, ManagedServer server, Guid? targetServerId,
-        CancellationToken cancellationToken, bool persist = true)
+        CancellationToken cancellationToken, bool persist = true, ManagerConfig? runConfig = null)
     {
+        var activeConfig = runConfig ?? config;
         var proxyId = proxy.Id;
-        AccessGrantPolicy.MarkScriptAttempt(proxy, DateTimeOffset.UtcNow);
+        var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+        var liveProxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+        var now = DateTimeOffset.UtcNow;
+        AccessGrantPolicy.MarkScriptAttempt(executionProxy, now);
+        if (liveProxy is not null && !ReferenceEquals(liveProxy, executionProxy))
+            AccessGrantPolicy.MarkScriptAttempt(liveProxy, now);
         if (persist) SaveConfig();
         AccessScriptRunnerPlan? plan = null;
         Process? process = null;
         var cleanupAfterExit = false;
         try
         {
-            var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
-                ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
-                : ResolveProgram(config.KittyPath);
-            plan = AccessScriptRunnerPlan.Create(kitty, server, proxy, DateTimeOffset.UtcNow);
-            process = Process.Start(plan.StartInfo)
-                ?? throw new InvalidOperationException("KiTTY для скрипта доступа не удалось запустить.");
+            var (createdPlan, startedProcess) = await Task.Run(() =>
+            {
+                AccessScriptRunnerPlan? p = null;
+                try
+                {
+                    var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
+                        ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(activeConfig.KittyPath)
+                        : ResolveProgram(activeConfig.KittyPath);
+                    p = AccessScriptRunnerPlan.Create(kitty, server, executionProxy, DateTimeOffset.UtcNow);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var proc = Process.Start(p.StartInfo)
+                        ?? throw new InvalidOperationException("KiTTY для скрипта доступа не удалось запустить.");
+                    return (p, proc);
+                }
+                catch
+                {
+                    p?.Dispose();
+                    throw;
+                }
+            }, cancellationToken);
+            plan = createdPlan;
+            process = startedProcess;
             // Remember the service console so every later attempt reuses it
             // instead of opening another duplicate window.
-            jumphostProcesses.Remember(proxy, JumphostConsoleKind.Access, process,
-                JumphostConsoleTitles.AccessTitle(server.Name, proxy.Name));
+            jumphostProcesses.Remember(executionProxy, JumphostConsoleKind.Access, process,
+                JumphostConsoleTitles.AccessTitle(server.Name, executionProxy.Name));
             PersistConsoles();
             if (plan.TotpCodeForWindowInput is not null)
                 await KittyWindowInput.SendLineAsync(process, plan.TotpCodeForWindowInput, cancellationToken);
@@ -2989,55 +3443,71 @@ public partial class MainWindow : Window
             var markerSeen = plan.HasCompletionMarker();
             if (!markerSeen)
             {
-                proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-                AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
+                var failNow = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, failNow);
+                var currentLiveFail = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (currentLiveFail is not null && !ReferenceEquals(currentLiveFail, executionProxy))
+                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveFail, failNow);
                 if (persist) SaveConfig();
                 var earlyExit = process.HasExited;
-                RouteLog($"Access script unconfirmed: proxy={proxy.Name}; " +
+                RouteLog($"Access script unconfirmed: proxy={executionProxy.Name}; " +
                          (earlyExit ? "KiTTY exited before marker" : "marker timeout; process left running"));
                 cleanupAfterExit = true;
                 _ = plan.DisposeAfterExitAsync(process);
                 Status(earlyExit
-                    ? $"KiTTY скрипта через «{proxy.Name}» закрылась до подтверждения завершения"
-                    : $"Запуск скрипта через «{proxy.Name}» не подтверждён за " +
+                    ? $"KiTTY скрипта через «{executionProxy.Name}» закрылась до подтверждения завершения"
+                    : $"Запуск скрипта через «{executionProxy.Name}» не подтверждён за " +
                       $"{(int)plan.CompletionTimeout.TotalSeconds} сек.; консоль оставлена открытой");
                 return false;
             }
 
-            var controls = await VerifyAccessControlsAsync(proxy, targetServerId, cancellationToken);
-            proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+            var controls = await VerifyAccessControlsAsync(executionProxy, targetServerId, cancellationToken);
             if (controls.Count == 0)
             {
                 IReadOnlyList<Guid> candidates;
-                try { candidates = await DiscoverAccessControlsAsync(proxy, targetServerId, cancellationToken); }
+                try { candidates = await DiscoverAccessControlsAsync(executionProxy, targetServerId, cancellationToken); }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 { candidates = []; }
-                proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-                AccessGrantPolicy.RememberControlCandidates(config, proxy.Id, candidates);
-                AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
+                AccessGrantPolicy.RememberControlCandidates(config, executionProxy.Id, candidates);
+                if (!ReferenceEquals(activeConfig, config))
+                    AccessGrantPolicy.RememberControlCandidates(activeConfig, executionProxy.Id, candidates);
+                var unconfNow = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, unconfNow);
+                var currentLiveUnconf = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (currentLiveUnconf is not null && !ReferenceEquals(currentLiveUnconf, executionProxy))
+                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveUnconf, unconfNow);
                 if (persist) SaveConfig();
-                RouteLog($"Access script unconfirmed: proxy={proxy.Name}; marker=seen; controls=0; " +
+                RouteLog($"Access script unconfirmed: proxy={executionProxy.Name}; marker=seen; controls=0; " +
                          $"learned-candidates={candidates.Count}");
                 Status("Команда завершилась, но доступ к целевому или контрольному серверу не подтверждён");
                 return false;
             }
             IReadOnlyList<Guid> learned;
-            try { learned = await DiscoverAccessControlsAsync(proxy, targetServerId, cancellationToken); }
+            try { learned = await DiscoverAccessControlsAsync(executionProxy, targetServerId, cancellationToken); }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             { learned = controls; }
-            proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-            AccessGrantPolicy.MarkScriptSuccess(proxy, DateTimeOffset.UtcNow);
-            AccessGrantPolicy.RememberReachableControls(config, proxy.Id,
-                learned.Count > 0 ? learned : controls, DateTimeOffset.UtcNow);
+            var succNow = DateTimeOffset.UtcNow;
+            AccessGrantPolicy.MarkScriptSuccess(executionProxy, succNow);
+            var currentLiveSucc = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+            if (currentLiveSucc is not null && !ReferenceEquals(currentLiveSucc, executionProxy))
+                AccessGrantPolicy.MarkScriptSuccess(currentLiveSucc, succNow);
+            AccessGrantPolicy.RememberReachableControls(config, executionProxy.Id,
+                learned.Count > 0 ? learned : controls, succNow);
+            if (!ReferenceEquals(activeConfig, config))
+                AccessGrantPolicy.RememberReachableControls(activeConfig, executionProxy.Id,
+                    learned.Count > 0 ? learned : controls, succNow);
             if (persist) SaveConfig();
-            RouteLog($"Access script verified: proxy={proxy.Name}; controls={controls.Count}; learned={learned.Count}");
-            Status($"Скрипт доступа через «{proxy.Name}» подтверждён ({controls.Count} серверов)");
+            RouteLog($"Access script verified: proxy={executionProxy.Name}; controls={controls.Count}; learned={learned.Count}");
+            Status($"Скрипт доступа через «{executionProxy.Name}» подтверждён ({controls.Count} серверов)");
             return true;
         }
         catch
         {
-            proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-            AccessGrantPolicy.MarkScriptUnconfirmed(proxy, DateTimeOffset.UtcNow);
+            var errNow = DateTimeOffset.UtcNow;
+            AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, errNow);
+            var currentLiveErr = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+            if (currentLiveErr is not null && !ReferenceEquals(currentLiveErr, executionProxy))
+                AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveErr, errNow);
             if (persist) SaveConfig();
             if (plan is not null && process is not null)
             {
@@ -3056,13 +3526,66 @@ public partial class MainWindow : Window
         }
     }
 
+    private void SyncProxyRuntimeState(BaseProxy snapProxy, ManagerConfig? activeConfig = null, bool syncPort = false,
+        int originalPort = 0, string? originalHost = null, Guid? originalStartupServerId = null, bool? originalAutoSelect = null)
+    {
+        if (activeConfig is not null && ReferenceEquals(activeConfig, config)) return;
+        var liveProxy = config.BaseProxies.FirstOrDefault(p => p.Id == snapProxy.Id);
+        if (liveProxy is null || ReferenceEquals(liveProxy, snapProxy)) return;
+        if (syncPort &&
+            liveProxy.Port == originalPort &&
+            (originalHost is null || string.Equals(liveProxy.Host, originalHost, StringComparison.OrdinalIgnoreCase)) &&
+            (originalStartupServerId is null || liveProxy.StartupServerId == originalStartupServerId) &&
+            (originalAutoSelect is null || liveProxy.UseAutomaticPort == originalAutoSelect.Value))
+        {
+            liveProxy.Port = snapProxy.Port;
+        }
+        if (snapProxy.LastSuccessUtc is not null && (liveProxy.LastSuccessUtc is null || snapProxy.LastSuccessUtc >= liveProxy.LastSuccessUtc))
+        {
+            liveProxy.LastSuccessUtc = snapProxy.LastSuccessUtc;
+            liveProxy.LastConnectLatencyMs = snapProxy.LastConnectLatencyMs;
+        }
+        var matchesStartupIdentity =
+            (originalStartupServerId is null || liveProxy.StartupServerId == originalStartupServerId) &&
+            liveProxy.StartupServerId == snapProxy.StartupServerId;
+
+        if (matchesStartupIdentity && snapProxy.StartupServerId is not null && activeConfig is not null && !ReferenceEquals(activeConfig, config) && liveProxy.StartupServerId is not null)
+        {
+            var snapServer = activeConfig.FindServer(snapProxy.StartupServerId.Value);
+            var liveServer = config.FindServer(liveProxy.StartupServerId.Value);
+            if (snapServer is not null && (liveServer is null ||
+                !string.Equals(liveServer.Host, snapServer.Host, StringComparison.OrdinalIgnoreCase) ||
+                liveServer.Port != snapServer.Port ||
+                !string.Equals(liveServer.Username, snapServer.Username, StringComparison.Ordinal) ||
+                !string.Equals(liveServer.Password, snapServer.Password, StringComparison.Ordinal) ||
+                !string.Equals(liveServer.PrivateKeyPath, snapServer.PrivateKeyPath, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(liveServer.PrivateKeyPassphrase, snapServer.PrivateKeyPassphrase, StringComparison.Ordinal)))
+            {
+                matchesStartupIdentity = false;
+            }
+        }
+
+        if (matchesStartupIdentity)
+        {
+            if (snapProxy.LastStartupLatencyMs is not null)
+            {
+                liveProxy.LastStartupLatencyMs = snapProxy.LastStartupLatencyMs;
+            }
+            if (snapProxy.LastStartupFailureUtc is null || snapProxy.LastStartupFailureUtc >= (liveProxy.LastStartupFailureUtc ?? DateTimeOffset.MinValue))
+            {
+                liveProxy.LastStartupFailureUtc = snapProxy.LastStartupFailureUtc;
+            }
+        }
+    }
+
     private async Task<bool> EnsureManagedJumphostAsync(
         CancellationToken cancellationToken, bool startMissing, Guid? startupServerId = null,
         Guid? proxyId = null, Guid? accessTargetServerId = null, bool startAllAutoStart = false,
         Guid? forceAccessScriptProxyId = null, bool deferAccessScriptUntilReady = false,
-        bool isManualLaunch = false, bool persist = true)
+        bool isManualLaunch = false, bool persist = true, ManagerConfig? runConfig = null)
     {
-        var ordered = RoutePlanner.OrderedProxies(config)
+        var activeConfig = runConfig ?? config;
+        var ordered = RoutePlanner.OrderedProxies(activeConfig)
             .Where(proxy => startupServerId is null || proxy.StartupServerId == startupServerId)
             .Where(proxy => proxyId is null || proxy.Id == proxyId)
             .ToArray();
@@ -3072,16 +3595,18 @@ public partial class MainWindow : Window
                 if (proxy.LastStartupFailureUtc is not null)
                 {
                     proxy.LastStartupFailureUtc = null;
+                    SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: proxy.StartupServerId);
                     if (persist) SaveConfig();
                 }
         }
         if (!startMissing && !startAllAutoStart)
             foreach (var proxy in ordered)
-                if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                if (await IsProxyReadyAndPreparedAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
                 {
                     if (proxy.LastStartupFailureUtc is not null)
                     {
                         proxy.LastStartupFailureUtc = null;
+                        SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: proxy.StartupServerId);
                         if (persist) SaveConfig();
                     }
                     return true;
@@ -3092,18 +3617,19 @@ public partial class MainWindow : Window
                                                              (startMissing || item.AutoStartWhenUnavailable)))
         {
             var proxy = candidateProxy;
-            if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+            if (await IsProxyReadyAndPreparedAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
             {
                 if (proxy.LastStartupFailureUtc is not null)
                 {
                     proxy.LastStartupFailureUtc = null;
+                    SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: proxy.StartupServerId);
                     if (persist) SaveConfig();
                 }
                 anyReady = true;
                 continue;
             }
 
-            var server = config.FindServer(proxy.StartupServerId!.Value);
+            var server = activeConfig.FindServer(proxy.StartupServerId!.Value);
             if (server is null) continue;
 
             var eligibility = JumphostStartupPolicy.CheckEligibility(
@@ -3119,13 +3645,33 @@ public partial class MainWindow : Window
             await gate.WaitAsync(cancellationToken);
             try
             {
-                proxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxy.Id) ?? proxy;
-                if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                proxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxy.Id) ?? proxy;
+                var hasReusableManaged = jumphostProcesses.TryGetAliveManaged(proxy, out var existingManaged);
+                var hasIncompatibleEndpointConflict =
+                    jumphostProcesses.TryGetAlive(proxy, JumphostConsoleKind.Entry, out var registered) &&
+                    !hasReusableManaged &&
+                    ProxyEndpointComparer.HostsEquivalent(registered.Host, proxy.Host) &&
+                    registered.Port == proxy.Port;
+                var probeHost = proxy.Host;
+                var probePort = proxy.Port;
+                if (existingManaged is not null)
                 {
-                    RouteLog($"Jumphost startup reused: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
+                    probeHost = existingManaged.Host;
+                    probePort = existingManaged.Port;
+                }
+                if (!hasIncompatibleEndpointConflict &&
+                    await IsSocks5ReadyAsync(probeHost, probePort, TimeSpan.FromSeconds(1), cancellationToken))
+                {
+                    RouteLog($"Jumphost startup reused: name={proxy.Name}; endpoint={probeHost}:{probePort}");
+                    if (existingManaged is not null && !IsLiveConfigProxy(proxy))
+                    {
+                        proxy.Host = existingManaged.Host;
+                        proxy.Port = existingManaged.Port;
+                    }
                     if (proxy.LastStartupFailureUtc is not null)
                     {
                         proxy.LastStartupFailureUtc = null;
+                        SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: proxy.StartupServerId);
                         if (persist) SaveConfig();
                     }
                     anyReady = true;
@@ -3133,8 +3679,18 @@ public partial class MainWindow : Window
                     continue;
                 }
 
-                server = config.FindServer(proxy.StartupServerId!.Value);
+                server = activeConfig.FindServer(proxy.StartupServerId!.Value);
                 if (server is null) continue;
+
+                if (!isManualLaunch)
+                {
+                    var liveProxyForFailure = config.BaseProxies.FirstOrDefault(item => item.Id == proxy.Id);
+                    if (liveProxyForFailure?.LastStartupFailureUtc is not null &&
+                        (proxy.LastStartupFailureUtc is null || liveProxyForFailure.LastStartupFailureUtc > proxy.LastStartupFailureUtc))
+                    {
+                        proxy.LastStartupFailureUtc = liveProxyForFailure.LastStartupFailureUtc;
+                    }
+                }
 
                 var gateEligibility = JumphostStartupPolicy.CheckEligibility(
                     proxy, server, isManualLaunch, IsServerBeingEditedWithUnsavedChanges, DateTimeOffset.UtcNow);
@@ -3147,13 +3703,15 @@ public partial class MainWindow : Window
                 var stoppedExistingManagedProcess = false;
                 if (jumphostProcesses.TryGetAliveManaged(proxy, out var existingProcess))
                 {
+                    var existingHost = existingProcess.Host;
+                    var existingPort = existingProcess.Port;
                     RouteLog($"Jumphost process alive while SOCKS is unavailable: name={proxy.Name}; " +
-                             $"endpoint={proxy.Host}:{proxy.Port}; pid={existingProcess.ProcessId}");
-                    var existingDeadline = DateTime.UtcNow.AddSeconds(config.ConnectionTimeoutSeconds);
+                             $"endpoint={existingHost}:{existingPort}; pid={existingProcess.ProcessId}");
+                    var existingDeadline = DateTime.UtcNow.AddSeconds(activeConfig.ConnectionTimeoutSeconds);
                     while (DateTime.UtcNow < existingDeadline)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                        if (await IsSocks5ReadyAsync(existingHost, existingPort, TimeSpan.FromSeconds(1), cancellationToken))
                         {
                             anyReady = true;
                             if (!startAllAutoStart) return true;
@@ -3161,11 +3719,12 @@ public partial class MainWindow : Window
                         }
                         await Task.Delay(500, cancellationToken);
                     }
-                    if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                    if (await IsSocks5ReadyAsync(existingHost, existingPort, TimeSpan.FromSeconds(1), cancellationToken))
                         continue;
-                    if (!jumphostProcesses.TryStopAliveManaged(proxy))
+                    if (!await jumphostProcesses.TryStopAliveManagedAsync(proxy, cancellationToken))
                     {
                         JumphostStartupPolicy.HandleStopUnhealthyProcessFailure(proxy, DateTimeOffset.UtcNow);
+                        SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: proxy.StartupServerId);
                         if (persist) SaveConfig();
                         Status($"Не удалось безопасно перезапустить собственную KiTTY «{proxy.Name}».");
                         continue;
@@ -3173,54 +3732,92 @@ public partial class MainWindow : Window
                     RouteLog($"Unhealthy managed jumphost stopped for one retry: name={proxy.Name}; pid={existingProcess.ProcessId}");
                     stoppedExistingManagedProcess = true;
                 }
-            var entryTitle = JumphostConsoleTitles.EntryTitle(server.Name, proxy.Name);
-            var startupStopwatch = System.Diagnostics.Stopwatch.StartNew();
-            var forcedScheduledAccessScript = proxy.Id == forceAccessScriptProxyId;
-            var runAccessScript = forcedScheduledAccessScript ||
-                AccessGrantPolicy.ShouldRunAccessScript(proxy, DateTimeOffset.UtcNow);
 
-            async Task<bool> WaitForReadyAsync()
-            {
-                var deadline = DateTime.UtcNow.AddSeconds(config.ConnectionTimeoutSeconds);
-                while (DateTime.UtcNow < deadline)
+                var started = await StartManagedJumphostInternalAsync(
+                    proxy, server, isManualLaunch, stoppedExistingManagedProcess,
+                    deferAccessScriptUntilReady, accessTargetServerId,
+                    forceAccessScriptProxyId, cancellationToken, persist, runConfig: activeConfig);
+                if (started)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
-                    {
-                        if (!deferAccessScriptUntilReady)
-                        {
-                                var accessAlreadyValid = !forcedScheduledAccessScript &&
-                                    await ConfirmExistingAccessAsync(proxy, cancellationToken, persist: persist);
-                            var learnedAccessUnavailable = proxy.AccessProbeServerIds.Count > 0 && !accessAlreadyValid;
-                            if (!accessAlreadyValid && (runAccessScript || learnedAccessUnavailable))
-                            {
-                                Status($"Контрольные серверы через «{proxy.Name}» недоступны. " +
-                                       "Открываю отдельную служебную консоль скрипта доступа…");
-                                await RunAccessScriptWithConsoleChoiceAsync(
-                                    proxy, server, accessTargetServerId,
-                                    forcedScheduledAccessScript ? "scheduled" : "cold-start",
-                                    cancellationToken, persist);
-                            }
-                        }
-                        proxy.LastSuccessUtc = DateTimeOffset.UtcNow;
-                        proxy.LastStartupLatencyMs = startupStopwatch.Elapsed.TotalMilliseconds;
-                        proxy.LastStartupFailureUtc = null;
-                        if (persist) SaveConfig();
-                        Status($"Точка входа «{proxy.Name}» готова");
-                        return true;
-                    }
-                    Status($"Жду SOCKS5 «{proxy.Name}» на {proxy.Host}:{proxy.Port}…");
-                    await Task.Delay(1000, cancellationToken);
+                    if (deferAccessScriptUntilReady) return true;
+                    anyReady = true;
+                    if (!startAllAutoStart) return true;
                 }
-                RouteLog($"Jumphost startup timeout: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
-                return false;
             }
+            finally { gate.Release(); }
+        }
+        return anyReady;
+    }
 
-            // A forgotten own console (manager restarted, notebook lost) must be
-            // adopted by its title instead of spawning a duplicate.
-            using (var titled = KittyWindowInput.FindByTitle(entryTitle))
+    private async Task<bool> StartManagedJumphostInternalAsync(
+        BaseProxy proxy,
+        ManagedServer server,
+        bool isManualLaunch,
+        bool stoppedExistingManagedProcess,
+        bool deferAccessScriptUntilReady,
+        Guid? accessTargetServerId,
+        Guid? forceAccessScriptProxyId,
+        CancellationToken cancellationToken,
+        bool persist = true,
+        ManagerConfig? runConfig = null)
+    {
+        var activeConfig = runConfig ?? config;
+        var initialHost = proxy.Host;
+        var initialStartupServerId = proxy.StartupServerId;
+        var initialAutoSelect = proxy.UseAutomaticPort;
+        var entryTitle = JumphostConsoleTitles.EntryTitle(server.Name, proxy.Name);
+        var startupStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var forcedScheduledAccessScript = proxy.Id == forceAccessScriptProxyId;
+        var runAccessScript = forcedScheduledAccessScript ||
+            AccessGrantPolicy.ShouldRunAccessScript(proxy, DateTimeOffset.UtcNow);
+
+        async Task<bool> WaitForReadyAsync()
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(activeConfig.ConnectionTimeoutSeconds);
+            while (DateTime.UtcNow < deadline)
             {
-                if (titled is not null)
+                cancellationToken.ThrowIfCancellationRequested();
+                if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
+                {
+                    if (!deferAccessScriptUntilReady)
+                    {
+                        var accessAlreadyValid = !forcedScheduledAccessScript &&
+                            await ConfirmExistingAccessAsync(proxy, cancellationToken, persist: persist);
+                        var learnedAccessUnavailable = proxy.AccessProbeServerIds.Count > 0 && !accessAlreadyValid;
+                        if (!accessAlreadyValid && (runAccessScript || learnedAccessUnavailable))
+                        {
+                            Status($"Контрольные серверы через «{proxy.Name}» недоступны. " +
+                                   "Открываю отдельную служебную консоль скрипта доступа…");
+                            await RunAccessScriptWithConsoleChoiceAsync(
+                                proxy, server, accessTargetServerId,
+                                forcedScheduledAccessScript ? "scheduled" : "cold-start",
+                                cancellationToken, persist, runConfig: activeConfig);
+                        }
+                    }
+                    proxy.LastSuccessUtc = DateTimeOffset.UtcNow;
+                    proxy.LastStartupLatencyMs = startupStopwatch.Elapsed.TotalMilliseconds;
+                    proxy.LastStartupFailureUtc = null;
+                    SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: initialStartupServerId);
+                    if (persist) SaveConfig();
+                    Status($"Точка входа «{proxy.Name}» готова");
+                    return true;
+                }
+                Status($"Жду SOCKS5 «{proxy.Name}» на {proxy.Host}:{proxy.Port}…");
+                await Task.Delay(1000, cancellationToken);
+            }
+            RouteLog($"Jumphost startup timeout: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
+            return false;
+        }
+
+        // A forgotten own console (manager restarted, notebook lost) must be
+        // adopted by its title instead of spawning a duplicate.
+        using (var titled = KittyWindowInput.FindByTitle(entryTitle))
+        {
+            if (titled is not null)
+            {
+                var hasIncompatible = jumphostProcesses.TryGetAlive(proxy, JumphostConsoleKind.Entry, out var reg) &&
+                                      !jumphostProcesses.CanReuseManaged(proxy, reg);
+                if (!hasIncompatible && (!proxy.UseAutomaticPort || proxy.Port > 0))
                 {
                     jumphostProcesses.Adopt(proxy, JumphostConsoleKind.Entry, titled.Id, entryTitle);
                     PersistConsoles();
@@ -3228,148 +3825,166 @@ public partial class MainWindow : Window
                              $"endpoint={proxy.Host}:{proxy.Port}; pid={titled.Id}");
                     if (await WaitForReadyAsync())
                     {
-                        if (deferAccessScriptUntilReady) return true;
-                        anyReady = true;
-                        if (!startAllAutoStart) return true;
+                        return true;
                     }
                     else
                     {
                         JumphostStartupPolicy.HandleAdoptedConsoleTimeout(proxy, DateTimeOffset.UtcNow);
+                        SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: initialStartupServerId);
                         if (persist) SaveConfig();
                         RouteLog($"Jumphost startup failed on adopted console: name={proxy.Name}; " +
                                  $"endpoint={proxy.Host}:{proxy.Port}; cooldown until {proxy.LastStartupFailureUtc?.Add(AccessGrantPolicy.StartupFailureCooldown)}");
                         Status($"KiTTY точки входа «{proxy.Name}» открыта (PID {titled.Id}), " +
                                "но SOCKS5 недоступен. Проверьте открытую консоль.");
+                        return false;
                     }
-                    continue;
                 }
             }
+        }
 
-            var maximumLaunchAttempts = isManualLaunch ? (stoppedExistingManagedProcess ? 1 : 2) : 1;
-            for (var launchAttempt = 1; launchAttempt <= maximumLaunchAttempts; launchAttempt++)
-            {
-                Status($"Запускаю точку входа «{proxy.Name}»…");
-                KittyLoginScript? loginScript = null;
-                var launchResult = await JumphostStartupPolicy.ExecuteLaunchSequenceAsync(
-                    proxy,
-                    server,
-                    isManualLaunch,
-                    IsServerBeingEditedWithUnsavedChanges,
-                    preLaunchDelayAsync: async () =>
+        var maximumLaunchAttempts = isManualLaunch ? (stoppedExistingManagedProcess ? 1 : 2) : 1;
+        for (var launchAttempt = 1; launchAttempt <= maximumLaunchAttempts; launchAttempt++)
+        {
+            var expectedPort = proxy.Port;
+            Status($"Запускаю точку входа «{proxy.Name}»…");
+            KittyLoginScript? loginScript = null;
+            var launchResult = await JumphostStartupPolicy.ExecuteLaunchSequenceAsync(
+                proxy,
+                server,
+                isManualLaunch,
+                IsServerBeingEditedWithUnsavedChanges,
+                preLaunchDelayAsync: async () =>
+                {
+                    if (proxy.TotpSecret.Length > 0)
                     {
+                        var period = Math.Max(1, proxy.TotpPeriodSeconds);
+                        var remaining = period - (DateTimeOffset.UtcNow.ToUnixTimeSeconds() % period);
+                        if (remaining < Math.Min(8, period))
+                        {
+                            Status($"Жду новое окно TOTP для «{proxy.Name}»…");
+                            await Task.Delay(TimeSpan.FromSeconds(remaining + 1), cancellationToken);
+                        }
+                    }
+                },
+                selectPortAndVerifyAsync: async () =>
+                {
+                    if (!proxy.UseAutomaticPort &&
+                        await IsTcpPortOpenAsync(proxy.Host, proxy.Port, TimeSpan.FromSeconds(1), cancellationToken))
+                        throw new InvalidOperationException(
+                            $"Порт {proxy.Host}:{proxy.Port} занят процессом, который не отвечает как SOCKS5. " +
+                            "Освободите порт или включите автоматический выбор порта.");
+                    return JumphostPortSelector.Select(proxy);
+                },
+                launchProcessAndWaitReadyAsync: async port =>
+                {
+                    try
+                    {
+                        var (startedProcess, createdScript) = await Task.Run(() =>
+                        {
+                            KittyLoginScript? script = null;
+                            try
+                            {
+                                var steps = JumphostStartupPlan.BuildPostLogin(proxy, server, false);
+                                script = KittyLoginScript.Create(steps);
+                                var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
+                                    ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(activeConfig.KittyPath)
+                                    : ResolveProgram(activeConfig.KittyPath);
+                                var startInfo = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
+                                if (!string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath))
+                                {
+                                    startInfo.ArgumentList.Add("-load");
+                                    startInfo.ArgumentList.Add(server.Name);
+                                }
+                                if (string.IsNullOrWhiteSpace(server.SourceSessionPath) || !File.Exists(server.SourceSessionPath))
+                                {
+                                    startInfo.ArgumentList.Add("-ssh"); startInfo.ArgumentList.Add(server.Host);
+                                    startInfo.ArgumentList.Add("-P"); startInfo.ArgumentList.Add(server.Port.ToString());
+                                    if (server.Username.Length > 0) { startInfo.ArgumentList.Add("-l"); startInfo.ArgumentList.Add(server.Username); }
+                                }
+                                var preserveSavedAuthentication = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
+                                    File.Exists(server.SourceSessionPath) && proxy.TotpSecret.Length == 0;
+                                foreach (var argument in JumphostStartupPlan.KittyAuthenticationArguments(
+                                             server, preserveSavedAuthentication))
+                                    startInfo.ArgumentList.Add(argument);
+                                var startupKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
+                                if (startupKeyPath is not null)
+                                { startInfo.ArgumentList.Add("-i"); startInfo.ArgumentList.Add(startupKeyPath); }
+                                startInfo.ArgumentList.Add("-D"); startInfo.ArgumentList.Add(port.ToString());
+                                if (script is not null)
+                                { startInfo.ArgumentList.Add("-loginscript"); startInfo.ArgumentList.Add(script.Path); }
+                                startInfo.ArgumentList.Add("-title"); startInfo.ArgumentList.Add(entryTitle);
+                                cancellationToken.ThrowIfCancellationRequested();
+                                var proc = Process.Start(startInfo)
+                                    ?? throw new InvalidOperationException("KiTTY не удалось запустить.");
+                                return (proc, script);
+                            }
+                            catch
+                            {
+                                script?.Dispose();
+                                throw;
+                            }
+                        }, cancellationToken);
+
+                        loginScript = createdScript;
+                        var process = startedProcess;
+                        proxy.Port = port;
+                        SyncProxyRuntimeState(proxy, activeConfig, syncPort: true,
+                            originalPort: expectedPort, originalHost: initialHost,
+                            originalStartupServerId: initialStartupServerId, originalAutoSelect: initialAutoSelect);
+                        jumphostProcesses.Remember(proxy, JumphostConsoleKind.Entry, process, entryTitle);
+                        PersistConsoles();
+                        RouteLog($"Jumphost launched: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; pid={process.Id}");
                         if (proxy.TotpSecret.Length > 0)
                         {
-                            var period = Math.Max(1, proxy.TotpPeriodSeconds);
-                            var remaining = period - (DateTimeOffset.UtcNow.ToUnixTimeSeconds() % period);
-                            if (remaining < Math.Min(8, period))
-                            {
-                                Status($"Жду новое окно TOTP для «{proxy.Name}»…");
-                                await Task.Delay(TimeSpan.FromSeconds(remaining + 1), cancellationToken);
-                            }
+                            var code = TotpGenerator.Generate(proxy.TotpSecret, DateTimeOffset.UtcNow,
+                                proxy.TotpDigits, proxy.TotpPeriodSeconds, proxy.TotpAlgorithm);
+                            await KittyWindowInput.SendLineAsync(process, code, cancellationToken);
                         }
-                    },
-                    selectPortAndVerifyAsync: async () =>
+
+                        return await WaitForReadyAsync();
+                    }
+                    finally
                     {
-                        if (!proxy.UseAutomaticPort &&
-                            await IsTcpPortOpenAsync(proxy.Host, proxy.Port, TimeSpan.FromSeconds(1), cancellationToken))
-                            throw new InvalidOperationException(
-                                $"Порт {proxy.Host}:{proxy.Port} занят процессом, который не отвечает как SOCKS5. " +
-                                "Освободите порт или включите автоматический выбор порта.");
-                        return JumphostPortSelector.Select(proxy);
-                    },
-                    launchProcessAndWaitReadyAsync: async port =>
-                    {
-                        try
-                        {
-                            var steps = JumphostStartupPlan.BuildPostLogin(proxy, server, false);
-                            loginScript = KittyLoginScript.Create(steps);
-                            var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
-                                ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(config.KittyPath)
-                                : ResolveProgram(config.KittyPath);
-                            var startInfo = new ProcessStartInfo(kitty) { WorkingDirectory = Path.GetDirectoryName(kitty)! };
-                            if (!string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath))
-                            {
-                                startInfo.ArgumentList.Add("-load");
-                                startInfo.ArgumentList.Add(server.Name);
-                            }
-                            if (string.IsNullOrWhiteSpace(server.SourceSessionPath) || !File.Exists(server.SourceSessionPath))
-                            {
-                                startInfo.ArgumentList.Add("-ssh"); startInfo.ArgumentList.Add(server.Host);
-                                startInfo.ArgumentList.Add("-P"); startInfo.ArgumentList.Add(server.Port.ToString());
-                                if (server.Username.Length > 0) { startInfo.ArgumentList.Add("-l"); startInfo.ArgumentList.Add(server.Username); }
-                            }
-                            var preserveSavedAuthentication = !string.IsNullOrWhiteSpace(server.SourceSessionPath) &&
-                                File.Exists(server.SourceSessionPath) && proxy.TotpSecret.Length == 0;
-                            foreach (var argument in JumphostStartupPlan.KittyAuthenticationArguments(
-                                         server, preserveSavedAuthentication))
-                                startInfo.ArgumentList.Add(argument);
-                            var startupKeyPath = ManagerPathResolver.ResolveOptionalExistingFile(server.PrivateKeyPath, "SSH-ключ");
-                            if (startupKeyPath is not null)
-                            { startInfo.ArgumentList.Add("-i"); startInfo.ArgumentList.Add(startupKeyPath); }
-                            startInfo.ArgumentList.Add("-D"); startInfo.ArgumentList.Add(port.ToString());
-                            if (loginScript is not null)
-                            { startInfo.ArgumentList.Add("-loginscript"); startInfo.ArgumentList.Add(loginScript.Path); }
-                            startInfo.ArgumentList.Add("-title"); startInfo.ArgumentList.Add(entryTitle);
-                            var process = Process.Start(startInfo)
-                                ?? throw new InvalidOperationException("KiTTY не удалось запустить.");
-                            proxy.Port = port;
-                            jumphostProcesses.Remember(proxy, JumphostConsoleKind.Entry, process, entryTitle);
-                            PersistConsoles();
-                            RouteLog($"Jumphost launched: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; pid={process.Id}");
-                            if (proxy.TotpSecret.Length > 0)
-                            {
-                                var code = TotpGenerator.Generate(proxy.TotpSecret, DateTimeOffset.UtcNow,
-                                    proxy.TotpDigits, proxy.TotpPeriodSeconds, proxy.TotpAlgorithm);
-                                await KittyWindowInput.SendLineAsync(process, code, cancellationToken);
-                            }
+                        loginScript?.Dispose();
+                    }
+                },
+                getNow: () => DateTimeOffset.UtcNow);
 
-                            return await WaitForReadyAsync();
-                        }
-                        finally
-                        {
-                            loginScript?.Dispose();
-                        }
-                    },
-                    getNow: () => DateTimeOffset.UtcNow);
+            SyncProxyRuntimeState(proxy, activeConfig, originalStartupServerId: initialStartupServerId);
 
-                if (launchResult.Status == JumphostLaunchStatus.Success)
-                {
-                    if (persist) SaveConfig();
-                    if (deferAccessScriptUntilReady) return true;
-                    anyReady = true;
-                    if (!startAllAutoStart) return true;
-                    break;
-                }
-
-                if (launchResult.Status == JumphostLaunchStatus.AbortedDueToEditing ||
-                    launchResult.Status == JumphostLaunchStatus.SkippedNotEligible)
-                {
-                    RouteLog($"Jumphost startup skipped: name={proxy.Name}; reason={launchResult.Eligibility}");
-                    break;
-                }
-
+            if (launchResult.Status == JumphostLaunchStatus.Success)
+            {
                 if (persist) SaveConfig();
-                if (launchResult.Exception is not null)
-                {
-                    RouteLog($"Jumphost launch error: name={proxy.Name}; error={launchResult.Exception.GetType().Name}: {launchResult.Exception.Message}");
-                    Status($"Ошибка запуска точки входа «{proxy.Name}»: {launchResult.Exception.Message}");
-                    break;
-                }
+                return true;
+            }
 
-                if (launchAttempt == 1 && maximumLaunchAttempts > 1 && jumphostProcesses.TryStopAliveManaged(proxy))
-                {
-                    RouteLog($"New unhealthy jumphost stopped for one retry: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
-                    continue;
-                }
-
-                RouteLog($"Jumphost startup failed: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; cooldown until {proxy.LastStartupFailureUtc?.Add(AccessGrantPolicy.StartupFailureCooldown)}");
-                Status($"Точка входа «{proxy.Name}» не подняла SOCKS5 после запуска.");
+            if (launchResult.Status == JumphostLaunchStatus.AbortedDueToEditing ||
+                launchResult.Status == JumphostLaunchStatus.SkippedNotEligible)
+            {
+                RouteLog($"Jumphost startup skipped: name={proxy.Name}; reason={launchResult.Eligibility}");
                 break;
             }
+
+            if (persist) SaveConfig();
+            if (launchResult.Exception is not null)
+            {
+                RouteLog($"Jumphost launch error: name={proxy.Name}; error={launchResult.Exception.GetType().Name}: {launchResult.Exception.Message}");
+                Status($"Ошибка запуска точки входа «{proxy.Name}»: {launchResult.Exception.Message}");
+                break;
             }
-            finally { gate.Release(); }
+
+            if (launchAttempt == 1 && maximumLaunchAttempts > 1 && await jumphostProcesses.TryStopAliveManagedAsync(proxy, cancellationToken))
+            {
+                RouteLog($"New unhealthy jumphost stopped for one retry: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}");
+                continue;
+            }
+
+            RouteLog($"Jumphost startup failed: name={proxy.Name}; endpoint={proxy.Host}:{proxy.Port}; cooldown until {proxy.LastStartupFailureUtc?.Add(AccessGrantPolicy.StartupFailureCooldown)}");
+            Status($"Точка входа «{proxy.Name}» не подняла SOCKS5 после запуска.");
+            break;
         }
-        return anyReady;
+
+        return false;
     }
 
     private async Task OfferStartMissingJumphostsAsync()
@@ -3416,9 +4031,12 @@ public partial class MainWindow : Window
     {
         if (!configAvailable) return;
         foreach (var record in JumphostConsoleStore.Load(ConsoleStorePath))
-            if (jumphostProcesses.Restore(record))
+        {
+            var proxy = config.BaseProxies.FirstOrDefault(p => p.Id == record.ProxyId);
+            if (jumphostProcesses.Restore(record, proxy))
                 RouteLog($"Console notebook restored: proxy={record.ProxyId}; kind={record.Kind}; " +
                          $"pid={record.ProcessId}; title={record.Title}");
+        }
         foreach (var proxy in config.BaseProxies)
         {
             if (proxy.StartupServerId is not Guid serverId) continue;
@@ -3669,24 +4287,67 @@ public partial class MainWindow : Window
 
     private async Task StartManagedJumphostAsync(ManagedServer server)
     {
-        var points = config.BaseProxies.Where(proxy => proxy.Enabled && proxy.StartupServerId == server.Id).ToArray();
-        if (points.Length == 0) { Warn("Эта сессия не назначена точкой входа."); return; }
-        await BusyAsync($"Запускаю точку входа «{server.Name}»…", async cancellationToken =>
+        if (sessionExitPending || sessionExitCompleted) return;
+        var openingKey = (server.Id, (Guid?)null);
+        if (!pendingSessionOpenings.Add(openingKey))
         {
+            Status($"Запуск точки входа «{server.Name}» уже выполняется…");
+            return;
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(sessionCts.Token);
+        var cancellationToken = linkedCts.Token;
+
+        var snapshotConfig = ConfigTransfer.CloneSnapshot(config);
+        var snapshotServer = snapshotConfig.FindServer(server.Id) ?? server;
+
+        try
+        {
+            var points = snapshotConfig.BaseProxies.Where(proxy => proxy.Enabled && proxy.StartupServerId == snapshotServer.Id).ToArray();
+            if (points.Length == 0)
+            {
+                Status("Эта сессия не назначена точкой входа.");
+                RouteLog($"StartManagedJumphostAsync: session {snapshotServer.Name} is not configured as startup for any proxy");
+                return;
+            }
+
+            Status($"Запускаю точку входа «{snapshotServer.Name}»…");
+
             foreach (var proxy in points)
                 if (await IsSocks5ReadyAsync(proxy, TimeSpan.FromSeconds(1), cancellationToken))
                 {
                     if (proxy.LastStartupFailureUtc is not null)
                     {
                         proxy.LastStartupFailureUtc = null;
+                        SyncProxyRuntimeState(proxy, snapshotConfig, originalStartupServerId: proxy.StartupServerId);
                         SaveConfig();
                     }
-                    Status($"Точка входа «{server.Name}» уже работает; источник существующего SOCKS5 не подтверждён");
+                    Status($"Точка входа «{snapshotServer.Name}» уже работает; источник существующего SOCKS5 не подтверждён");
                     return;
                 }
-            if (!await EnsureManagedJumphostAsync(cancellationToken, true, server.Id, isManualLaunch: true))
-                throw new InvalidOperationException("Не удалось запустить назначенную точку входа.");
-        });
+
+            if (!await EnsureManagedJumphostAsync(cancellationToken, true, snapshotServer.Id, isManualLaunch: true, runConfig: snapshotConfig))
+            {
+                Status($"Не удалось запустить назначенную точку входа «{snapshotServer.Name}».");
+                RouteLog($"Не удалось запустить назначенную точку входа «{snapshotServer.Name}».");
+                return;
+            }
+
+            Status($"Точка входа «{snapshotServer.Name}» успешно запущена.");
+        }
+        catch (OperationCanceledException)
+        {
+            Status($"Запуск точки входа «{snapshotServer.Name}» отменён.");
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"Ошибка запуска точки входа «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
+            Status($"Ошибка запуска точки входа «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
+        }
+        finally
+        {
+            pendingSessionOpenings.Remove(openingKey);
+        }
     }
 
     private static async Task<bool> IsTcpPortOpenAsync(
@@ -3703,6 +4364,56 @@ public partial class MainWindow : Window
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return false; }
         catch { return false; }
+    }
+
+    private bool IsLiveConfigProxy(BaseProxy proxy) =>
+        config.BaseProxies.Any(live => ReferenceEquals(live, proxy));
+
+    private async Task<bool> IsProxyReadyAndPreparedAsync(
+        BaseProxy proxy, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var startupGate = jumphostStartupGates.GetOrAdd(proxy.Id, _ => new SemaphoreSlim(1, 1));
+        await startupGate.WaitAsync(cancellationToken);
+        try
+        {
+            var accessGate = accessScriptGates.GetOrAdd(proxy.Id, _ => new SemaphoreSlim(1, 1));
+            await accessGate.WaitAsync(cancellationToken);
+            try
+            {
+                var hasReusableManaged = jumphostProcesses.TryGetAliveManaged(proxy, out var existingManaged);
+                var hasIncompatibleEndpointConflict =
+                    jumphostProcesses.TryGetAlive(proxy, JumphostConsoleKind.Entry, out var registered) &&
+                    !hasReusableManaged &&
+                    ProxyEndpointComparer.HostsEquivalent(registered.Host, proxy.Host) &&
+                    registered.Port == proxy.Port;
+
+                if (hasIncompatibleEndpointConflict)
+                    return false;
+
+                var probeHost = proxy.Host;
+                var probePort = proxy.Port;
+                if (existingManaged is not null)
+                {
+                    probeHost = existingManaged.Host;
+                    probePort = existingManaged.Port;
+                }
+                var ready = await IsSocks5ReadyAsync(probeHost, probePort, timeout, cancellationToken);
+                if (ready && existingManaged is not null && !IsLiveConfigProxy(proxy))
+                {
+                    proxy.Host = existingManaged.Host;
+                    proxy.Port = existingManaged.Port;
+                }
+                return ready;
+            }
+            finally
+            {
+                accessGate.Release();
+            }
+        }
+        finally
+        {
+            startupGate.Release();
+        }
     }
 
     private static async Task<bool> IsSocks5ReadyAsync(
@@ -4143,32 +4854,137 @@ public partial class MainWindow : Window
     {
         var source = SelectedRow()?.Server ?? selectedServer;
         if (source is null) return;
+        if (savedLinksWindows.TryGetValue(source.Id, out var existing))
+        {
+            if (existing.WindowState == WindowState.Minimized) existing.WindowState = WindowState.Normal;
+            existing.Activate();
+            return;
+        }
         var dialog = new SavedLinksDialog(config, source, CheckSavedLinksAsync, SaveConfig,
             async (viaServerId, cancellationToken) =>
             {
                 await OpenRoutedConsoleAsync(source, viaServerId, cancellationToken);
             }, hideEntryPointLinks: true) { Owner = this };
-        _ = dialog.ShowDialog();
+        savedLinksWindows[source.Id] = dialog;
+        dialog.Closed += (_, _) => savedLinksWindows.Remove(source.Id);
+        dialog.Show();
+    }
+
+    private void CloseActiveSavedLinksDialogs()
+    {
+        foreach (var dialog in savedLinksWindows.Values.ToList())
+        {
+            try { dialog.Close(); } catch { }
+        }
+        savedLinksWindows.Clear();
     }
 
     private async Task<IReadOnlyList<ConnectivityResult>> CheckSavedLinksAsync(
         Guid sourceId, IReadOnlyList<Guid> targetIds, CancellationToken cancellationToken)
     {
-        await EnsureManagedJumphostAsync(cancellationToken, false);
-        var source = config.FindServer(sourceId)
+        var snapshotConfig = ConfigTransfer.CloneSnapshot(config);
+        await EnsureManagedJumphostAsync(cancellationToken, false, runConfig: snapshotConfig);
+        var snapSource = snapshotConfig.FindServer(sourceId)
             ?? throw new InvalidOperationException("Исходный сервер связи не найден.");
-        var results = await ssh.CheckFromAsync(config, sourceId, targetIds, cancellationToken);
+        var initialFingerprints = snapshotConfig.AllServers()
+            .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
+
+        var checkingSsh = new SshConnectionService
+        {
+            Timeout = TimeSpan.FromSeconds(snapshotConfig.ConnectionTimeoutSeconds),
+            EndpointProbeTimeout = TimeSpan.FromSeconds(snapshotConfig.EndpointProbeTimeoutSeconds),
+            HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, cancellationToken),
+            HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, cancellationToken),
+        };
+
+        var results = await checkingSsh.CheckFromAsync(snapshotConfig, sourceId, targetIds, cancellationToken);
+        var changed = false;
+
         foreach (var result in results)
         {
-            var destination = config.FindServer(result.TargetId);
-            Log($"{source.Name} → {destination?.Name}: {(result.Success ? "OK" : "FAIL")} — {result.Message}" +
+            var liveSource = config.FindServer(sourceId);
+            var liveDest = config.FindServer(result.TargetId);
+            if (liveSource is null || liveDest is null) continue;
+
+            Log($"{liveSource.Name} → {liveDest.Name}: {(result.Success ? "OK" : "FAIL")} — {result.Message}" +
                 (result.Strategy.Length == 0 ? "" : $"; strategy={result.Strategy}"));
+
+            if (initialFingerprints.TryGetValue(sourceId, out var initSource) &&
+                (!string.Equals(liveSource.Host, initSource.Host, StringComparison.OrdinalIgnoreCase) ||
+                 liveSource.Port != initSource.Port))
+                continue;
+
+            if (initialFingerprints.TryGetValue(result.TargetId, out var initDest) &&
+                (!string.Equals(liveDest.Host, initDest.Host, StringComparison.OrdinalIgnoreCase) ||
+                 liveDest.Port != initDest.Port))
+                continue;
+
+            var snapDest = snapshotConfig.FindServer(result.TargetId);
+            if (snapSource.PreferredRoute is not null &&
+                RoutePreferencePolicy.ShouldReplacePreferred(liveSource.PreferredRoute, snapSource.PreferredRoute.ServerIds))
+            {
+                liveSource.PreferredRoute = snapSource.PreferredRoute;
+                changed = true;
+            }
+            if (snapDest?.PreferredRoute is not null &&
+                RoutePreferencePolicy.ShouldReplacePreferred(liveDest.PreferredRoute, snapDest.PreferredRoute.ServerIds))
+            {
+                liveDest.PreferredRoute = snapDest.PreferredRoute;
+                changed = true;
+            }
+
             if (result.Success)
+            {
                 ServerLinkPairPolicy.RememberDirectedSuccess(config, result, DateTimeOffset.UtcNow);
+                changed = true;
+            }
             else
+            {
                 ServerLinkPairPolicy.InvalidateDirection(config, sourceId, result.TargetId);
+                changed = true;
+            }
         }
-        SaveConfig();
+
+        foreach (var hop in snapshotConfig.AllServers())
+        {
+            var liveHop = config.FindServer(hop.Id);
+            if (liveHop is null) continue;
+            if (!initialFingerprints.TryGetValue(hop.Id, out var initial)) continue;
+            if (!string.Equals(liveHop.Host, initial.Host, StringComparison.OrdinalIgnoreCase) || liveHop.Port != initial.Port) continue;
+            if (!string.IsNullOrEmpty(hop.HostKeyFingerprint) &&
+                !string.Equals(hop.HostKeyFingerprint, initial.Fingerprint, StringComparison.Ordinal) &&
+                string.Equals(liveHop.HostKeyFingerprint ?? "", initial.Fingerprint, StringComparison.Ordinal))
+            {
+                liveHop.HostKeyFingerprint = hop.HostKeyFingerprint;
+                liveHop.HostKeyAlgorithm = hop.HostKeyAlgorithm;
+                liveHop.HostKeyBits = hop.HostKeyBits;
+                changed = true;
+            }
+            foreach (var snapshotPref in hop.EndpointPreferences)
+            {
+                var livePref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                    item.ProxyId == snapshotPref.ProxyId &&
+                    item.PreviousServerId == snapshotPref.PreviousServerId);
+                if (livePref is null || livePref.LastSuccessUtc <= snapshotPref.LastSuccessUtc)
+                {
+                    var hopContext = snapshotPref.ProxyId is not null
+                        ? EndpointContext.Direct(snapshotPref.ProxyId.Value)
+                        : (snapshotPref.PreviousServerId is not null ? EndpointContext.Via(snapshotPref.PreviousServerId.Value) : (EndpointContext?)null);
+                    ServerEndpointPolicy.Remember(liveHop, snapshotPref.Endpoint, hopContext);
+                    if (snapshotPref.LastSuccessUtc != default)
+                    {
+                        var updatedPref = liveHop.EndpointPreferences.FirstOrDefault(item =>
+                            item.ProxyId == snapshotPref.ProxyId &&
+                            item.PreviousServerId == snapshotPref.PreviousServerId);
+                        if (updatedPref is not null)
+                            updatedPref.LastSuccessUtc = snapshotPref.LastSuccessUtc;
+                    }
+                    changed = true;
+                }
+            }
+        }
+
+        if (changed) SaveConfig();
         return results;
     }
 
@@ -4644,6 +5460,7 @@ public partial class MainWindow : Window
             RouteLog(ImportWizardEngine.DescribeResult(config, merged));
             lastImportBackupPath = ImportWizardTransaction.SaveWithBackup(configPath, merged);
             RouteLog($"IMPORT APPLY success backup=\"{Path.GetFileName(lastImportBackupPath)}\"");
+            CloseActiveSavedLinksDialogs();
             config = merged;
             ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
             ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
@@ -4684,6 +5501,7 @@ public partial class MainWindow : Window
         if (ThemedMessageDialog.Show(this, "Вернуть конфигурацию к состоянию перед последним импортом?",
                 "Откат импорта", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
         ImportWizardTransaction.Rollback(configPath, lastImportBackupPath);
+        CloseActiveSavedLinksDialogs();
         config = ConfigStore.Load(configPath, migratePlaintextSecrets: true);
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
         ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
@@ -4750,6 +5568,17 @@ public partial class MainWindow : Window
             {
                 webExitPending = true;
                 _ = StopWebAndExitAsync(webCts);
+            }
+            return;
+        }
+
+        if (pendingSessionOpenings.Count > 0 && !sessionExitCompleted)
+        {
+            e.Cancel = true;
+            if (!sessionExitPending)
+            {
+                sessionExitPending = true;
+                _ = StopSessionsAndExitAsync(sessionCts);
             }
             return;
         }
@@ -4831,15 +5660,45 @@ public partial class MainWindow : Window
         webExitCompleted = true;
         _ = Dispatcher.BeginInvoke(new Action(Close));
     }
+    private async Task StopSessionsAndExitAsync(CancellationTokenSource exitCts)
+    {
+        try
+        {
+            exitCts.Cancel();
+            while (pendingSessionOpenings.Count > 0)
+            {
+                if (!ReferenceEquals(sessionCts, exitCts) || !sessionExitPending)
+                    return;
+                await Task.Delay(50);
+            }
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"[SessionExit] Ошибка остановки SSH-подключений: {ex.Message}");
+        }
+
+        if (!ReferenceEquals(sessionCts, exitCts) || !sessionExitPending)
+            return;
+
+        sessionExitCompleted = true;
+        _ = Dispatcher.BeginInvoke(new Action(Close));
+    }
     private void ResetPendingExitState()
     {
         webExitPending = false;
         webExitCompleted = false;
+        sessionExitPending = false;
+        sessionExitCompleted = false;
         tunnelsExitConfirmed = false;
         if (webCts.IsCancellationRequested)
         {
             try { webCts.Dispose(); } catch { }
             webCts = new CancellationTokenSource();
+        }
+        if (sessionCts.IsCancellationRequested)
+        {
+            try { sessionCts.Dispose(); } catch { }
+            sessionCts = new CancellationTokenSource();
         }
     }
     private void EnsureTrayIcon()
@@ -4857,6 +5716,7 @@ public partial class MainWindow : Window
     private void Cleanup()
     {
         try { webCts.Cancel(); } catch { }
+        try { sessionCts.Cancel(); } catch { }
         updateSchedulerCancellation?.Cancel();
         operationCancellation?.Cancel();
         backgroundRouteProbes.CancelAll();
@@ -4868,6 +5728,7 @@ public partial class MainWindow : Window
         accessScriptGates.Clear();
         try { SaveConfig(); } catch { }
         StopFirefoxContainers();
+        CloseActiveSavedLinksDialogs();
         try { activeTunnelsWindow?.ForceClose(); } catch { }
         tunnelService.Dispose();
         foreach (var route in activeRoutes) route.Dispose();
@@ -5060,20 +5921,60 @@ public partial class MainWindow : Window
         catch (IOException) { return false; }
         catch (UnauthorizedAccessException) { return false; }
     }
-    private bool ConfirmHostKey(ManagedServer server, string fingerprint)
+    private bool ConfirmHostKey(ManagedServer server, string fingerprint, CancellationToken cancellationToken = default)
     {
         if (config.AutoConfirmHostKeys) return true;
-        return Dispatcher.Invoke(() => ThemedMessageDialog.Show(this, $"Первое подключение к {server.Name} ({server.Endpoint}).\n\nHost key SHA256:\n{fingerprint}\n\nСверьте отпечаток с администратором. Доверять?", "Неизвестный SSH host key", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes);
+        try
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                return ThemedMessageDialog.Show(this,
+                    $"Первое подключение к {server.Name} ({server.Endpoint}).\n\nHost key SHA256:\n{fingerprint}\n\nСверьте отпечаток с администратором. Доверять?",
+                    "Неизвестный SSH host key", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes;
+            }
+            var task = ThemedMessageDialog.ShowModelessAsync(this,
+                $"Первое подключение к {server.Name} ({server.Endpoint}).\n\nHost key SHA256:\n{fingerprint}\n\nСверьте отпечаток с администратором. Доверять?",
+                "Неизвестный SSH host key", MessageBoxButton.YesNo, MessageBoxImage.Warning, cancellationToken);
+            return task.GetAwaiter().GetResult() == MessageBoxResult.Yes;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
     }
-    private bool ConfirmChangedHostKey(ManagedServer server, string oldFingerprint, string newFingerprint)
+
+    private bool ConfirmHostKey(ManagedServer server, string fingerprint) =>
+        ConfirmHostKey(server, fingerprint, CancellationToken.None);
+
+    private bool ConfirmChangedHostKey(ManagedServer server, string oldFingerprint, string newFingerprint, CancellationToken cancellationToken = default)
     {
         if (config.AutoConfirmHostKeys) return true;
-        return Dispatcher.Invoke(() => ThemedMessageDialog.Show(this,
-            $"SSH-ключ сервера {server.Name} ({server.Endpoint}) изменился.\n\n" +
-            $"Сохранённый:\n{oldFingerprint}\n\nНовый:\n{newFingerprint}\n\n" +
-            "Это может означать переустановку сервера или подмену. Сверьте новый SHA256 с администратором. Заменить ключ после проверки?",
-            "Изменился SSH host key", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes);
+        try
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                return ThemedMessageDialog.Show(this,
+                    $"SSH-ключ сервера {server.Name} ({server.Endpoint}) изменился.\n\n" +
+                    $"Сохранённый:\n{oldFingerprint}\n\nНовый:\n{newFingerprint}\n\n" +
+                    "Это может означать переустановку сервера или подмену. Сверьте новый SHA256 с администратором. Заменить ключ после проверки?",
+                    "Изменился SSH host key", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes;
+            }
+            var task = ThemedMessageDialog.ShowModelessAsync(this,
+                $"SSH-ключ сервера {server.Name} ({server.Endpoint}) изменился.\n\n" +
+                $"Сохранённый:\n{oldFingerprint}\n\nНовый:\n{newFingerprint}\n\n" +
+                "Это может означать переустановку сервера или подмену. Сверьте новый SHA256 с администратором. Заменить ключ после проверки?",
+                "Изменился SSH host key", MessageBoxButton.YesNo, MessageBoxImage.Warning, cancellationToken);
+            return task.GetAwaiter().GetResult() == MessageBoxResult.Yes;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
     }
+
+    private bool ConfirmChangedHostKey(ManagedServer server, string oldFingerprint, string newFingerprint) =>
+        ConfirmChangedHostKey(server, oldFingerprint, newFingerprint, CancellationToken.None);
+
     private void Log(string text) { RouteLog(text); Status(text); }
     private void RouteLog(string text)
     {
@@ -5133,10 +6034,13 @@ public partial class MainWindow : Window
         Status("Ошибка");
     }
 
-    private string RedactSecrets(string text)
+    private string RedactSecrets(string text, ManagerConfig? extraConfig = null)
     {
         var result = text;
-        foreach (var secret in config.AllServers()
+        var configs = extraConfig is null || ReferenceEquals(extraConfig, config)
+            ? new[] { config }
+            : new[] { config, extraConfig };
+        foreach (var secret in configs.SelectMany(c => c.AllServers())
                      .SelectMany(server => new[] { server.Password, server.PrivateKeyPassphrase, server.RootPassword, server.PamPassword, server.PamTotpSecret }
                          .Concat(server.WebInterfaces.Select(web => web.Password)))
                      .Where(secret => !string.IsNullOrEmpty(secret))

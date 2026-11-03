@@ -1230,7 +1230,7 @@ internal sealed partial class SelfTestRunner
         var proxy = new BaseProxy { Host = "127.0.0.1", Port = 5555 };
         var registry = new JumphostProcessRegistry();
         registry.Remember(proxy, JumphostConsoleKind.Entry, process, "test");
-        Equal(true, registry.TryStopAliveManaged(proxy));
+        Equal(true, registry.TryStopAliveManagedAsync(proxy).GetAwaiter().GetResult());
         try
         {
             using var remaining = Process.GetProcessById(processId);

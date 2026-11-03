@@ -8,7 +8,7 @@ namespace KiTTYManager.App;
 
 internal sealed record ManagedJumphostProcess(
     Guid ProxyId, JumphostConsoleKind Kind, int ProcessId, DateTime ProcessStartTimeUtc,
-    string Host, int Port, string Title);
+    string Host, int Port, string Title, Guid? StartupServerId = null, bool UseAutomaticPort = false);
 
 internal enum JumphostProcessKind
 {
@@ -36,7 +36,7 @@ internal sealed class JumphostProcessRegistry
     private readonly ConcurrentDictionary<Key, ManagedJumphostProcess> managed = new();
 
     public void Remember(BaseProxy proxy, JumphostConsoleKind kind, Process process, string title) =>
-        Store(proxy.Id, kind, process, title, proxy.Host, proxy.Port);
+        Store(proxy.Id, kind, process, title, proxy.Host, proxy.Port, proxy.StartupServerId, proxy.UseAutomaticPort);
 
     public bool Adopt(BaseProxy proxy, JumphostConsoleKind kind, int processId, string title)
     {
@@ -48,7 +48,7 @@ internal sealed class JumphostProcessRegistry
                 process.Dispose();
                 return false;
             }
-            Store(proxy.Id, kind, process, title, proxy.Host, proxy.Port);
+            Store(proxy.Id, kind, process, title, proxy.Host, proxy.Port, proxy.StartupServerId, proxy.UseAutomaticPort);
             return true;
         }
         catch (ArgumentException) { return false; }
@@ -57,7 +57,7 @@ internal sealed class JumphostProcessRegistry
         catch (NotSupportedException) { return false; }
     }
 
-    public bool Restore(JumphostConsoleRecord record)
+    public bool Restore(JumphostConsoleRecord record, BaseProxy? proxy = null)
     {
         try
         {
@@ -77,7 +77,8 @@ internal sealed class JumphostProcessRegistry
                 process.Dispose();
                 return false;
             }
-            Store(record.ProxyId, record.Kind, process, record.Title, record.Host, record.Port);
+            Store(record.ProxyId, record.Kind, process, record.Title, record.Host, record.Port,
+                proxy?.StartupServerId, proxy?.UseAutomaticPort ?? false);
             return true;
         }
         catch (ArgumentException) { return false; }
@@ -86,11 +87,12 @@ internal sealed class JumphostProcessRegistry
 
     private void Store(
         Guid proxyId, JumphostConsoleKind kind, Process process, string title,
-        string host, int port)
+        string host, int port, Guid? startupServerId = null, bool useAutomaticPort = false)
     {
         process.Refresh();
         var identity = new ManagedJumphostProcess(
-            proxyId, kind, process.Id, process.StartTime.ToUniversalTime(), host, port, title);
+            proxyId, kind, process.Id, process.StartTime.ToUniversalTime(), host, port, title,
+            startupServerId, useAutomaticPort);
         var key = new Key(proxyId, kind);
         managed[key] = identity;
         process.EnableRaisingEvents = true;
@@ -108,12 +110,33 @@ internal sealed class JumphostProcessRegistry
         managed.TryRemove(new Key(proxyId, JumphostConsoleKind.Access), out _);
     }
 
-    public bool TryGetAliveManaged(BaseProxy proxy, out ManagedJumphostProcess identity) =>
-        TryGetAlive(proxy, JumphostConsoleKind.Entry, out identity);
+    public bool CanReuseManaged(BaseProxy proxy, ManagedJumphostProcess identity)
+    {
+        if (identity.ProxyId != proxy.Id) return false;
+        if (identity.StartupServerId != proxy.StartupServerId) return false;
+        if (!ProxyEndpointComparer.HostsEquivalent(identity.Host, proxy.Host)) return false;
+        if (proxy.UseAutomaticPort)
+        {
+            // Автоматический порт переиспользуется, только если процесс также был запущен в режиме автоматического порта
+            return identity.UseAutomaticPort;
+        }
+        return identity.Port == proxy.Port;
+    }
+
+    public bool TryGetAliveManaged(BaseProxy proxy, out ManagedJumphostProcess identity)
+    {
+        if (TryGetAlive(proxy, JumphostConsoleKind.Entry, out identity))
+        {
+            if (CanReuseManaged(proxy, identity))
+                return true;
+            identity = null!;
+        }
+        return false;
+    }
 
     public bool TryStopAliveManaged(BaseProxy proxy)
     {
-        if (!TryGetAliveManaged(proxy, out var identity)) return false;
+        if (!TryGetAlive(proxy, JumphostConsoleKind.Entry, out var identity)) return false;
         try
         {
             using var process = Process.GetProcessById(identity.ProcessId);
@@ -128,6 +151,44 @@ internal sealed class JumphostProcessRegistry
         catch (System.ComponentModel.Win32Exception) { return false; }
         catch (NotSupportedException) { return false; }
     }
+
+    public async Task<bool> TryStopAliveManagedAsync(BaseProxy proxy, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!TryGetAlive(proxy, JumphostConsoleKind.Entry, out var identity)) return false;
+        try
+        {
+            using var process = Process.GetProcessById(identity.ProcessId);
+            if (process.StartTime.ToUniversalTime() != identity.ProcessStartTimeUtc) return false;
+            cancellationToken.ThrowIfCancellationRequested();
+            process.Kill(true);
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeoutCts.Token, cancellationToken);
+            try
+            {
+                await process.WaitForExitAsync(linked.Token);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            managed.TryRemove(new Key(proxy.Id, JumphostConsoleKind.Entry), out _);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+        catch (NotSupportedException) { return false; }
+    }
+
 
     public bool TryGetAlive(BaseProxy proxy, JumphostConsoleKind kind, out ManagedJumphostProcess identity)
     {
@@ -211,9 +272,7 @@ internal sealed class JumphostProcessRegistry
     }
 
     private static bool HostsEquivalent(string left, string right) =>
-        left.Equals(right, StringComparison.OrdinalIgnoreCase) ||
-        IPAddress.TryParse(left, out var leftAddress) &&
-        IPAddress.TryParse(right, out var rightAddress) && leftAddress.Equals(rightAddress);
+        ProxyEndpointComparer.HostsEquivalent(left, right);
 }
 
 internal static class TcpListenerOwner
