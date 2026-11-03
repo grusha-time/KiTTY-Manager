@@ -601,6 +601,8 @@ internal sealed partial class SelfTestRunner
         Equal(false, ContainsUncommentedCode(openConsoleBody, "HeaderPanel.IsEnabled = false"));
         Equal(false, ContainsUncommentedCode(openConsoleBody, "WorkspacePanel.IsEnabled = false"));
         Equal(false, ContainsUncommentedCode(openConsoleBody, "operationCancellation ="));
+        Equal(true, ContainsUncommentedCode(openConsoleBody, "Error(ex"));
+        Equal(true, ContainsUncommentedCode(openConsoleBody, "UpdateCancelOperationButtonVisibility()"));
         Equal(true, ContainsUncommentedCode(openConsoleBody, "pendingSessionOpenings.Add(openingKey)"));
         Equal(true, ContainsUncommentedCode(openConsoleBody, "pendingSessionOpenings.Remove(openingKey)"));
         Equal(true, ContainsUncommentedCode(openConsoleBody, "ConfigTransfer.CloneSnapshot"));
@@ -621,6 +623,9 @@ internal sealed partial class SelfTestRunner
         Equal(false, ContainsUncommentedCode(startJhBody, "HeaderPanel.IsEnabled = false"));
         Equal(false, ContainsUncommentedCode(startJhBody, "WorkspacePanel.IsEnabled = false"));
         Equal(false, ContainsUncommentedCode(startJhBody, "operationCancellation ="));
+        Equal(true, ContainsUncommentedCode(startJhBody, "Error(ex"));
+        Equal(true, ContainsUncommentedCode(startJhBody, "InvalidOperationException"));
+        Equal(true, ContainsUncommentedCode(startJhBody, "UpdateCancelOperationButtonVisibility()"));
         Equal(true, ContainsUncommentedCode(startJhBody, "pendingSessionOpenings.Add(openingKey)"));
         Equal(true, ContainsUncommentedCode(startJhBody, "pendingSessionOpenings.Remove(openingKey)"));
         Equal(true, ContainsUncommentedCode(startJhBody, "ConfigTransfer.CloneSnapshot"));
@@ -680,6 +685,13 @@ internal sealed partial class SelfTestRunner
         Equal(true, ContainsUncommentedCode(startJhInternalBody, "originalHost: initialHost"));
         Equal(true, ContainsUncommentedCode(startJhInternalBody, "originalStartupServerId: initialStartupServerId"));
         Equal(true, ContainsUncommentedCode(startJhInternalBody, "originalAutoSelect: initialAutoSelect"));
+        Equal(true, ContainsUncommentedCode(startJhInternalBody, "isManualLaunch"));
+        Equal(true, ContainsUncommentedCode(startJhInternalBody, "ExceptionDispatchInfo.Capture(launchResult.Exception).Throw()"));
+
+        var offerMissingBody = ExtractMethodBody(csText, "async Task OfferStartMissingJumphostsAsync(");
+        Equal(true, ContainsUncommentedCode(offerMissingBody, "EnsureManagedJumphostAsync"));
+        Equal(true, ContainsUncommentedCode(offerMissingBody, "catch (Exception ex)"));
+        Equal(true, ContainsUncommentedCode(offerMissingBody, "Error(ex"));
 
         var syncRuntimeBody = ExtractMethodBody(csText, "void SyncProxyRuntimeState(");
         Equal(true, ContainsUncommentedCode(syncRuntimeBody, "syncPort"));
@@ -750,6 +762,19 @@ internal sealed partial class SelfTestRunner
         Equal(true, ContainsUncommentedCode(openWebBody, "HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, cancellationToken)"));
         Equal(true, ContainsUncommentedCode(openWebBody, "HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, cancellationToken)"));
         Equal(true, ContainsUncommentedCode(openWebBody, "sshService: webSsh"));
+        Equal(true, ContainsUncommentedCode(openWebBody, "Error(ex"));
+        Equal(true, ContainsUncommentedCode(openWebBody, "UpdateCancelOperationButtonVisibility()"));
+
+        var cancelClickBody = ExtractMethodBody(csText, "void CancelOperation_Click(");
+        Equal(true, ContainsUncommentedCode(cancelClickBody, "sessionExitPending"));
+        Equal(true, ContainsUncommentedCode(cancelClickBody, "webExitPending"));
+        Equal(true, ContainsUncommentedCode(cancelClickBody, "oldSessionCts.Cancel()"));
+        Equal(true, ContainsUncommentedCode(cancelClickBody, "oldWebCts.Cancel()"));
+        Equal(true, ContainsUncommentedCode(cancelClickBody, "CancelOperationButton.IsEnabled = false"));
+
+        var updateCancelBody = ExtractMethodBody(csText, "void UpdateCancelOperationButtonVisibility(");
+        Equal(true, ContainsUncommentedCode(updateCancelBody, "CancelOperationButton.Visibility = Visibility.Visible"));
+        Equal(true, ContainsUncommentedCode(updateCancelBody, "CancelOperationButton.Visibility = Visibility.Collapsed"));
 
         Equal(true, ContainsUncommentedCode(directProbeBody, "if (initialFingerprints.TryGetValue(server.Id, out var initial) &&"));
         Equal(true, ContainsUncommentedCode(directProbeBody, "(!string.Equals(initial.Host, liveServer.Host, StringComparison.OrdinalIgnoreCase) ||"));
@@ -784,6 +809,39 @@ internal sealed partial class SelfTestRunner
         Equal(true, pending.Add((s2, null))); // Different target proceeds
         Equal(true, pending.Remove((s1, null)));
         Equal(true, pending.Add((s1, null))); // Can re-add after completion
+
+        // 3b. Cancellation token swapping and isolation
+        var testSessionCts = new CancellationTokenSource();
+        using (var linkedAttempt1 = CancellationTokenSource.CreateLinkedTokenSource(testSessionCts.Token))
+        {
+            Equal(false, linkedAttempt1.Token.IsCancellationRequested);
+
+            // Simulate CancelOperation_Click: swap out session CTS and cancel old
+            var oldCts = testSessionCts;
+            testSessionCts = new CancellationTokenSource();
+            oldCts.Cancel();
+            oldCts.Dispose();
+
+            // Old attempt is cancelled
+            Equal(true, linkedAttempt1.Token.IsCancellationRequested);
+
+            // Subsequent attempt using new CTS is active and non-cancelled
+            using var linkedAttempt2 = CancellationTokenSource.CreateLinkedTokenSource(testSessionCts.Token);
+            Equal(false, linkedAttempt2.Token.IsCancellationRequested);
+            testSessionCts.Dispose();
+        }
+
+        // 3c. Exit cancellation semantics: if exit is pending, cancel CTS without replacing it
+        var exitSessionCts = new CancellationTokenSource();
+        var exitPending = true;
+        var activeCts = exitSessionCts;
+        if (exitPending)
+        {
+            activeCts.Cancel();
+        }
+        Equal(true, ReferenceEquals(activeCts, exitSessionCts));
+        Equal(true, activeCts.IsCancellationRequested);
+        exitSessionCts.Dispose();
 
         // 4. Modeless dialog structure and API
         var dialogCode = File.ReadAllText(ResolveSourceFile(Path.Combine("src", "KiTTYManager.App", "ThemedMessageDialog.xaml.cs")));

@@ -1381,15 +1381,10 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            if (nonModal)
-            {
-                RouteLog($"Ошибка открытия исходной сессии KiTTY «{server.Name}»: {ex.Message}");
-                Status($"Ошибка открытия сессии «{server.Name}»: {ex.Message}");
-            }
-            else
-            {
-                Error(ex);
-            }
+            var errText = $"Ошибка открытия сессии «{server.Name}»: {ex.Message}";
+            RouteLog($"Ошибка открытия исходной сессии KiTTY «{server.Name}»: {ex.Message}");
+            Status(errText);
+            Error(ex, errText);
         }
     }
 
@@ -1504,6 +1499,7 @@ public partial class MainWindow : Window
             Status($"Подключение к «{server.Name}» уже выполняется…");
             return;
         }
+        UpdateCancelOperationButtonVisibility();
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(sessionCts.Token, externalCancellationToken);
         var cancellationToken = linkedCts.Token;
@@ -1513,6 +1509,7 @@ public partial class MainWindow : Window
         if (snapshotServer is null)
         {
             pendingSessionOpenings.Remove(openingKey);
+            UpdateCancelOperationButtonVisibility();
             RouteLog($"OpenRoutedConsoleAsync: server not found in configuration: {server.Name} ({server.Id})");
             Status($"Сессия «{server.Name}» не найдена в конфигурации.");
             return;
@@ -2002,12 +1999,15 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            RouteLog($"Ошибка подключения к «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
-            Status($"Ошибка подключения к «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
+            var errText = $"Ошибка подключения к «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}";
+            RouteLog(errText);
+            Status(errText);
+            Error(ex, errText);
         }
         finally
         {
             pendingSessionOpenings.Remove(openingKey);
+            UpdateCancelOperationButtonVisibility();
         }
     }
 
@@ -2129,6 +2129,7 @@ public partial class MainWindow : Window
         if (serverSnapshot is null) return;
 
         pendingWebOpenings.Add(containerKey);
+        UpdateCancelOperationButtonVisibility();
         ssh.ClearFailureCache();
 
         ActiveRoute? route = null;
@@ -2358,8 +2359,10 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            var errText = $"Ошибка подключения к «{webName}»: {ex.Message}";
             RouteLog($"Ошибка подключения к веб-интерфейсу «{serverName} — {webName}»: {ex.Message}");
-            Status($"Ошибка подключения к «{webName}»: {ex.Message}");
+            Status(errText);
+            Error(ex, errText);
         }
         finally
         {
@@ -2372,6 +2375,7 @@ public partial class MainWindow : Window
                 if (route is not null) ReleaseRoute(route);
             }
             pendingWebOpenings.Remove(containerKey);
+            UpdateCancelOperationButtonVisibility();
         }
     }
 
@@ -4017,6 +4021,10 @@ public partial class MainWindow : Window
             {
                 RouteLog($"Jumphost launch error: name={proxy.Name}; error={launchResult.Exception.GetType().Name}: {launchResult.Exception.Message}");
                 Status($"Ошибка запуска точки входа «{proxy.Name}»: {launchResult.Exception.Message}");
+                if (isManualLaunch)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(launchResult.Exception).Throw();
+                }
                 break;
             }
 
@@ -4058,7 +4066,19 @@ public partial class MainWindow : Window
                 proxy.LastStartupFailureUtc = null;
                 continue;
             }
-            await EnsureManagedJumphostAsync(CancellationToken.None, true, proxyId: proxy.Id, isManualLaunch: true);
+            try
+            {
+                await EnsureManagedJumphostAsync(CancellationToken.None, true, proxyId: proxy.Id, isManualLaunch: true);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                RouteLog($"Startup offer jumphost error: name={proxy.Name}; error={ex.GetType().Name}: {ex.Message}");
+                Error(ex, $"Ошибка запуска точки входа «{proxy.Name}»: {ex.Message}");
+            }
         }
     }
 
@@ -4341,6 +4361,7 @@ public partial class MainWindow : Window
             Status($"Запуск точки входа «{server.Name}» уже выполняется…");
             return;
         }
+        UpdateCancelOperationButtonVisibility();
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(sessionCts.Token);
         var cancellationToken = linkedCts.Token;
@@ -4375,9 +4396,7 @@ public partial class MainWindow : Window
 
             if (!await EnsureManagedJumphostAsync(cancellationToken, true, snapshotServer.Id, isManualLaunch: true, runConfig: snapshotConfig))
             {
-                Status($"Не удалось запустить назначенную точку входа «{snapshotServer.Name}».");
-                RouteLog($"Не удалось запустить назначенную точку входа «{snapshotServer.Name}».");
-                return;
+                throw new InvalidOperationException($"Не удалось запустить назначенную точку входа «{snapshotServer.Name}».");
             }
 
             Status($"Точка входа «{snapshotServer.Name}» успешно запущена.");
@@ -4388,12 +4407,15 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            RouteLog($"Ошибка запуска точки входа «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
-            Status($"Ошибка запуска точки входа «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}");
+            var errText = $"Ошибка запуска точки входа «{snapshotServer.Name}»: {RedactSecrets(ex.Message, snapshotConfig)}";
+            RouteLog(errText);
+            Status(errText);
+            Error(ex, errText);
         }
         finally
         {
             pendingSessionOpenings.Remove(openingKey);
+            UpdateCancelOperationButtonVisibility();
         }
     }
 
@@ -5747,6 +5769,7 @@ public partial class MainWindow : Window
             try { sessionCts.Dispose(); } catch { }
             sessionCts = new CancellationTokenSource();
         }
+        UpdateCancelOperationButtonVisibility();
     }
     private void EnsureTrayIcon()
     {
@@ -5783,6 +5806,7 @@ public partial class MainWindow : Window
         KittyWindowInput.CleanupStaleLogs();
         pendingUpdateSession?.Commit();
         try { webCts.Dispose(); } catch { }
+        try { sessionCts.Dispose(); } catch { }
         try { firefoxStartupLock.Dispose(); } catch { }
     }
 
@@ -5796,8 +5820,7 @@ public partial class MainWindow : Window
         operationCancellation = cancellation;
         HeaderPanel.IsEnabled = false;
         WorkspacePanel.IsEnabled = false;
-        CancelOperationButton.IsEnabled = true;
-        CancelOperationButton.Visibility = Visibility.Visible;
+        UpdateCancelOperationButtonVisibility();
         Status(text);
         try
         {
@@ -5811,13 +5834,13 @@ public partial class MainWindow : Window
             if (ReferenceEquals(operationCancellation, cancellation)) operationCancellation = null;
             HeaderPanel.IsEnabled = true;
             WorkspacePanel.IsEnabled = true;
-            CancelOperationButton.Visibility = Visibility.Collapsed;
+            UpdateCancelOperationButtonVisibility();
         }
     }
     private void EndProgressOperation(CancellationTokenSource cancellation, LinkBuildingProgress progressWindow)
     {
         if (ReferenceEquals(operationCancellation, cancellation)) operationCancellation = null;
-        CancelOperationButton.Visibility = Visibility.Collapsed;
+        UpdateCancelOperationButtonVisibility();
         HeaderPanel.IsEnabled = true;
         WorkspacePanel.IsEnabled = true;
         if (progressWindow.IsLoaded) progressWindow.CloseCompleted();
@@ -5832,12 +5855,74 @@ public partial class MainWindow : Window
         }
         Focus();
     }
+    private void UpdateCancelOperationButtonVisibility()
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.BeginInvoke(new Action(UpdateCancelOperationButtonVisibility));
+            return;
+        }
+
+        var hasActiveWork = operationCancellation is not null ||
+                            pendingSessionOpenings.Count > 0 ||
+                            pendingWebOpenings.Count > 0;
+        if (hasActiveWork)
+        {
+            CancelOperationButton.Visibility = Visibility.Visible;
+            CancelOperationButton.IsEnabled = true;
+        }
+        else
+        {
+            CancelOperationButton.Visibility = Visibility.Collapsed;
+            CancelOperationButton.IsEnabled = false;
+        }
+    }
+
     private void CancelOperation_Click(object sender, RoutedEventArgs e)
     {
-        if (operationCancellation is null) return;
+        var hasActiveSessions = pendingSessionOpenings.Count > 0;
+        var hasActiveWeb = pendingWebOpenings.Count > 0;
+        var hasBusyOperation = operationCancellation is not null;
+
+        if (!hasActiveSessions && !hasActiveWeb && !hasBusyOperation) return;
+
         CancelOperationButton.IsEnabled = false;
         Status("Отменяю операцию…");
-        operationCancellation.Cancel();
+
+        if (hasBusyOperation)
+        {
+            operationCancellation?.Cancel();
+        }
+
+        if (hasActiveSessions)
+        {
+            if (sessionExitPending)
+            {
+                try { sessionCts.Cancel(); } catch { }
+            }
+            else
+            {
+                var oldSessionCts = sessionCts;
+                sessionCts = new CancellationTokenSource();
+                try { oldSessionCts.Cancel(); } catch { }
+                try { oldSessionCts.Dispose(); } catch { }
+            }
+        }
+
+        if (hasActiveWeb)
+        {
+            if (webExitPending)
+            {
+                try { webCts.Cancel(); } catch { }
+            }
+            else
+            {
+                var oldWebCts = webCts;
+                webCts = new CancellationTokenSource();
+                try { oldWebCts.Cancel(); } catch { }
+                try { oldWebCts.Dispose(); } catch { }
+            }
+        }
     }
     private static ManagerConfig LoadInitialConfig(string path, out bool isAvailable)
     {
@@ -6064,8 +6149,15 @@ public partial class MainWindow : Window
         return $"{stage}: {traceEvent.Subject} — {state}";
     }
     private void Warn(string text) => ThemedMessageDialog.Show(this, text, "KiTTY Manager", MessageBoxButton.OK, MessageBoxImage.Warning);
-    private void Error(Exception ex)
+    private void Error(Exception ex, string? explicitStatus = null)
     {
+        if (Dispatcher.HasShutdownStarted || sessionExitPending || webExitPending || forceExit) return;
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(() => Error(ex, explicitStatus));
+            return;
+        }
+
         var details = RedactSecrets(string.Join(" --> ", ExceptionChain(ex)
             .Select(item => $"{item.GetType().Name}: {item.Message}")));
         var logPath = CurrentRouteLogPath;
@@ -6078,7 +6170,7 @@ public partial class MainWindow : Window
                 ? $"Причина: {details}\n\nНе удалось записать журнал: {logError}"
                 : $"Причина: {details}\n\nЖурнал отключён в настройках.";
         ThemedMessageDialog.Show(this, $"{ActionableErrorFormatter.Format(ex)}\n\n{hint}", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-        Status("Ошибка");
+        Status(explicitStatus ?? "Ошибка");
     }
 
     private string RedactSecrets(string text, ManagerConfig? extraConfig = null)

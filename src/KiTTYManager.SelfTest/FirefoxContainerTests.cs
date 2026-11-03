@@ -866,7 +866,8 @@ internal sealed partial class SelfTestRunner
         Equal(false, openMethodBody.Contains("HeaderPanel.IsEnabled = false"));
         Equal(false, openMethodBody.Contains("WorkspacePanel.IsEnabled = false"));
         Equal(false, openMethodBody.Contains("operationCancellation ="));
-        Equal(false, openMethodBody.Contains("Error(ex)"));
+        Equal(true, openMethodBody.Contains("Error(ex"));
+        Equal(true, openMethodBody.Contains("UpdateCancelOperationButtonVisibility()"));
         Equal(true, openMethodBody.Contains("pendingWebOpenings.Contains(containerKey)"));
         Equal(true, openMethodBody.Contains("pendingWebOpenings.Add(containerKey)"));
         Equal(true, openMethodBody.Contains("pendingWebOpenings.Remove(containerKey)"));
