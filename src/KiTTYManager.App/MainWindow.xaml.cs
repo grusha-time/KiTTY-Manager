@@ -2154,7 +2154,7 @@ public partial class MainWindow : Window
                 try
                 {
                     await containerBrowser.Bridge.OpenAsync(containerKey, $"{serverName} — {webName}",
-                        existing.Relay.Port, webUrl, cancellationToken);
+                        existing.Relay.Port, webUrl, cancellationToken, existing.Domains);
                     Status($"Веб-интерфейс «{serverName} — {webName}» открыт.");
                 }
                 catch
@@ -2236,6 +2236,12 @@ public partial class MainWindow : Window
                 if (!resolverMappings.Any(m => string.Equals(m.Key, pair.Key, StringComparison.OrdinalIgnoreCase)))
                     resolverMappings.Add(pair);
             }
+            var domainSnapshot = new List<string>();
+            if (!System.Net.IPAddress.TryParse(originalDestination.DnsSafeHost, out _))
+            {
+                domainSnapshot.Add(ResolvingSocks5Relay.NormalizeDomain(originalDestination.DnsSafeHost));
+            }
+
             resolver = new ResolvingSocks5Relay("127.0.0.1", webPort, resolverMappings, resolveUnmappedLocally: true);
             var browserProxyPort = resolver.Port;
 
@@ -2330,13 +2336,13 @@ public partial class MainWindow : Window
             if (containerBrowser?.IsRunning != true || !containerBrowser.Bridge.Connected)
                 throw new IOException("Firefox или расширение контейнеров недоступны.");
 
-            containerSessions.Add(containerKey, new ContainerWebSession(tunnel, route, resolver));
+            containerSessions.Add(containerKey, new ContainerWebSession(tunnel, route, resolver, domainSnapshot));
             handedOff = true;
 
             try
             {
                 await containerBrowser.Bridge.OpenAsync(containerKey, $"{serverName} — {webName}",
-                    browserProxyPort, webUrl, cancellationToken);
+                    browserProxyPort, webUrl, cancellationToken, domainSnapshot);
 
                 if (config.FindServer(serverId) is not { } verifiedServer || !verifiedServer.WebInterfaces.Any(w => w.Id == webId))
                 {

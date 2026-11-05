@@ -25,7 +25,7 @@ public sealed class FirefoxContainerBridge : IDisposable
     public event Action<string>? Closed;
     public event Action<string>? PurgeAcknowledged;
     public Action<string>? Trace { get; set; }
-    private sealed record Route(string Key, string Name, int Port) { public bool Opened { get; set; } }
+    private sealed record Route(string Key, string Name, int Port, IReadOnlyList<string> Domains) { public bool Opened { get; set; } }
     private sealed record Pending(string Key, string Url)
     {
         public TaskCompletionSource<bool> Done { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -51,16 +51,50 @@ public sealed class FirefoxContainerBridge : IDisposable
         _ = AcceptAsync(blockedListener, true);
     }
 
-    public async Task OpenAsync(string key, string name, int port, string url, CancellationToken token)
+    public async Task OpenAsync(string key, string name, int port, string url, CancellationToken token,
+        IEnumerable<string>? domains = null)
     {
         if (port is < 1 or > 65535 || !Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
             uri.Scheme is not ("http" or "https")) throw new ArgumentException("Ожидается HTTP(S) URL и порт прокси.");
         var id = Guid.NewGuid().ToString("N");
         var command = new Pending(key, url);
+        var domainList = new List<string>();
+        if (domains is not null)
+        {
+            foreach (var d in domains)
+            {
+                if (string.IsNullOrWhiteSpace(d) || IPAddress.TryParse(d.Trim(), out _)) continue;
+                try
+                {
+                    var norm = ResolvingSocks5Relay.NormalizeDomain(d);
+                    if (!domainList.Contains(norm, StringComparer.OrdinalIgnoreCase))
+                        domainList.Add(norm);
+                }
+                catch { }
+            }
+        }
+        if (!IPAddress.TryParse(uri.Host, out _))
+        {
+            try
+            {
+                var norm = ResolvingSocks5Relay.NormalizeDomain(uri.DnsSafeHost);
+                if (!domainList.Contains(norm, StringComparer.OrdinalIgnoreCase))
+                    domainList.Add(norm);
+            }
+            catch { }
+        }
+
         lock (stateGate)
         {
-            routes.AddOrUpdate(key, new Route(key, name, port), (_, old) => old.Port == port
-                ? old : throw new InvalidOperationException("Контейнер уже связан с другим туннелем."));
+            routes.AddOrUpdate(key,
+                new Route(key, name, port, domainList),
+                (_, old) =>
+                {
+                    if (old.Port != port)
+                        throw new InvalidOperationException("Контейнер уже связан с другим туннелем.");
+                    var merged = old.Domains.Concat(domainList).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    return new Route(key, name, port, merged) { Opened = old.Opened };
+                });
             commands[id] = command;
         }
         try { await command.Done.Task.WaitAsync(TimeSpan.FromSeconds(20), token); }
@@ -173,9 +207,24 @@ public sealed class FirefoxContainerBridge : IDisposable
                         }
                     }
                     Interlocked.Exchange(ref lastPollTicks, DateTime.UtcNow.Ticks);
+                    var domainGroups = routes.Values
+                        .SelectMany(r => r.Domains.Select(d => (Domain: d, Route: r)))
+                        .GroupBy(x => x.Domain, StringComparer.OrdinalIgnoreCase);
+
+                    var uniqueDomainRoutes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var group in domainGroups)
+                    {
+                        var distinctKeys = group.Select(x => x.Route.Key).Distinct(StringComparer.Ordinal).ToList();
+                        if (distinctKeys.Count == 1)
+                        {
+                            uniqueDomainRoutes[group.Key] = group.First().Route.Port;
+                        }
+                    }
+
                     response = JsonSerializer.Serialize(new
                     {
-                        routes = routes.Values.Select(r => new {key = r.Key, name = r.Name, port = r.Port}),
+                        routes = routes.Values.Select(r => new {key = r.Key, name = r.Name, port = r.Port, domains = r.Domains}),
+                        domainRoutes = uniqueDomainRoutes,
                         commands = commands.Select(p => new {id = p.Key, key = p.Value.Key, url = p.Value.Url}),
                         purges = purges.Values.Select(p => new {id = p.Id, pattern = p.Pattern})
                     });
