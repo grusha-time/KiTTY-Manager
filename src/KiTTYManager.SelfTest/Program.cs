@@ -220,6 +220,13 @@ internal sealed partial class SelfTestRunner
         Test("Быстрый дубль выбирает только независимые узлы группы", QuickDuplicateDefaultSources);
         Test("config.json шифрует все секреты и восстанавливает их", JsonRoundTrip);
         Test("Старый открытый config.json мигрирует в зашифрованный", PlaintextConfigMigration);
+        Test("Конфигурация с dpapi:v1 автоматически мигрирует в dpapi:v2 при загрузке", DpapiV1ToV2ConfigMigration);
+        Test("DpapiConfigSecretProtector: v2 шифрует в LocalMachine с SID-энтропией и расшифровывает", DpapiProtectorV2RoundTripAndScope);
+        Test("DpapiConfigSecretProtector: обратная совместимость чтения dpapi:v1 через CurrentUser", DpapiProtectorV1BackwardCompatibility);
+        Test("DpapiConfigSecretProtector: изоляция по SID предотвращает расшифровку чужих данных", DpapiProtectorUserSidIsolation);
+        Test("DpapiConfigSecretProtector: заглушка на не-Windows отклоняет попытки шифрования", DpapiProtectorNonWindowsPlatformCheck);
+        Test("ConfigSecrets.NeedsMigration корректно определяет открытые и устаревшие секреты", ConfigSecretsNeedsMigrationDetection);
+        Test("Сбой сохранения или ограничения прав не повреждает config.json и оставляет исходный файл", SaveFailurePreservesOriginalFileAndRejectsUnprotectedStorage);
         Test("Явный JSON-экспорт остаётся переносимым", PortableExportRemainsPlaintext);
         Test("DPAPI диагностика: различие криптографических ошибок и повреждений формата", DpapiDiagnosticFailureDifferentiation);
         Test("Загрузка конфига с requireExisting отклоняет отсутствующий файл", ConfigRequireExistingRejectsMissingFile);
@@ -1703,6 +1710,300 @@ internal sealed partial class SelfTestRunner
             ConfigStore.SecretProtector = oldProtector;
             try { File.Delete(path); File.Delete(path + ".tmp"); } catch { }
         }
+    }
+
+    private static void DpapiV1ToV2ConfigMigration()
+    {
+        var path = TempFile();
+        try
+        {
+            var v1Pass = DpapiConfigSecretProtector.V1Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes("v1-server-pass"));
+            var v1Root = DpapiConfigSecretProtector.V1Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes("v1-root-pass"));
+            var v1Totp = DpapiConfigSecretProtector.V1Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes("v1-totp-secret"));
+            File.WriteAllText(path, $$"""
+                {
+                  "UngroupedServers": [
+                    {
+                      "Name": "legacy-v1",
+                      "Host": "192.0.2.1",
+                      "Password": "{{v1Pass}}",
+                      "RootPassword": "{{v1Root}}"
+                    }
+                  ],
+                  "BaseProxies": [
+                    { "Name": "JH", "Port": 5050, "TotpSecret": "{{v1Totp}}" }
+                  ]
+                }
+                """);
+
+            var unmigrated = ConfigStore.Load(path, migratePlaintextSecrets: false);
+            Equal("v1-server-pass", unmigrated.AllServers().Single().Password);
+            Equal("v1-root-pass", unmigrated.AllServers().Single().RootPassword);
+            Equal("v1-totp-secret", unmigrated.BaseProxies.Single().TotpSecret);
+            var diskContentUnmigrated = File.ReadAllText(path);
+            Equal(true, diskContentUnmigrated.Contains(DpapiConfigSecretProtector.V1Prefix, StringComparison.Ordinal));
+            Equal(false, diskContentUnmigrated.Contains(DpapiConfigSecretProtector.V2Prefix, StringComparison.Ordinal));
+
+            var migrated = ConfigStore.Load(path, migratePlaintextSecrets: true);
+            Equal("v1-server-pass", migrated.AllServers().Single().Password);
+            Equal("v1-root-pass", migrated.AllServers().Single().RootPassword);
+            Equal("v1-totp-secret", migrated.BaseProxies.Single().TotpSecret);
+
+            var diskContentMigrated = File.ReadAllText(path);
+            Equal(false, diskContentMigrated.Contains(DpapiConfigSecretProtector.V1Prefix, StringComparison.Ordinal));
+            Equal(true, diskContentMigrated.Contains(DpapiConfigSecretProtector.V2Prefix, StringComparison.Ordinal));
+
+            var reloaded = ConfigStore.Load(path, migratePlaintextSecrets: true);
+            Equal("v1-server-pass", reloaded.AllServers().Single().Password);
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    private static void SaveFailurePreservesOriginalFileAndRejectsUnprotectedStorage()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "kittymanager-test-acl-fail-" + Guid.NewGuid().ToString("N") + ".json");
+        var originalContent = "{\"SchemaVersion\":9,\"UngroupedServers\":[{\"Name\":\"srv1\",\"Host\":\"10.0.0.1\",\"Port\":22,\"Password\":\"dpapi:v1:AAAA\"}]}";
+        File.WriteAllText(path, originalContent);
+        var hookExecuted = false;
+        try
+        {
+            ConfigStore.ForceWindowsAclForTesting = true;
+            ConfigStore.PreWriteAclHook = fileInfo =>
+            {
+                hookExecuted = true;
+                fileInfo.Refresh();
+                Equal(true, fileInfo.Exists);
+                Equal(0L, fileInfo.Length);
+                throw new PlatformNotSupportedException("DISTINCTIVE_SIMULATED_ACL_UNSUPPORTED_STORAGE");
+            };
+
+            var threw = false;
+            try
+            {
+                ConfigStore.Load(path, migratePlaintextSecrets: true);
+            }
+            catch (InvalidOperationException ex)
+            {
+                threw = true;
+                Equal(true, ex.Message.Contains("restrictive file permissions could not be established"));
+                Equal(true, ex.InnerException is PlatformNotSupportedException);
+                Equal("DISTINCTIVE_SIMULATED_ACL_UNSUPPORTED_STORAGE", ex.InnerException!.Message);
+            }
+            Equal(true, threw);
+            Equal(true, hookExecuted);
+
+            // Verify original file on disk is strictly preserved and not corrupted/migrated
+            var currentOnDisk = File.ReadAllText(path);
+            Equal(originalContent, currentOnDisk);
+
+            // Verify no temp files left behind in the directory
+            var tempFiles = Directory.GetFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".*.tmp");
+            Equal(0, tempFiles.Length);
+
+            // Verify portable export succeeds without requiring ACLs even when Windows ACL simulation is active
+            var exportPath = path + ".export.json";
+            try
+            {
+                ConfigStore.Export(exportPath, new ManagerConfig { UngroupedServers = [new ManagedServer { Password = "plain-export-pass" }] });
+                Equal(true, File.Exists(exportPath));
+                var exportContent = File.ReadAllText(exportPath);
+                Equal(true, exportContent.Contains("plain-export-pass"));
+            }
+            finally
+            {
+                try { File.Delete(exportPath); } catch { }
+            }
+
+            // Verify ImportWizardTransaction backup creation enforces the secure ACL boundary
+            var backupAttemptThrew = false;
+            try
+            {
+                ImportWizardTransaction.SaveWithBackup(path, new ManagerConfig { WinScpPath = "new-path" });
+            }
+            catch (InvalidOperationException ex)
+            {
+                backupAttemptThrew = true;
+                Equal(true, ex.InnerException is PlatformNotSupportedException);
+            }
+            Equal(true, backupAttemptThrew);
+            Equal(originalContent, File.ReadAllText(path));
+            var bakFiles = Directory.GetFiles(Path.GetDirectoryName(path)!, Path.GetFileName(path) + ".*.bak");
+            Equal(0, bakFiles.Length);
+        }
+        finally
+        {
+            ConfigStore.ForceWindowsAclForTesting = false;
+            ConfigStore.PreWriteAclHook = null;
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    private static void DpapiProtectorV2RoundTripAndScope()
+    {
+        DataProtectionScope? protectScope = null;
+        byte[]? protectEntropy = null;
+        DataProtectionScope? unprotectScope = null;
+        byte[]? unprotectEntropy = null;
+
+        var protector = new DpapiConfigSecretProtector(
+            (userData, entropy, scope) =>
+            {
+                protectScope = scope;
+                protectEntropy = entropy;
+                var result = new byte[userData.Length];
+                for (var i = 0; i < userData.Length; i++) result[i] = (byte)(userData[i] ^ 0x5A);
+                return result;
+            },
+            (encryptedData, entropy, scope) =>
+            {
+                unprotectScope = scope;
+                unprotectEntropy = entropy;
+                var result = new byte[encryptedData.Length];
+                for (var i = 0; i < encryptedData.Length; i++) result[i] = (byte)(encryptedData[i] ^ 0x5A);
+                return result;
+            },
+            () => "S-1-5-21-123456789-1000");
+
+        var protectedVal = protector.Protect("my-secret-pass");
+        Equal(true, protectedVal.StartsWith(DpapiConfigSecretProtector.V2Prefix, StringComparison.Ordinal));
+        Equal(DataProtectionScope.LocalMachine, protectScope);
+        Equal("KiTTYManager.ConfigSecrets.v2:S-1-5-21-123456789-1000", Encoding.UTF8.GetString(protectEntropy!));
+
+        var unprotectedVal = protector.Unprotect(protectedVal);
+        Equal("my-secret-pass", unprotectedVal);
+        Equal(DataProtectionScope.LocalMachine, unprotectScope);
+        Equal("KiTTYManager.ConfigSecrets.v2:S-1-5-21-123456789-1000", Encoding.UTF8.GetString(unprotectEntropy!));
+    }
+
+    private static void DpapiProtectorV1BackwardCompatibility()
+    {
+        DataProtectionScope? unprotectScope = null;
+        byte[]? unprotectEntropy = null;
+        var sidCalled = false;
+
+        var protector = new DpapiConfigSecretProtector(
+            (userData, entropy, scope) => throw new NotImplementedException(),
+            (encryptedData, entropy, scope) =>
+            {
+                unprotectScope = scope;
+                unprotectEntropy = entropy;
+                var result = new byte[encryptedData.Length];
+                for (var i = 0; i < encryptedData.Length; i++) result[i] = (byte)(encryptedData[i] ^ 0x42);
+                return result;
+            },
+            () => { sidCalled = true; return "S-1-5-21-123456789-1000"; });
+
+        var raw = Encoding.UTF8.GetBytes("legacy-v1-secret");
+        var encrypted = new byte[raw.Length];
+        for (var i = 0; i < raw.Length; i++) encrypted[i] = (byte)(raw[i] ^ 0x42);
+        var v1Payload = DpapiConfigSecretProtector.V1Prefix + Convert.ToBase64String(encrypted);
+
+        var resultText = protector.Unprotect(v1Payload);
+        Equal("legacy-v1-secret", resultText);
+        Equal(DataProtectionScope.CurrentUser, unprotectScope);
+        Equal("KiTTYManager.ConfigSecrets.v1", Encoding.UTF8.GetString(unprotectEntropy!));
+        Equal(false, sidCalled);
+    }
+
+    private static void DpapiProtectorUserSidIsolation()
+    {
+        var currentSid = "S-1-5-21-USER-A";
+        var protector = new DpapiConfigSecretProtector(
+            (userData, entropy, scope) =>
+            {
+                var combined = new byte[userData.Length + entropy.Length];
+                Buffer.BlockCopy(userData, 0, combined, 0, userData.Length);
+                Buffer.BlockCopy(entropy, 0, combined, userData.Length, entropy.Length);
+                return combined;
+            },
+            (encryptedData, entropy, scope) =>
+            {
+                var expectedTail = entropy;
+                if (encryptedData.Length < expectedTail.Length)
+                    throw new CryptographicException("Ciphertext too short");
+                var tail = new byte[expectedTail.Length];
+                Buffer.BlockCopy(encryptedData, encryptedData.Length - expectedTail.Length, tail, 0, expectedTail.Length);
+                if (!tail.SequenceEqual(expectedTail))
+                    throw new CryptographicException("Entropy mismatch: user SID is different");
+                var userLen = encryptedData.Length - expectedTail.Length;
+                var userBytes = new byte[userLen];
+                Buffer.BlockCopy(encryptedData, 0, userBytes, 0, userLen);
+                return userBytes;
+            },
+            () => currentSid);
+
+        var protectedVal = protector.Protect("secret-data");
+        Equal("secret-data", protector.Unprotect(protectedVal));
+
+        currentSid = "S-1-5-21-USER-B";
+        var threw = false;
+        try
+        {
+            protector.Unprotect(protectedVal);
+        }
+        catch (InvalidDataException ex)
+        {
+            threw = true;
+            Equal(true, ex.InnerException is CryptographicException);
+            Equal(true, ex.Message.Contains("Windows DPAPI"));
+        }
+        Equal(true, threw);
+    }
+
+    private static void DpapiProtectorNonWindowsPlatformCheck()
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        var defaultProtector = new DpapiConfigSecretProtector();
+
+        Equal("", defaultProtector.Protect(""));
+        Equal("", defaultProtector.Unprotect(""));
+        Equal("unprotected-text", defaultProtector.Unprotect("unprotected-text"));
+
+        var protectThrew = false;
+        try { defaultProtector.Protect("some-secret"); }
+        catch (PlatformNotSupportedException) { protectThrew = true; }
+        Equal(true, protectThrew);
+
+        var unprotectV2Threw = false;
+        try { defaultProtector.Unprotect("dpapi:v2:AAAA"); }
+        catch (PlatformNotSupportedException) { unprotectV2Threw = true; }
+        Equal(true, unprotectV2Threw);
+
+        var unprotectV1Threw = false;
+        try { defaultProtector.Unprotect("dpapi:v1:AAAA"); }
+        catch (PlatformNotSupportedException) { unprotectV1Threw = true; }
+        Equal(true, unprotectV1Threw);
+    }
+
+    private static void ConfigSecretsNeedsMigrationDetection()
+    {
+        var cleanConfig = new ManagerConfig
+        {
+            UngroupedServers = [new ManagedServer { Password = "dpapi:v2:ABCD" }]
+        };
+        Equal(false, ConfigSecrets.NeedsMigration(cleanConfig));
+
+        var plaintextConfig = new ManagerConfig
+        {
+            UngroupedServers = [new ManagedServer { Password = "plain-password" }]
+        };
+        Equal(true, ConfigSecrets.NeedsMigration(plaintextConfig));
+
+        var v1Config = new ManagerConfig
+        {
+            UngroupedServers = [new ManagedServer { Password = "dpapi:v1:ABCD" }]
+        };
+        Equal(true, ConfigSecrets.NeedsMigration(v1Config));
+
+        var mixedConfig = new ManagerConfig
+        {
+            UngroupedServers =
+            [
+                new ManagedServer { Password = "dpapi:v2:ABCD", RootPassword = "dpapi:v1:EFGH" }
+            ]
+        };
+        Equal(true, ConfigSecrets.NeedsMigration(mixedConfig));
     }
 
     private static void KittyIgnoreSpecificChange()
@@ -8774,16 +9075,19 @@ internal sealed class TestConfigSecretProtector : IConfigSecretProtector
     public string Protect(string plaintext) =>
         plaintext.Length == 0
             ? ""
-            : DpapiConfigSecretProtector.Prefix +
+            : DpapiConfigSecretProtector.V2Prefix +
               Convert.ToBase64String(Encoding.UTF8.GetBytes(plaintext));
 
     public string Unprotect(string protectedValue)
     {
-        if (protectedValue.Length == 0 ||
-            !protectedValue.StartsWith(DpapiConfigSecretProtector.Prefix, StringComparison.Ordinal))
-            return protectedValue;
-        return Encoding.UTF8.GetString(Convert.FromBase64String(
-            protectedValue[DpapiConfigSecretProtector.Prefix.Length..]));
+        if (protectedValue.Length == 0) return protectedValue;
+        if (protectedValue.StartsWith(DpapiConfigSecretProtector.V2Prefix, StringComparison.Ordinal))
+            return Encoding.UTF8.GetString(Convert.FromBase64String(
+                protectedValue[DpapiConfigSecretProtector.V2Prefix.Length..]));
+        if (protectedValue.StartsWith(DpapiConfigSecretProtector.V1Prefix, StringComparison.Ordinal))
+            return Encoding.UTF8.GetString(Convert.FromBase64String(
+                protectedValue[DpapiConfigSecretProtector.V1Prefix.Length..]));
+        return protectedValue;
     }
 }
 
@@ -8799,7 +9103,7 @@ internal sealed class FailingTestSecretProtector : IConfigSecretProtector
 
     public string Unprotect(string protectedValue)
     {
-        if (protectedValue.Length == 0 || !protectedValue.StartsWith(DpapiConfigSecretProtector.Prefix, StringComparison.Ordinal))
+        if (protectedValue.Length == 0 || !DpapiConfigSecretProtector.IsProtected(protectedValue))
             return protectedValue;
         throw exceptionToThrow;
     }

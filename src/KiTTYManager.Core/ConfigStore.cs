@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Collections.Concurrent;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 namespace KiTTYManager.Core;
 
@@ -41,7 +43,7 @@ public static class ConfigStore
                     property.Name.Equals(nameof(ManagerConfig.SchemaVersion), StringComparison.OrdinalIgnoreCase)))
                 config.SchemaVersion = 0;
         Normalize(config);
-        var needsMigration = ConfigSecrets.ContainsPlaintext(config);
+        var needsMigration = ConfigSecrets.NeedsMigration(config);
         ConfigSecrets.Unprotect(config, SecretProtector);
         ResolvePaths(config);
         if (migratePlaintextSecrets && needsMigration)
@@ -60,7 +62,7 @@ public static class ConfigStore
             foreach (var server in portable.AllServers()) NormalizePamDefaults(server);
             MakePathsPortable(portable);
             ConfigSecrets.Protect(portable, SecretProtector);
-            WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options));
+            WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options), secureAclRequired: true);
         }
     }
 
@@ -244,22 +246,115 @@ public static class ConfigStore
             var portable = CloneForSave(config);
             foreach (var server in portable.AllServers()) NormalizePamDefaults(server);
             MakePathsPortable(portable);
-            WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options));
+            WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options), secureAclRequired: false);
         }
     }
 
-    private static void WriteAtomically(string path, string content)
+    public static void CreateSecuredBackup(string sourcePath, string backupPath)
+    {
+        var content = File.ReadAllText(sourcePath);
+        WriteAtomically(backupPath, content, secureAclRequired: true);
+    }
+
+    internal static Action<FileInfo>? PreWriteAclHook { get; set; }
+    internal static bool ForceWindowsAclForTesting { get; set; }
+
+    private static void WriteAtomically(string path, string content, bool secureAclRequired = true)
     {
         var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
-            File.WriteAllText(temp, content);
-            File.Move(temp, path, true);
+            if (secureAclRequired && (OperatingSystem.IsWindows() || ForceWindowsAclForTesting))
+            {
+                var fileInfo = new FileInfo(temp);
+                FileStream stream;
+                if (OperatingSystem.IsWindows())
+                {
+                    var fileSecurity = CreateRestrictedFileSecurity();
+                    stream = FileSystemAclExtensions.Create(
+                        fileInfo,
+                        FileMode.CreateNew,
+                        FileSystemRights.FullControl,
+                        FileShare.None,
+                        4096,
+                        FileOptions.None,
+                        fileSecurity);
+                }
+                else
+                {
+                    stream = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+                }
+
+                using (stream)
+                {
+                    // Enforce and verify ACLs on the open temporary file before writing any secret content
+                    EnsureFileSecurityEnforced(fileInfo);
+
+                    using var writer = new StreamWriter(stream, System.Text.Encoding.UTF8);
+                    writer.Write(content);
+                    writer.Flush();
+                }
+
+                // All security operations completed before replacement; same-volume rename preserves file security
+                File.Move(temp, path, true);
+            }
+            else
+            {
+                File.WriteAllText(temp, content);
+                File.Move(temp, path, true);
+            }
+        }
+        catch (Exception ex) when (secureAclRequired &&
+                                  (OperatingSystem.IsWindows() || ForceWindowsAclForTesting) &&
+                                  (ex is PlatformNotSupportedException or IOException or UnauthorizedAccessException or InvalidOperationException))
+        {
+            throw new InvalidOperationException($"Cannot securely save configuration: restrictive file permissions could not be established ({ex.Message}). KiTTY Manager requires an NTFS volume with access control to protect encrypted secrets.", ex);
         }
         finally
         {
-            try { File.Delete(temp); } catch { }
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
         }
+    }
+
+    private static void EnsureFileSecurityEnforced(FileInfo fileInfo)
+    {
+        PreWriteAclHook?.Invoke(fileInfo);
+        if (OperatingSystem.IsWindows())
+        {
+            var fileSecurity = CreateRestrictedFileSecurity();
+            fileInfo.SetAccessControl(fileSecurity);
+            var actual = fileInfo.GetAccessControl(AccessControlSections.Access);
+            if (actual is null || !actual.AreAccessRulesProtected)
+                throw new PlatformNotSupportedException("The destination volume does not enforce NTFS access control lists.");
+        }
+    }
+
+    private static FileSecurity CreateRestrictedFileSecurity()
+    {
+        var fileSecurity = new FileSecurity();
+        using var identity = WindowsIdentity.GetCurrent();
+        if (identity?.User is null)
+            throw new InvalidOperationException("Cannot determine current user SID for access control.");
+
+        fileSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        fileSecurity.AddAccessRule(new FileSystemAccessRule(
+            identity.User,
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+
+        var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        fileSecurity.AddAccessRule(new FileSystemAccessRule(
+            adminSid,
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+
+        var systemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+        fileSecurity.AddAccessRule(new FileSystemAccessRule(
+            systemSid,
+            FileSystemRights.FullControl,
+            AccessControlType.Allow));
+
+        return fileSecurity;
     }
 
     /// <summary>

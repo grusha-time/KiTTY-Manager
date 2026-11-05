@@ -10,10 +10,15 @@ internal sealed partial class SelfTestRunner
         public string Protect(string plaintext) =>
             string.IsNullOrEmpty(plaintext) ? "" : DpapiConfigSecretProtector.Prefix + Convert.ToBase64String(Encoding.UTF8.GetBytes(plaintext));
 
-        public string Unprotect(string protectedValue) =>
-            protectedValue.StartsWith(DpapiConfigSecretProtector.Prefix, StringComparison.Ordinal)
-                ? Encoding.UTF8.GetString(Convert.FromBase64String(protectedValue[DpapiConfigSecretProtector.Prefix.Length..]))
-                : protectedValue;
+        public string Unprotect(string protectedValue)
+        {
+            if (string.IsNullOrEmpty(protectedValue)) return protectedValue;
+            if (protectedValue.StartsWith(DpapiConfigSecretProtector.V2Prefix, StringComparison.Ordinal))
+                return Encoding.UTF8.GetString(Convert.FromBase64String(protectedValue[DpapiConfigSecretProtector.V2Prefix.Length..]));
+            if (protectedValue.StartsWith(DpapiConfigSecretProtector.V1Prefix, StringComparison.Ordinal))
+                return Encoding.UTF8.GetString(Convert.FromBase64String(protectedValue[DpapiConfigSecretProtector.V1Prefix.Length..]));
+            return protectedValue;
+        }
     }
 
     private static void PamLoginPlanSequenceTests()

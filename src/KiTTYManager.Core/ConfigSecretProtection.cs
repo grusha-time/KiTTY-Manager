@@ -11,34 +11,110 @@ internal interface IConfigSecretProtector
 
 internal sealed class DpapiConfigSecretProtector : IConfigSecretProtector
 {
-    internal const string Prefix = "dpapi:v1:";
-    private static readonly byte[] Entropy =
+    internal const string V1Prefix = "dpapi:v1:";
+    internal const string V2Prefix = "dpapi:v2:";
+    internal const string Prefix = V2Prefix;
+
+    private static readonly byte[] V1Entropy =
         Encoding.UTF8.GetBytes("KiTTYManager.ConfigSecrets.v1");
+    private const string V2EntropyPrefix = "KiTTYManager.ConfigSecrets.v2:";
+
+    private readonly Func<byte[], byte[], DataProtectionScope, byte[]> _protectData;
+    private readonly Func<byte[], byte[], DataProtectionScope, byte[]> _unprotectData;
+    private readonly Func<string> _getUserSid;
+
+    public DpapiConfigSecretProtector()
+        : this(
+            (userData, optionalEntropy, scope) =>
+            {
+                if (!OperatingSystem.IsWindows())
+                    throw new PlatformNotSupportedException(
+                        "Шифрование config.json поддерживается только в Windows.");
+                return ProtectedData.Protect(userData, optionalEntropy, scope);
+            },
+            (encryptedData, optionalEntropy, scope) =>
+            {
+                if (!OperatingSystem.IsWindows())
+                    throw new PlatformNotSupportedException(
+                        "Расшифровка config.json поддерживается только в Windows.");
+                return ProtectedData.Unprotect(encryptedData, optionalEntropy, scope);
+            },
+            GetCurrentUserSid)
+    {
+    }
+
+    internal DpapiConfigSecretProtector(
+        Func<byte[], byte[], DataProtectionScope, byte[]> protectData,
+        Func<byte[], byte[], DataProtectionScope, byte[]> unprotectData,
+        Func<string> getUserSid)
+    {
+        _protectData = protectData ?? throw new ArgumentNullException(nameof(protectData));
+        _unprotectData = unprotectData ?? throw new ArgumentNullException(nameof(unprotectData));
+        _getUserSid = getUserSid ?? throw new ArgumentNullException(nameof(getUserSid));
+    }
+
+    private static string GetCurrentUserSid()
+    {
+        if (!OperatingSystem.IsWindows())
+            throw new PlatformNotSupportedException(
+                "Получение SID пользователя поддерживается только в Windows.");
+
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        var sid = identity?.User?.Value;
+        if (string.IsNullOrWhiteSpace(sid))
+            throw new InvalidOperationException(
+                "Не удалось определить SID текущего пользователя Windows для защиты секретов.");
+        return sid;
+    }
+
+    private byte[] GetV2Entropy()
+    {
+        var sid = _getUserSid();
+        if (string.IsNullOrWhiteSpace(sid))
+            throw new InvalidOperationException(
+                "Не удалось определить SID текущего пользователя Windows для защиты секретов.");
+        return Encoding.UTF8.GetBytes(V2EntropyPrefix + sid);
+    }
 
     public string Protect(string plaintext)
     {
         if (plaintext.Length == 0) return "";
-        if (!OperatingSystem.IsWindows())
-            throw new PlatformNotSupportedException(
-                "Шифрование config.json поддерживается только в Windows.");
-        var bytes = ProtectedData.Protect(
-            Encoding.UTF8.GetBytes(plaintext), Entropy, DataProtectionScope.CurrentUser);
-        return Prefix + Convert.ToBase64String(bytes);
+        var bytes = _protectData(
+            Encoding.UTF8.GetBytes(plaintext),
+            GetV2Entropy(),
+            DataProtectionScope.LocalMachine);
+        return V2Prefix + Convert.ToBase64String(bytes);
     }
 
     public string Unprotect(string protectedValue)
     {
-        if (protectedValue.Length == 0 ||
-            !protectedValue.StartsWith(Prefix, StringComparison.Ordinal))
-            return protectedValue;
-        if (!OperatingSystem.IsWindows())
-            throw new PlatformNotSupportedException(
-                "Расшифровка config.json поддерживается только в Windows.");
+        if (protectedValue.Length == 0) return protectedValue;
+
+        if (protectedValue.StartsWith(V2Prefix, StringComparison.Ordinal))
+        {
+            return UnprotectPayload(
+                protectedValue[V2Prefix.Length..],
+                GetV2Entropy(),
+                DataProtectionScope.LocalMachine);
+        }
+
+        if (protectedValue.StartsWith(V1Prefix, StringComparison.Ordinal))
+        {
+            return UnprotectPayload(
+                protectedValue[V1Prefix.Length..],
+                V1Entropy,
+                DataProtectionScope.CurrentUser);
+        }
+
+        return protectedValue;
+    }
+
+    private string UnprotectPayload(string base64Payload, byte[] entropy, DataProtectionScope scope)
+    {
         try
         {
-            var bytes = Convert.FromBase64String(protectedValue[Prefix.Length..]);
-            return Encoding.UTF8.GetString(ProtectedData.Unprotect(
-                bytes, Entropy, DataProtectionScope.CurrentUser));
+            var bytes = Convert.FromBase64String(base64Payload);
+            return Encoding.UTF8.GetString(_unprotectData(bytes, entropy, scope));
         }
         catch (FormatException exception)
         {
@@ -51,13 +127,14 @@ internal sealed class DpapiConfigSecretProtector : IConfigSecretProtector
             var hex = $"0x{exception.HResult:X8}";
             throw new InvalidDataException(
                 $"Не удалось расшифровать секрет из config.json через Windows DPAPI ({hex}). " +
-                "Файл должен открываться той же учётной записью Windows, которая его сохранила.",
+                "Файл должен открываться на том же компьютере и под той же учётной записью Windows, в которой он был сохранён.",
                 exception);
         }
     }
 
     internal static bool IsProtected(string value) =>
-        value.StartsWith(Prefix, StringComparison.Ordinal);
+        value.StartsWith(V2Prefix, StringComparison.Ordinal) ||
+        value.StartsWith(V1Prefix, StringComparison.Ordinal);
 }
 
 internal static class ConfigSecrets
@@ -74,6 +151,18 @@ internal static class ConfigSecrets
         Visit(config, value =>
         {
             if (value.Length > 0 && !DpapiConfigSecretProtector.IsProtected(value))
+                found = true;
+            return value;
+        });
+        return found;
+    }
+
+    public static bool NeedsMigration(ManagerConfig config)
+    {
+        var found = false;
+        Visit(config, value =>
+        {
+            if (value.Length > 0 && (!DpapiConfigSecretProtector.IsProtected(value) || value.StartsWith(DpapiConfigSecretProtector.V1Prefix, StringComparison.Ordinal)))
                 found = true;
             return value;
         });
@@ -130,3 +219,4 @@ internal static class ConfigSecrets
         }
     }
 }
+

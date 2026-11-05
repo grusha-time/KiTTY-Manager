@@ -6,7 +6,7 @@ public static class ImportWizardTransaction
     {
         var fullPath = Path.GetFullPath(configPath);
         var backupPath = fullPath + ".before-import-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff") + ".bak";
-        if (File.Exists(fullPath)) File.Copy(fullPath, backupPath, overwrite: false);
+        if (File.Exists(fullPath)) ConfigStore.CreateSecuredBackup(fullPath, backupPath);
         try
         {
             ConfigStore.Save(fullPath, merged);
@@ -14,7 +14,7 @@ public static class ImportWizardTransaction
         }
         catch
         {
-            if (File.Exists(backupPath)) File.Copy(backupPath, fullPath, overwrite: true);
+            if (File.Exists(backupPath)) ConfigStore.CreateSecuredBackup(backupPath, fullPath);
             throw;
         }
     }
@@ -22,6 +22,6 @@ public static class ImportWizardTransaction
     public static void Rollback(string configPath, string backupPath)
     {
         if (!File.Exists(backupPath)) throw new FileNotFoundException("Backup импорта не найден.", backupPath);
-        File.Copy(backupPath, Path.GetFullPath(configPath), overwrite: true);
+        ConfigStore.CreateSecuredBackup(backupPath, Path.GetFullPath(configPath));
     }
 }
