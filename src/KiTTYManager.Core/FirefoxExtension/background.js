@@ -3,6 +3,7 @@
 // Stable container identities are stored by the extension. Ports are deliberately
 // memory-only: a restored tab must not reuse a port from a previous manager run.
 const routes = new Map();
+const domainRoutes = new Map();
 const completed = new Map();
 let online = false;
 let lastError = "";
@@ -12,7 +13,25 @@ const ownOrigin = browser.runtime.getURL("");
 const bridgeRequest = r => r.url === KITTY.url &&
   [r.originUrl, r.documentUrl].some(u => u && u.startsWith(ownOrigin));
 const blocked = {type: "http", host: "127.0.0.1", port: KITTY.blockedPort};
-function routeFor(r) { return online ? routes.get(r.cookieStoreId) : undefined; }
+
+function extractDomain(urlStr) {
+  if (!urlStr) return "";
+  try {
+    const u = new URL(urlStr);
+    if (!["http:", "https:", "ws:", "wss:"].includes(u.protocol)) return "";
+    return u.hostname ? u.hostname.toLowerCase().replace(/\.+$/, "") : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function routeFor(r) {
+  if (!online || !r) return undefined;
+  if (r.cookieStoreId && routes.has(r.cookieStoreId)) return routes.get(r.cookieStoreId);
+  const domain = extractDomain(r.url);
+  if (domain && domainRoutes.has(domain)) return domainRoutes.get(domain);
+  return undefined;
+}
 
 // Track the active tab separately for each window.
 const knownTabs = new Map();
@@ -183,6 +202,11 @@ async function poll() {
             }
             for (const [key, id] of toRemove) {
               routes.delete(id);
+              if (typeof domainRoutes !== "undefined") {
+                for (const [d, r] of domainRoutes) {
+                  if (r.key === key) domainRoutes.delete(d);
+                }
+              }
               for (const [winId, cid] of activeContainers) {
                 if (cid === id) activeContainers.delete(winId);
               }
@@ -236,8 +260,33 @@ async function poll() {
         const id = await container(route.key, route.name);
         next.set(id, route);
       }
+      const domainOwners = new Map();
+      const nextDomainRoutes = new Map();
+      for (const [, route] of next) {
+        if (Array.isArray(route.domains)) {
+          for (const d of route.domains) {
+            const domain = String(d).trim().toLowerCase().replace(/\.+$/, "");
+            if (!domain) continue;
+            if (!domainOwners.has(domain)) {
+              domainOwners.set(domain, [route]);
+            } else {
+              const list = domainOwners.get(domain);
+              if (!list.some(r => r.key === route.key)) {
+                list.push(route);
+              }
+            }
+          }
+        }
+      }
+      for (const [domain, list] of domainOwners) {
+        if (list.length === 1) {
+          nextDomainRoutes.set(domain, list[0]);
+        }
+      }
       routes.clear();
       for (const [id, route] of next) routes.set(id, route);
+      domainRoutes.clear();
+      for (const [d, route] of nextDomainRoutes) domainRoutes.set(d, route);
       online = true;
       for (const [windowId, tabId] of activeTabs) {
         const tab = knownTabs.get(tabId);

@@ -116,6 +116,7 @@ internal sealed partial class SelfTestRunner
         Test("Настройки оптимизации Firefox сохраняются, нормализуются и очищаются при экспорте", FirefoxDiskOptimizationConfigTest);
         Test("Firefox Marionette протокол и HTTPS с самоподписанным сертификатом", FirefoxAcceptInsecureCertsProtocolAndTlsTest);
         Test("Неблокирующее открытие веб-интерфейсов Firefox и синхронизация", FirefoxNonBlockingWebOpenTests);
+        Test("Маршрутизация по домену в Firefox Containers и кросс-контейнерный fallback", FirefoxContainerDomainFallbackRoutingTests);
         Test("Ansible отвергает опасные имена и удаляет архив после ошибки", AnsibleArchiveRejectsUnsafeNamesAndCleansFailure);
         Test("Сравнение файлов учитывает короткие чтения, хвост и отмену", BatchFileComparisonWithFragmentedReads);
         Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);

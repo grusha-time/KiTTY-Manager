@@ -19,7 +19,7 @@ public partial class MainWindow
     private bool webExitPending;
     private bool webExitCompleted;
     private bool tunnelsExitConfirmed;
-    private sealed record ContainerWebSession(Process Tunnel, ActiveRoute Route, ResolvingSocks5Relay Relay);
+    private sealed record ContainerWebSession(Process Tunnel, ActiveRoute Route, ResolvingSocks5Relay Relay, IReadOnlyList<string> Domains);
 
     private async Task EnsureFirefoxContainersAsync(CancellationToken token)
     {

@@ -1557,6 +1557,455 @@ internal sealed partial class SelfTestRunner
         var token = webCts.Token;
         Equal(false, token.IsCancellationRequested);
     }
+
+    internal static void FirefoxContainerDomainFallbackRoutingTests()
+    {
+        CheckBridgeDomainMetadataAsync().GetAwaiter().GetResult();
+        FirefoxExtensionDomainFallbackRoutingNodeTest();
+        CheckCrossContainerRelayResolutionAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task CheckBridgeDomainMetadataAsync()
+    {
+        using var bridge = new FirefoxContainerBridge();
+        using var http = new HttpClient(new HttpClientHandler { UseProxy = false });
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bridge.Token);
+
+        // 1. Open route with URL containing domain, plus explicit domains with IPs and duplicates
+        var domains = new[] { "api.corp.local", "127.0.0.1", "::1", "10.0.0.5", "DB.corp.local.", "api.corp.local" };
+        var openTask1 = bridge.OpenAsync("s1", "Server 1", 10001, "https://panel.corp.local:8443/index.html", CancellationToken.None, domains);
+
+        var poll1 = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[]}"));
+        poll1.EnsureSuccessStatusCode();
+        using var doc1 = JsonDocument.Parse(await poll1.Content.ReadAsStringAsync());
+        var routes1 = doc1.RootElement.GetProperty("routes").EnumerateArray().ToList();
+        Equal(1, routes1.Count);
+        Equal("s1", routes1[0].GetProperty("key").GetString());
+        Equal(10001, routes1[0].GetProperty("port").GetInt32());
+
+        var routeDomains1 = routes1[0].GetProperty("domains").EnumerateArray().Select(d => d.GetString()).ToList();
+        Equal(3, routeDomains1.Count);
+        Equal(true, routeDomains1.Contains("panel.corp.local"));
+        Equal(true, routeDomains1.Contains("api.corp.local"));
+        Equal(true, routeDomains1.Contains("db.corp.local"));
+
+        var domainRoutes1 = doc1.RootElement.GetProperty("domainRoutes");
+        Equal(10001, domainRoutes1.GetProperty("panel.corp.local").GetInt32());
+        Equal(10001, domainRoutes1.GetProperty("api.corp.local").GetInt32());
+        Equal(10001, domainRoutes1.GetProperty("db.corp.local").GetInt32());
+
+        // Ack open task 1
+        var cmd1 = doc1.RootElement.GetProperty("commands")[0].GetProperty("id").GetString();
+        var ack1 = await http.PostAsync(bridge.Url, new StringContent(JsonSerializer.Serialize(new
+        {
+            acks = new[] { new { id = cmd1, error = (string?)null } },
+            activeKeys = new[] { "s1" }
+        })));
+        ack1.EnsureSuccessStatusCode();
+        await openTask1;
+
+        // 2. Reopen same key with same port and extra domain -> domains merged, Opened preserved
+        var reopenTask = bridge.OpenAsync("s1", "Server 1", 10001, "https://panel.corp.local/", CancellationToken.None, ["extra.corp.local"]);
+        var pollReopen = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[\"s1\"]}"));
+        using var docReopen = JsonDocument.Parse(await pollReopen.Content.ReadAsStringAsync());
+        var routeReopen = docReopen.RootElement.GetProperty("routes").EnumerateArray().First();
+        var reopenedDomains = routeReopen.GetProperty("domains").EnumerateArray().Select(d => d.GetString()).ToList();
+        Equal(4, reopenedDomains.Count);
+        Equal(true, reopenedDomains.Contains("extra.corp.local"));
+
+        var cmdReopen = docReopen.RootElement.GetProperty("commands")[0].GetProperty("id").GetString();
+        await http.PostAsync(bridge.Url, new StringContent(JsonSerializer.Serialize(new
+        {
+            acks = new[] { new { id = cmdReopen, error = (string?)null } },
+            activeKeys = new[] { "s1" }
+        })));
+        await reopenTask;
+
+        // 3. Reopen same key with different port -> throws InvalidOperationException
+        try
+        {
+            await bridge.OpenAsync("s1", "Server 1", 10002, "https://panel.corp.local/", CancellationToken.None);
+            throw new Exception("Expected InvalidOperationException on port conflict");
+        }
+        catch (InvalidOperationException) { }
+
+        // 4. Add second route s2 with domain collision on "api.corp.local"
+        var openTask2 = bridge.OpenAsync("s2", "Server 2", 20002, "https://other.corp.local/", CancellationToken.None, ["api.corp.local"]);
+        var poll2 = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[\"s1\"]}"));
+        using var doc2 = JsonDocument.Parse(await poll2.Content.ReadAsStringAsync());
+        var domainRoutes2 = doc2.RootElement.GetProperty("domainRoutes");
+        Equal(true, domainRoutes2.TryGetProperty("panel.corp.local", out _));
+        Equal(true, domainRoutes2.TryGetProperty("other.corp.local", out _));
+        // "api.corp.local" is claimed by s1 and s2 -> fail-closed: excluded from domainRoutes
+        Equal(false, domainRoutes2.TryGetProperty("api.corp.local", out _));
+
+        var cmd2 = doc2.RootElement.GetProperty("commands")[0].GetProperty("id").GetString();
+        await http.PostAsync(bridge.Url, new StringContent(JsonSerializer.Serialize(new
+        {
+            acks = new[] { new { id = cmd2, error = (string?)null } },
+            activeKeys = new[] { "s1", "s2" }
+        })));
+        await openTask2;
+
+        // 5. Remove s1: "api.corp.local" becomes unique to s2, s1 domains removed
+        bridge.Remove("s1");
+        var poll3 = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[\"s2\"]}"));
+        using var doc3 = JsonDocument.Parse(await poll3.Content.ReadAsStringAsync());
+        var domainRoutes3 = doc3.RootElement.GetProperty("domainRoutes");
+        Equal(false, domainRoutes3.TryGetProperty("panel.corp.local", out _));
+        Equal(true, domainRoutes3.TryGetProperty("other.corp.local", out _));
+        Equal(true, domainRoutes3.TryGetProperty("api.corp.local", out var s2ApiPort));
+        Equal(20002, s2ApiPort.GetInt32());
+
+        // 6. Remove s2: domainRoutes empty
+        bridge.Remove("s2");
+        var poll4 = await http.PostAsync(bridge.Url, new StringContent("{\"acks\":[],\"activeKeys\":[]}"));
+        using var doc4 = JsonDocument.Parse(await poll4.Content.ReadAsStringAsync());
+        Equal(0, doc4.RootElement.GetProperty("routes").GetArrayLength());
+        Equal(0, doc4.RootElement.GetProperty("domainRoutes").EnumerateObject().Count());
+
+        // 7. Regression check: Two distinct web interfaces sharing resolver mappings
+        // Each session publishes only its own hostname, so both remain active in domainRoutes without false collision
+        using var bridgeShared = new FirefoxContainerBridge();
+        using var httpShared = new HttpClient(new HttpClientHandler { UseProxy = false });
+        httpShared.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bridgeShared.Token);
+
+        _ = bridgeShared.OpenAsync("s-web1", "Server Web 1", 11001, "https://panel1.corp/", CancellationToken.None, ["panel1.corp"]);
+        _ = bridgeShared.OpenAsync("s-web2", "Server Web 2", 11002, "https://panel2.corp/", CancellationToken.None, ["panel2.corp"]);
+
+        var pollShared = await httpShared.PostAsync(bridgeShared.Url, new StringContent("{\"acks\":[],\"activeKeys\":[]}"));
+        using var docShared = JsonDocument.Parse(await pollShared.Content.ReadAsStringAsync());
+        var domainRoutesShared = docShared.RootElement.GetProperty("domainRoutes");
+        Equal(11001, domainRoutesShared.GetProperty("panel1.corp").GetInt32());
+        Equal(11002, domainRoutesShared.GetProperty("panel2.corp").GetInt32());
+    }
+
+    internal static void FirefoxExtensionDomainFallbackRoutingNodeTest()
+    {
+        using var stream = typeof(FirefoxContainerBrowser).Assembly
+            .GetManifestResourceStream("KiTTYManager.Core.FirefoxExtension.background.js");
+        if (stream == null) return;
+        using var reader = new StreamReader(stream);
+        var jsCode = reader.ReadToEnd();
+
+        var nodeCandidates = new[] { "/usr/bin/node", "/usr/local/bin/node", "node" };
+        string? nodeExe = null;
+        foreach (var candidate in nodeCandidates)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo(candidate, "--version")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                if (p != null)
+                {
+                    p.WaitForExit(2000);
+                    if (p.ExitCode == 0) { nodeExe = candidate; break; }
+                }
+            }
+            catch { }
+        }
+        if (nodeExe == null) return;
+
+        var script = $$"""
+        const vm = require('vm'), assert = require('assert');
+        const jsCode = {{JsonSerializer.Serialize(jsCode)}};
+        const code = jsCode.split('(async () => {')[0];
+
+        const events = {};
+        const event = name => ({ addListener: fn => { events[name] = fn; } });
+        let purgeCheckSeen = false, purgeFallback;
+        const browser = {
+          runtime: { getURL: () => 'moz-extension://ext-id/' },
+          proxy: { onRequest: event('proxy') },
+          webRequest: { onBeforeRequest: event('webRequest') },
+          tabs: {
+            query: async filter => {
+              if (filter && filter.cookieStoreId === 'cid-Server 1') {
+                purgeCheckSeen = true;
+                purgeFallback = vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://panel.corp/' })", ctx);
+              }
+              return [];
+            },
+            create: async () => ({ id: 99 }),
+            get: async id => ({ id, url: '' }),
+            remove: async () => {},
+            update: async () => {},
+            onActivated: event('tabActivated'),
+            onUpdated: event('tabUpdated'),
+            onRemoved: event('tabRemoved'),
+            onCreated: event('tabCreated')
+          },
+          windows: { onRemoved: event('winRemoved') },
+          contextualIdentities: {
+            get: async id => ({ cookieStoreId: id }),
+            create: async ({ name }) => ({ cookieStoreId: 'cid-' + name }),
+            remove: async () => {}
+          },
+          storage: { local: { get: async () => ({}), set: async () => {} } }
+        };
+
+        let currentMockState = { routes: [], purges: [], commands: [] };
+        let lastRequestBody = null;
+        let pollNextFn = null;
+        let pollStepWaitResolve = null;
+
+        const mockFetch = async (url, options) => {
+          lastRequestBody = JSON.parse(options.body);
+          return {
+            ok: true,
+            status: 200,
+            json: async () => currentMockState
+          };
+        };
+
+        const mockSetTimeout = (fn, ms) => {
+          pollNextFn = fn;
+          if (pollStepWaitResolve) {
+            const cb = pollStepWaitResolve;
+            pollStepWaitResolve = null;
+            cb();
+          }
+        };
+
+        const stepPoll = async (nextState) => {
+          currentMockState = nextState;
+          if (pollNextFn) {
+            const p = new Promise(r => { pollStepWaitResolve = r; });
+            const resume = pollNextFn;
+            pollNextFn = null;
+            resume();
+            await p;
+          } else {
+            const p = new Promise(r => { pollStepWaitResolve = r; });
+            vm.runInContext('poll()', ctx);
+            await p;
+          }
+        };
+
+        const ctx = vm.createContext({
+          browser,
+          KITTY: { url: 'http://127.0.0.1:9999/poll', token: 'test-tok', blockedPort: 9998, startupUrl: 'about:blank' },
+          fetch: mockFetch,
+          setTimeout: mockSetTimeout,
+          console,
+          URL,
+          AbortSignal: global.AbortSignal || { timeout: () => ({}) }
+        });
+        vm.runInContext(code, ctx);
+
+        (async () => {
+          // 1. Offline guard: routeFor returns undefined, proxy returns blocked, webRequest cancels
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://panel.corp/' })", ctx), undefined);
+          assert.deepEqual(events.proxy({ url: 'https://panel.corp/' }), [{type: 'http', host: '127.0.0.1', port: 9998}, null]);
+          assert.deepEqual(events.webRequest({ url: 'https://panel.corp/' }), { cancel: true });
+
+          // 2. Real poll execution: 3 routes published by bridge, srv-2 and srv-3 collide on 'collide.corp'
+          await stepPoll({
+            routes: [
+              { key: 'srv-1', name: 'Server 1', port: 10001, domains: ['panel.corp', 'api.corp', 'xn--e1afmkfd.xn--p1ai'] },
+              { key: 'srv-2', name: 'Server 2', port: 20002, domains: ['other.corp', 'collide.corp'] },
+              { key: 'srv-3', name: 'Server 3', port: 30003, domains: ['collide.corp'] }
+            ],
+            purges: [],
+            commands: []
+          });
+
+          // Verify state populated by real poll()
+          assert.equal(vm.runInContext("online", ctx), true);
+          assert.equal(vm.runInContext("domainRoutes.get('panel.corp').port", ctx), 10001);
+          assert.equal(vm.runInContext("domainRoutes.get('api.corp').port", ctx), 10001);
+          assert.equal(vm.runInContext("domainRoutes.get('xn--e1afmkfd.xn--p1ai').port", ctx), 10001);
+          assert.equal(vm.runInContext("domainRoutes.get('other.corp').port", ctx), 20002);
+          // Collision filtering verified: collide.corp is excluded
+          assert.equal(vm.runInContext("domainRoutes.has('collide.corp')", ctx), false);
+
+          // 3. Domain fallback for firefox-default (iframe / embedded widget)
+          const fbPanel = events.proxy({ cookieStoreId: 'firefox-default', url: 'https://panel.corp:8443/app/main' });
+          assert.deepEqual(fbPanel, [{type: 'socks', host: '127.0.0.1', port: 10001, proxyDNS: true, connectionIsolationKey: 'srv-1'}, null]);
+          assert.deepEqual(events.webRequest({ cookieStoreId: 'firefox-default', url: 'https://panel.corp:8443/app/main' }), { cancel: false });
+
+          // 4. Transparent protocol support: HTTP, HTTPS, WS, WSS
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'http://panel.corp/api' }).port", ctx), 10001);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://panel.corp/api' }).port", ctx), 10001);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'ws://panel.corp:3000/socket' }).port", ctx), 10001);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'wss://panel.corp:3443/socket' }).port", ctx), 10001);
+
+          // 5. Case-insensitivity and trailing dot normalization
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://PANEL.CORP./test' }).port", ctx), 10001);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://Api.Corp:9090/' }).port", ctx), 10001);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://xn--e1afmkfd.xn--p1ai/path' }).port", ctx), 10001);
+
+          // 6. Absolute container priority over domain fallback
+          // Request from Container 2 must use Server 2 (port 20002), NOT fallback for panel.corp (port 10001)
+          const c2Id = vm.runInContext("containerIds['srv-2']", ctx);
+          const c2Request = events.proxy({ cookieStoreId: c2Id, url: 'https://panel.corp/test' });
+          assert.deepEqual(c2Request, [{type: 'socks', host: '127.0.0.1', port: 20002, proxyDNS: true, connectionIsolationKey: 'srv-2'}, null]);
+          assert.equal(vm.runInContext(`routeFor({ cookieStoreId: '${c2Id}', url: 'https://panel.corp/test' }).port`, ctx), 20002);
+
+          // 7. Unknown and colliding domains denied
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://unknown.local/' })", ctx), undefined);
+          assert.deepEqual(events.proxy({ cookieStoreId: 'firefox-default', url: 'https://unknown.local/' }), [{type: 'http', host: '127.0.0.1', port: 9998}, null]);
+          assert.deepEqual(events.webRequest({ cookieStoreId: 'firefox-default', url: 'https://unknown.local/' }), { cancel: true });
+
+          // Colliding domain "collide.corp" was excluded by real poll() -> fail-closed
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://collide.corp/' })", ctx), undefined);
+          assert.deepEqual(events.webRequest({ cookieStoreId: 'firefox-default', url: 'https://collide.corp/' }), { cancel: true });
+
+          // 8. Suffix and lookalike rejection
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://sub.panel.corp/' })", ctx), undefined);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://panel.corp.evil/' })", ctx), undefined);
+
+          // 9. Malformed URL safety
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'javascript:alert(1)' })", ctx), undefined);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'not a valid url' })", ctx), undefined);
+
+          // 10. Second poll iteration: remove srv-3 so collide.corp becomes uniquely owned by srv-2
+          await stepPoll({
+            routes: [
+              { key: 'srv-1', name: 'Server 1', port: 10001, domains: ['panel.corp', 'api.corp', 'xn--e1afmkfd.xn--p1ai'] },
+              { key: 'srv-2', name: 'Server 2', port: 20002, domains: ['other.corp', 'collide.corp'] }
+            ],
+            purges: [],
+            commands: []
+          });
+          assert.equal(vm.runInContext("domainRoutes.has('collide.corp')", ctx), true);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://collide.corp/' }).port", ctx), 20002);
+
+          // 11. Third poll iteration: real Purge processing removes srv-1 and purges its domains
+          await stepPoll({
+            routes: [
+              { key: 'srv-2', name: 'Server 2', port: 20002, domains: ['other.corp', 'collide.corp'] }
+            ],
+            purges: [
+              { id: 'purge-srv1', pattern: 'srv-1' }
+            ],
+            commands: []
+          });
+          assert.equal(purgeCheckSeen, true);
+          assert.equal(purgeFallback, undefined, 'fallback must already be revoked before awaiting tab deletion');
+          assert.equal(vm.runInContext("domainRoutes.has('panel.corp')", ctx), false);
+          assert.equal(vm.runInContext("domainRoutes.has('api.corp')", ctx), false);
+          assert.equal(vm.runInContext("routeFor({ cookieStoreId: 'firefox-default', url: 'https://panel.corp/' })", ctx), undefined);
+          assert.deepEqual(events.webRequest({ cookieStoreId: 'firefox-default', url: 'https://panel.corp/' }), { cancel: true });
+
+          // 12. Fourth poll iteration: verify purge acknowledgement was sent to bridge
+          await stepPoll({
+            routes: [
+              { key: 'srv-2', name: 'Server 2', port: 20002, domains: ['other.corp', 'collide.corp'] }
+            ],
+            purges: [],
+            commands: []
+          });
+          assert.deepEqual(lastRequestBody.purgeAcks, [{ id: 'purge-srv1', error: null }]);
+        })().catch(e => { console.error(e); process.exit(1); });
+        """;
+
+        var runPsi = new System.Diagnostics.ProcessStartInfo(nodeExe)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var process = System.Diagnostics.Process.Start(runPsi)!;
+        process.StandardInput.Write(script);
+        process.StandardInput.Close();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit(5000);
+        if (process.ExitCode != 0)
+            throw new Exception("Extension domain fallback routing Node check failed: " + stderr);
+    }
+
+    private static async Task CheckCrossContainerRelayResolutionAsync()
+    {
+        // Setup a mock upstream TCP listener simulating SSH tunnel dynamic SOCKS5
+        using var upstreamListener = new TcpListener(IPAddress.Loopback, 0);
+        upstreamListener.Start();
+        var upstreamPort = ((IPEndPoint)upstreamListener.LocalEndpoint).Port;
+
+        var upstreamConnected = new TaskCompletionSource<(string Host, int Port, string RequestHeader)>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _ = Task.Run(async () =>
+        {
+            using var client = await upstreamListener.AcceptTcpClientAsync();
+            var stream = client.GetStream();
+            // 1. SOCKS5 greeting
+            var greeting = new byte[3];
+            await stream.ReadExactlyAsync(greeting);
+            await stream.WriteAsync(new byte[] { 0x05, 0x00 });
+
+            // 2. SOCKS5 CONNECT
+            var header = new byte[4];
+            await stream.ReadExactlyAsync(header);
+            var atypical = header[3];
+            string destHost = "";
+            if (atypical == 0x01) // IPv4
+            {
+                var ipBytes = new byte[4];
+                await stream.ReadExactlyAsync(ipBytes);
+                destHost = new IPAddress(ipBytes).ToString();
+            }
+            var portBytes = new byte[2];
+            await stream.ReadExactlyAsync(portBytes);
+            var destPort = (portBytes[0] << 8) | portBytes[1];
+
+            // SOCKS5 success reply
+            await stream.WriteAsync(new byte[] { 0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80 });
+
+            // Read HTTP request bytes from client
+            var buffer = new byte[1024];
+            var count = await stream.ReadAsync(buffer);
+            var req = Encoding.ASCII.GetString(buffer, 0, count);
+            upstreamConnected.TrySetResult((destHost, destPort, req));
+
+            // Write HTTP 200 reply
+            var httpReply = Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+            await stream.WriteAsync(httpReply);
+        });
+
+        // ResolvingSocks5Relay with domain mapped to 10.1.2.3
+        await using var relay = new ResolvingSocks5Relay("127.0.0.1", upstreamPort,
+            [new KeyValuePair<string, string>("panel.internal.corp", "10.1.2.3")]);
+
+        // Client (simulating browser making request for panel.internal.corp:8443)
+        using var clientTcp = new TcpClient();
+        await clientTcp.ConnectAsync(IPAddress.Loopback, relay.Port);
+        var clientStream = clientTcp.GetStream();
+
+        // SOCKS5 handshake to relay
+        await clientStream.WriteAsync(new byte[] { 0x05, 0x01, 0x00 });
+        var relayGreeting = new byte[2];
+        await clientStream.ReadExactlyAsync(relayGreeting);
+        Equal(0x05, relayGreeting[0]);
+        Equal(0x00, relayGreeting[1]);
+
+        // SOCKS5 CONNECT for domain "panel.internal.corp" port 8443 (ATYP 0x03)
+        var domainBytes = Encoding.ASCII.GetBytes("panel.internal.corp");
+        var reqBytes = new List<byte> { 0x05, 0x01, 0x00, 0x03, (byte)domainBytes.Length };
+        reqBytes.AddRange(domainBytes);
+        reqBytes.Add((byte)(8443 >> 8));
+        reqBytes.Add((byte)(8443 & 0xFF));
+        await clientStream.WriteAsync(reqBytes.ToArray());
+
+        var relayReply = new byte[10];
+        await clientStream.ReadExactlyAsync(relayReply);
+        Equal(0x05, relayReply[0]);
+        Equal(0x00, relayReply[1]); // succeeded
+
+        // Send HTTP request preserving original Host
+        var httpRequest = "GET /api/status HTTP/1.1\r\nHost: panel.internal.corp:8443\r\nConnection: close\r\n\r\n";
+        await clientStream.WriteAsync(Encoding.ASCII.GetBytes(httpRequest));
+
+        var (resolvedIp, targetPort, receivedHttp) = await upstreamConnected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Equal("10.1.2.3", resolvedIp);
+        Equal(8443, targetPort);
+        Equal(true, receivedHttp.Contains("Host: panel.internal.corp:8443"));
+    }
 }
 
 internal static class FirefoxContainerSmoke
