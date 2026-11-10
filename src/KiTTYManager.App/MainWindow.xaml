@@ -45,6 +45,87 @@
         </Setter.Value>
       </Setter>
     </Style>
+    <Geometry x:Key="SessionNoteGlyph">M 3,1.5 L 11,1.5 L 15,5.5 L 15,16.5 L 3,16.5 Z M 5.5,7 L 12.5,7 M 5.5,9.5 L 12.5,9.5 M 5.5,12 L 10.5,12</Geometry>
+    <Style x:Key="SessionTextCellStyle" TargetType="TextBlock">
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="SessionNoteIconButtonStyle" TargetType="Button">
+      <Setter Property="Width" Value="22"/>
+      <Setter Property="Height" Value="22"/>
+      <Setter Property="MinWidth" Value="0"/>
+      <Setter Property="MinHeight" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Margin" Value="0"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Foreground" Value="#8FB4FF"/>
+      <Setter Property="ToolTipService.InitialShowDelay" Value="200"/>
+      <Setter Property="ToolTipService.ShowDuration" Value="20000"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="Chrome" Background="{TemplateBinding Background}" CornerRadius="3">
+              <Path Data="{StaticResource SessionNoteGlyph}" Stroke="{TemplateBinding Foreground}" StrokeThickness="1.2"
+                    Stretch="Uniform" Width="13" Height="14" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#262626"/>
+                <Setter Property="Foreground" Value="#B8D0FF"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#333333"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Chrome" Property="BorderBrush" Value="#8FB4FF"/>
+                <Setter TargetName="Chrome" Property="BorderThickness" Value="1"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="SessionNotesToggleStyle" TargetType="ToggleButton">
+      <Setter Property="Width" Value="30"/>
+      <Setter Property="Height" Value="30"/>
+      <Setter Property="MinWidth" Value="0"/>
+      <Setter Property="MinHeight" Value="0"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Focusable" Value="False"/>
+      <Setter Property="IsTabStop" Value="False"/>
+      <Setter Property="Foreground" Value="#8FB4FF"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ToggleButton">
+            <Border x:Name="Chrome" Background="{TemplateBinding Background}" CornerRadius="4">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#262626"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Chrome" Property="Background" Value="#1B2A44"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="IsChecked" Value="False">
+          <Setter Property="Foreground" Value="#6E6E6E"/>
+          <Setter Property="Opacity" Value="0.7"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
   </Window.Resources>
   <Window.CommandBindings>
     <CommandBinding Command="ApplicationCommands.Find" Executed="FindSession_Executed"/>
@@ -134,13 +215,42 @@
                 <TextBlock Text="Сессии" FontSize="17" FontWeight="SemiBold"/>
                 <TextBlock x:Name="SessionCountText" Foreground="#858585" FontSize="12"/>
               </StackPanel>
-              <Button x:Name="ClearGroupFilterButton" Grid.Column="1" Click="ClearGroupFilter_Click" Padding="10,5" Visibility="Collapsed">Сбросить фильтр групп</Button>
+              <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <ToggleButton x:Name="SessionNotesToggleButton" Click="SessionNotesToggle_Click"
+                              Style="{StaticResource SessionNotesToggleStyle}"
+                              IsThreeState="False" Focusable="False"
+                              ToolTip="Скрыть значки заметок"
+                              AutomationProperties.Name="Скрыть значки заметок">
+                  <Grid Width="16" Height="18">
+                    <Path Data="{StaticResource SessionNoteGlyph}"
+                          Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}"
+                          StrokeThickness="1.3" Stretch="Uniform" Width="16" Height="18"
+                          HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    <Path x:Name="SessionNotesStrike" Data="M 1.5,16.5 L 16.5,1.5"
+                          Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ToggleButton}}"
+                          StrokeThickness="1.5" Stretch="Uniform" Width="18" Height="18"
+                          HorizontalAlignment="Center" VerticalAlignment="Center">
+                      <Path.Style>
+                        <Style TargetType="Path">
+                          <Setter Property="Visibility" Value="Collapsed"/>
+                          <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsChecked, RelativeSource={RelativeSource AncestorType=ToggleButton}}" Value="False">
+                              <Setter Property="Visibility" Value="Visible"/>
+                            </DataTrigger>
+                          </Style.Triggers>
+                        </Style>
+                      </Path.Style>
+                    </Path>
+                  </Grid>
+                </ToggleButton>
+                <Button x:Name="ClearGroupFilterButton" Click="ClearGroupFilter_Click" Padding="10,5" Visibility="Collapsed">Сбросить фильтр групп</Button>
+              </StackPanel>
             </Grid>
             <StackPanel Grid.Row="1" Margin="0,10,0,0">
               <TextBlock x:Name="GroupFilterText" Foreground="#8FB4FF" FontSize="12" Margin="0,0,0,5"/>
               <Grid Margin="0,10,0,0">
                 <TextBox x:Name="SearchBox" Padding="10,8,38,8" TextChanged="SearchBox_TextChanged" PreviewKeyDown="SearchBox_PreviewKeyDown"
-                         ToolTip="Поиск по группам, сессиям, IP, портам, логинам, паролям и веб-интерфейсам"/>
+                         ToolTip="Поиск по группам, сессиям, IP, портам, логинам, паролям, заметкам и веб-интерфейсам"/>
                 <Button x:Name="SearchClearButton" Click="SearchClear_Click"
                         Focusable="False" IsTabStop="False"
                         ToolTip="Очистить поиск" AutomationProperties.Name="Очистить поиск сессий">
@@ -180,6 +290,7 @@
                 <MenuItem Header="Создать новую сессию" Click="CreateSession_Click"/>
                 <MenuItem Header="Дублировать сессию" Click="DuplicateSession_Click"/>
                 <MenuItem Header="Быстрый дубль" Click="QuickDuplicateSession_Click"/>
+                <MenuItem x:Name="SessionNoteMenuItem" Header="Заметка о сервере" Click="SessionNote_Click"/>
                 <Separator/>
                 <MenuItem Header="Подключиться" Click="OpenRoutedConsole_Click"/>
                 <MenuItem x:Name="SaveToKittyMenuItem" Header="Сохранить в KiTTY" Click="SaveToKitty_Click"/>
@@ -193,9 +304,23 @@
               </ContextMenu>
             </DataGrid.ContextMenu>
             <DataGrid.Columns>
-              <DataGridTextColumn Header="Сессия" Binding="{Binding Name}" Width="2*"/>
-              <DataGridTextColumn Header="Сервер" Binding="{Binding Endpoint}" Width="1.4*"/>
-              <DataGridTextColumn Header="Группа" Binding="{Binding Group}" Width="1.4*"/>
+              <DataGridTextColumn Header="Сессия" Binding="{Binding Name}" Width="2*" ElementStyle="{StaticResource SessionTextCellStyle}"/>
+              <DataGridTextColumn Header="Сервер" Binding="{Binding Endpoint}" Width="1.4*" ElementStyle="{StaticResource SessionTextCellStyle}"/>
+              <DataGridTemplateColumn Header="Группа" Width="1.4*" SortMemberPath="Group" ClipboardContentBinding="{Binding Group}">
+                <DataGridTemplateColumn.CellTemplate>
+                  <DataTemplate>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Group}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                      <Button Grid.Column="1" Click="SessionNoteButton_Click"
+                              Visibility="{Binding NoteIconVisibility}"
+                              ToolTip="{Binding NotePreview}"
+                              AutomationProperties.Name="Открыть заметку о сервере"
+                              Style="{StaticResource SessionNoteIconButtonStyle}"/>
+                    </Grid>
+                  </DataTemplate>
+                </DataGridTemplateColumn.CellTemplate>
+              </DataGridTemplateColumn>
             </DataGrid.Columns>
           </DataGrid>
         </DockPanel>

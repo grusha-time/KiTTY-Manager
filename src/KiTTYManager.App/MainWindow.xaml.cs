@@ -5,6 +5,7 @@ using System.IO;
 using System.Text;
 using System.Reflection;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
@@ -12,6 +13,7 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using KiTTYManager.Core;
 using Point = System.Windows.Point;
+using Button = System.Windows.Controls.Button;
 using MouseEventArgs = System.Windows.Input.MouseEventArgs;
 using DragEventArgs = System.Windows.DragEventArgs;
 using DataObject = System.Windows.DataObject;
@@ -421,7 +423,10 @@ public partial class MainWindow : Window
         foreach (var s in allServers)
         {
             var groupName = cachedServerGroupPaths.GetValueOrDefault(s.Id, "Без группы");
-            rows.Add(new SessionRow(s, groupName));
+            var noteIconVisibility = config.ShowSessionNotes && SessionNotePolicy.HasNote(s.Note)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+            rows.Add(new SessionRow(s, groupName, noteIconVisibility, SessionNotePolicy.Preview(s.Note)));
             searchTexts[s.Id] = ComputeSearchableText(s, groupName);
         }
         rows.Sort((a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
@@ -463,6 +468,7 @@ public partial class MainWindow : Window
     {
         RebuildIndex();
         RefreshGroups(); RefreshSessions(); ShowServer(selectedServer);
+        SyncSessionNotesToggle();
         Status($"Сессий: {config.AllServers().Count()} • Групп: {config.AllGroups().Count()} • Jumphost’ов: {config.BaseProxies.Count}");
     }
 
@@ -540,7 +546,8 @@ public partial class MainWindow : Window
             new[] { item.Name, item.Url, item.ResolverAddress, item.Username, item.Password });
         return string.Join('\n', new[] { server.Name, server.Host, server.Port.ToString(), server.Username, server.Password,
             server.PrivateKeyPath, server.PrivateKeyPassphrase,
-            server.RootLogin, server.RootPassword, server.SourceScriptPath ?? "", server.SourceScriptContent, groupName }.Concat(web));
+            server.RootLogin, server.RootPassword, server.SourceScriptPath ?? "", server.SourceScriptContent, groupName,
+            server.Note }.Concat(web));
     }
 
     private string SearchableText(ManagedServer server) =>
@@ -941,6 +948,7 @@ public partial class MainWindow : Window
     {
         // Ignore double-clicks on column headers (sorting)
         if (FindParent<DataGridColumnHeader>(e.OriginalSource as DependencyObject) is not null) return;
+        if (FindParent<Button>(e.OriginalSource as DependencyObject) is not null) return;
         var server = SelectedRow()?.Server;
         if (server is null) return;
         await SessionOpenDispatcher.OpenAsync(server, config, StartManagedJumphostAsync, OpenRoutedConsoleAsync);
@@ -952,6 +960,7 @@ public partial class MainWindow : Window
     }
     private async void SessionsGrid_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        if (FindParent<Button>(e.OriginalSource as DependencyObject) is not null) return;
         var result = SessionKeyboardPolicy.EvaluateGridKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None, e.IsRepeat, SelectedRow()?.Server is not null);
         if (!result.Handled) return;
         e.Handled = true;
@@ -963,7 +972,8 @@ public partial class MainWindow : Window
     private void SessionsGrid_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         dragStart = e.GetPosition(null);
-        dragStartedOnRow = FindParent<DataGridRow>(e.OriginalSource as DependencyObject) is not null;
+        dragStartedOnRow = FindParent<Button>(e.OriginalSource as DependencyObject) is null &&
+            FindParent<DataGridRow>(e.OriginalSource as DependencyObject) is not null;
         if (dragStartedOnRow) SelectGridRowFromEvent(e);
     }
     private void SessionsGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e) => SelectGridRowFromEvent(e);
@@ -1185,11 +1195,50 @@ public partial class MainWindow : Window
         }
     }
     private void MoveToUngrouped_Click(object sender, RoutedEventArgs e) { if (SelectedRow() is SessionRow row) { config.MoveServerToGroup(row.Server.Id, null); SaveAndRefresh(); } }
+    private void SessionNote_Click(object sender, RoutedEventArgs e)
+    {
+        if (SelectedRow() is SessionRow row) EditSessionNote(row.Server);
+    }
+    private void SessionNoteButton_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not SessionRow row) return;
+        EditSessionNote(row.Server);
+        e.Handled = true;
+    }
+    private void SessionNotesToggle_Click(object sender, RoutedEventArgs e)
+    {
+        config.ShowSessionNotes = SessionNotesToggleButton.IsChecked == true;
+        SaveConfig();
+        RebuildIndex();
+        RefreshSessions();
+        SyncSessionNotesToggle();
+    }
+    private void SyncSessionNotesToggle()
+    {
+        if (SessionNotesToggleButton is null) return;
+        SessionNotesToggleButton.IsChecked = config.ShowSessionNotes;
+        var action = config.ShowSessionNotes ? "Скрыть" : "Показать";
+        var text = $"{action} значки заметок";
+        SessionNotesToggleButton.ToolTip = text;
+        AutomationProperties.SetName(SessionNotesToggleButton, text);
+    }
+    private void EditSessionNote(ManagedServer server)
+    {
+        var dialog = new SessionNoteWindow(server.Name, server.Note) { Owner = this };
+        if (dialog.ShowDialog() != true) return;
+        var note = SessionNotePolicy.Normalize(dialog.Note);
+        if (string.Equals(note, SessionNotePolicy.Normalize(server.Note), StringComparison.Ordinal)) return;
+        server.Note = note;
+        SaveConfig();
+        RebuildIndex();
+        RefreshSessions();
+    }
     private void SessionsGrid_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
         var row = SelectedRow();
         var inGroup = row is not null && config.FindServerGroup(row.Server.Id) is not null;
         MoveToUngroupedItem.Visibility = inGroup ? Visibility.Visible : Visibility.Collapsed;
+        SessionNoteMenuItem.IsEnabled = row is not null;
         SaveToKittyMenuItem.Visibility = row is not null && string.IsNullOrWhiteSpace(row.Server.SourceSessionPath)
             ? Visibility.Visible : Visibility.Collapsed;
     }
@@ -6769,7 +6818,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private sealed record SessionRow(ManagedServer Server, string Group) { public string Name => Server.Name; public string Endpoint => Server.Endpoint; }
+    private sealed record SessionRow(
+        ManagedServer Server, string Group, Visibility NoteIconVisibility, string NotePreview)
+    {
+        public string Name => Server.Name;
+        public string Endpoint => Server.Endpoint;
+    }
     private sealed record RequiredRouteOption(Guid? Id, string Name, string SearchText = "")
     {
         public override string ToString() => Name;

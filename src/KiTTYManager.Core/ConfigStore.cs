@@ -645,6 +645,7 @@ public static class ConfigStore
     public static void Normalize(ManagedServer server)
     {
         server.Host = server.Host.Trim();
+        server.Note = SessionNotePolicy.Normalize(server.Note);
         if (server.KittyBaseline is not null) server.KittyBaseline.Host = server.KittyBaseline.Host.Trim();
         server.ShellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
         server.ImportedCommand ??= "";

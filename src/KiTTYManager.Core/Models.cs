@@ -21,6 +21,7 @@ public sealed class ManagerConfig
     public bool CloseWebTunnelWithFirefox { get; set; } = true;
     public bool AutoDiscoverFirefoxProfile { get; set; } = true;
     public string FirefoxTemplateProfile { get; set; } = "";
+    public bool ShowSessionNotes { get; set; } = true;
     public int ConnectionTimeoutSeconds { get; set; } = 10;
     public int EndpointProbeTimeoutSeconds { get; set; } = 4;
     public int MaxRouteAttempts { get; set; } = 20;
@@ -68,6 +69,7 @@ public sealed class ManagerConfig
         CloseWebTunnelWithFirefox = CloseWebTunnelWithFirefox,
         AutoDiscoverFirefoxProfile = AutoDiscoverFirefoxProfile,
         FirefoxTemplateProfile = FirefoxTemplateProfile,
+        ShowSessionNotes = ShowSessionNotes,
         ConnectionTimeoutSeconds = ConnectionTimeoutSeconds,
         EndpointProbeTimeoutSeconds = EndpointProbeTimeoutSeconds,
         MaxRouteAttempts = MaxRouteAttempts,
@@ -135,6 +137,8 @@ public sealed class ManagedServer
     public string RootLogin { get; set; } = "";
     public string RootPassword { get; set; } = "";
     public string ShellPrompt { get; set; } = "$";
+    public string Note { get; set; } = "";
+    [JsonIgnore] public bool HasNote => SessionNotePolicy.HasNote(Note);
     public string ImportedCommand { get; set; } = "";
     public bool IgnoreImportedCommand { get; set; }
     public bool UsePam { get; set; }
@@ -291,6 +295,7 @@ public sealed class ManagedServer
             RootLogin = RootLogin,
             RootPassword = RootPassword,
             ShellPrompt = ShellPrompt,
+            Note = Note,
             ImportedCommand = ImportedCommand,
             IgnoreImportedCommand = IgnoreImportedCommand,
             UsePam = UsePam,
