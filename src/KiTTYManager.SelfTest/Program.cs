@@ -106,6 +106,9 @@ internal sealed partial class SelfTestRunner
         Test("Защита настроенного PAM от затирания пустыми полями при импорте", PamImportProtectionTests);
         Test("Диспетчер открытия сессий: обычный сервер и JumpHost", SessionOpenDispatcherTests);
         Test("Клавиатурная навигация: политика, привязки XAML и регрессионная защита", SessionKeyboardPolicyAndBindingTests);
+        Test("Заметки о серверах: политика, хранение и перенос", SessionNotePolicyAndPersistenceTests);
+        Test("Заметки о серверах: умный импорт и экспорт", SessionNoteImportExportTests);
+        Test("Заметки о серверах: привязки интерфейса", SessionNoteUiWiringTests);
         Test("Стартовая конфигурация пустая", EmptyInitialConfig);
         Test("Исполнитель отклоняет неверный выбор до открытия SSH", BatchRunnerRejectsSelectionBeforeConnecting);
         Test("Firefox отклоняет неполный источник без изменения его файлов", FirefoxRejectsIncompleteSource);

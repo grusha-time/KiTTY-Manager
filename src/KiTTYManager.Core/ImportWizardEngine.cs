@@ -268,6 +268,7 @@ public static class ImportWizardEngine
     {
         ArgumentNullException.ThrowIfNull(plan);
         ValidateGroupChoices(plan);
+        ValidateNoteChoices(plan);
         var result = Clone(current);
         var incomingById = incoming.AllServers().ToDictionary(x => x.Id);
         var serverMap = new Dictionary<Guid, Guid>();
@@ -299,6 +300,14 @@ public static class ImportWizardEngine
                     {
                         replacement.MergePamPreservingPopulated(existingServer);
                     }
+                    var noteField = plan.Fields.FirstOrDefault(f =>
+                        f.IncomingSessionId == row.IncomingId && f.PropertyName == "Note");
+                    var existingNote = SessionNotePolicy.Normalize(existingServer.Note);
+                    var incomingNote = SessionNotePolicy.Normalize(source.Note);
+                    var takeIncomingNote = incomingNote.Length > 0 &&
+                        (noteField?.UseIncoming ?? existingNote.Length == 0);
+                    if (!takeIncomingNote)
+                        replacement.Note = existingNote;
                     ReplaceServerInPlace(result, currentId, replacement);
                     importedServerIds.Add(currentId);
                 }
@@ -371,6 +380,33 @@ public static class ImportWizardEngine
             "Выберите «Добавить в существующую и переименовать» только у одной из них.");
     }
 
+    public static void ValidateNoteChoices(ImportWizardPlan plan)
+    {
+        var conflict = plan.Fields
+            .Where(field => field.PropertyName == "Note" && field.UseIncoming)
+            .Select(field => new
+            {
+                Field = field,
+                Session = plan.Sessions.FirstOrDefault(session => session.IncomingId == field.IncomingSessionId)
+            })
+            .Where(item => item.Session is
+            {
+                CurrentId: not null,
+                Decision: ImportDecision.KeepCurrent or ImportDecision.UseIncoming
+            })
+            .GroupBy(item => item.Session!.CurrentId!.Value)
+            .FirstOrDefault(group => group
+                .Select(item => SessionNotePolicy.Normalize(item.Field.IncomingValue))
+                .Where(SessionNotePolicy.HasNote)
+                .Distinct(StringComparer.Ordinal)
+                .Count() > 1);
+        if (conflict is null) return;
+        var names = string.Join(", ", conflict.Select(item => $"«{item.Field.SessionName}»"));
+        throw new InvalidDataException(
+            $"Несколько импортируемых сессий с разными заметками сопоставлены одной локальной сессии: {names}. " +
+            "Снимите галочку «Заметка» у одной из них или выберите другое сопоставление.");
+    }
+
     private static readonly HashSet<string> PamFieldNames = new(StringComparer.Ordinal)
     {
         "UsePam", "PamSshCommand", "PamPassword", "PamTotpSecret", "PamTotpAlgorithm",
@@ -434,6 +470,8 @@ public static class ImportWizardEngine
                     continue;
                 }
             }
+            if (field.PropertyName == "Note" && !string.IsNullOrWhiteSpace(field.CurrentValue))
+                continue;
             field.UseIncoming = true;
         }
     }
@@ -467,6 +505,11 @@ public static class ImportWizardEngine
             Add("PreferredProxyId", "Предпочтительная JH", before.PreferredProxyId?.ToString() ?? "не задана", after.PreferredProxyId?.ToString() ?? "не задана");
             Add("BackupEndpoints", "Резервные адреса", EndpointSummary(before.BackupEndpoints), EndpointSummary(after.BackupEndpoints));
             Add("WebInterfaces", "Веб-интерфейсы", WebSummary(before.WebInterfaces), WebSummary(after.WebInterfaces));
+            var noteBefore = SessionNotePolicy.Normalize(before.Note);
+            var noteAfter = SessionNotePolicy.Normalize(after.Note);
+            if (noteAfter.Length > 0)
+                Add("Note", "Заметка", noteBefore, noteAfter,
+                    useIncomingDefault: noteBefore.Length == 0);
             Add("KeepaliveIntervalSeconds", "Интервал keepalive", before.KeepaliveIntervalSeconds.ToString(), after.KeepaliveIntervalSeconds.ToString());
             Add("EnableTcpKeepalives", "TCP keepalive", before.EnableTcpKeepalives.ToString(), after.EnableTcpKeepalives.ToString());
             Add("ReconnectOnConnectionFailure", "Переподключение при сбое", before.ReconnectOnConnectionFailure.ToString(), after.ReconnectOnConnectionFailure.ToString());
@@ -498,7 +541,8 @@ public static class ImportWizardEngine
             if (!string.IsNullOrWhiteSpace(after.PamConfirmPrompt))
                 Add("PamConfirmPrompt", "Запрос подтверждения PAM", before.PamConfirmPrompt, after.PamConfirmPrompt, keepCurrent: PamKeep(before.PamConfirmPrompt, after.PamConfirmPrompt));
 
-            void Add(string property, string label, string oldValue, string newValue, bool secret = false, bool keepCurrent = false)
+            void Add(string property, string label, string oldValue, string newValue, bool secret = false,
+                bool keepCurrent = false, bool? useIncomingDefault = null)
             {
                 if (string.Equals(oldValue, newValue, StringComparison.Ordinal)) return;
                 result.Add(new ImportFieldDecision
@@ -507,7 +551,7 @@ public static class ImportWizardEngine
                     PropertyName = property, Label = label,
                     CurrentValue = secret ? SecretState(oldValue) : oldValue,
                     IncomingValue = secret ? SecretState(newValue) : newValue,
-                    UseIncoming = keepCurrent ? false : takeByDefault
+                    UseIncoming = useIncomingDefault ?? (keepCurrent ? false : takeByDefault)
                 });
             }
         }
@@ -595,6 +639,10 @@ public static class ImportWizardEngine
                 case "PreferredProxyId": target.PreferredProxyId = source.PreferredProxyId; break;
                 case "BackupEndpoints": target.BackupEndpoints = Clone(source.BackupEndpoints); break;
                 case "WebInterfaces": target.WebInterfaces = Clone(source.WebInterfaces); break;
+                case "Note":
+                    if (SessionNotePolicy.HasNote(source.Note))
+                        target.Note = SessionNotePolicy.Normalize(source.Note);
+                    break;
                 case "KeepaliveIntervalSeconds": target.KeepaliveIntervalSeconds = source.KeepaliveIntervalSeconds; break;
                 case "EnableTcpKeepalives": target.EnableTcpKeepalives = source.EnableTcpKeepalives; break;
                 case "ReconnectOnConnectionFailure": target.ReconnectOnConnectionFailure = source.ReconnectOnConnectionFailure; break;

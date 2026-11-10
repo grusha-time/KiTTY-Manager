@@ -127,6 +127,7 @@ public static class ConfigTransfer
         config.CloseWebTunnelWithFirefox = true;
         config.AutoDiscoverFirefoxProfile = true;
         config.FirefoxTemplateProfile = "";
+        config.ShowSessionNotes = true;
         config.ConnectionTimeoutSeconds = 10;
         config.TaskConnectionRecoveryMinutes = 1;
         config.EndpointProbeTimeoutSeconds = 4;
@@ -233,6 +234,8 @@ public static class ConfigTransfer
                     serverIdMap[incomingServer.Id] = existing.Id;
                     continue;
                 }
+                if (!SessionNotePolicy.HasNote(incomingServer.Note))
+                    incomingServer.Note = existing.Note;
                 if (existing.HasPamConfigured())
                 {
                     incomingServer.MergePamPreservingPopulated(existing);

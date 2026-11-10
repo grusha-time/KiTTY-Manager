@@ -64,6 +64,13 @@ public partial class ImportWizardDialog : Window
                 MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
+        try { ImportWizardEngine.ValidateNoteChoices(Plan); }
+        catch (InvalidDataException ex)
+        {
+            ThemedMessageDialog.Show(this, ex.Message, "Конфликт заметок",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
         if (Plan.Links.Any(x => x.ExistingConflict && x.Decision == ImportDecision.Add))
         {
             ThemedMessageDialog.Show(this,
