@@ -16,6 +16,7 @@
     <Compile Include="..\KiTTYManager.App\AppUpdateInstaller.cs" Link="AppUpdateInstaller.cs" />
     <Compile Include="..\KiTTYManager.App\KittyWindowInput.cs" Link="KittyWindowInput.cs" />
     <Compile Include="..\KiTTYManager.App\SessionOpenDispatcher.cs" Link="SessionOpenDispatcher.cs" />
+    <Compile Include="..\KiTTYManager.App\MainWindow.Connectivity.cs" Link="MainWindow.Connectivity.cs" />
     <Compile Include="..\KiTTYManager.App\SessionKeyboardPolicy.cs" Link="SessionKeyboardPolicy.cs" />
   </ItemGroup>
 </Project>

@@ -529,6 +529,20 @@ internal sealed partial class SelfTestRunner
         Test("Умное массовое добавление: предпросмотр конфига до создания сессий", SmartDiscoveryPreviewConfigTests);
         Test("Умное массовое добавление: расширения Issue #26", SmartDiscoveryIssue26EnhancementsTests);
         Test("Неблокирующее открытие SSH-сессий и точек входа", NonBlockingSessionOpeningTests);
+        Test("Оптимизация маршрутов: BFS с отслеживанием глубины, граница 16 серверов, циклы и сортировка", RoutePlannerBfsDepthAndOrderingTests);
+        Test("Индексация групп и серверов: однопроходное построение путей и O(1) поиск", ConfigIndexFastMappingTests);
+        Test("Глубокое копирование конфигурации: полнота CloneForSave, изоляция ссылок и сохранение в поток", ConfigStoreCloneForSaveAndStreamTests);
+        Test("Карта связей: построение с precomputed группами, лёгкая отрисовка и tooltips", LinkMapOptimizationTests);
+        Test("Сравнение производительности: RoutePlanner BFS отслеживание глубины против обратного обхода", RoutePlannerBfsBenchmarkComparisonTests);
+        Test("Сравнение производительности: ConfigIndex однопроходные карты против рекурсивного обхода", ConfigIndexMappingVsRecursiveTraversalBenchmarkTests);
+        Test("Сравнение производительности: ConfigStore типизированный CloneForSave против JSON roundtrip", ConfigStoreCloneVsJsonRoundtripBenchmarkTests);
+        Test("Сравнение производительности: синтетические бенчмарки масштабируемости (Search, Navigation, Saving, LinkMap)", SyntheticLargeScaleResponsivenessBenchmarks);
+        Test("Неблокирующее сохранение конфигурации: BackgroundConfigSaver и правило последнего сохранения", BackgroundConfigSaverNonBlockingAndLastSaveWinsTests);
+        Test("Интерфейс: debounce поиска и политика клавиатуры SearchBox_PreviewKeyDown", SessionSearchDebounceAndKeyboardPolicyTests);
+        Test("Интерфейс: обновление кэша и индекса при создании сессии и редактировании веб-интерфейсов", CacheAndIndexUpdateOnSessionAndWebEditingTests);
+        Test("Интерфейс: хит-тестинг кривых и стрелок LinkMap и Windows STA проверки", LinkMapCurveStrokeHitTestingAndWindowsStaTests);
+        Test("Безопасность данных: forceExit, FlushConfig, мастер импорта и откат", ExitSequenceAndImportWizardDataSafetyTests);
+        Test("Подключение SSH: перенос PreferredProxyId и метрик прокси в ApplyDiscoveredRoutesAndPreferences", ApplyDiscoveredRoutesAndPreferencesPreservesSuccessfulProxyStateTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {

@@ -69,20 +69,18 @@ public static class RoutePlanner
 
         var proxyPaths = allOrdered.Take(MaxSavedPaths);
         var directPaths = allOrdered.Where(path => path[0].TryDirectWithoutJumphost).Take(MaxSavedPaths);
-        return proxyPaths.Concat(directPaths).DistinctBy(path => string.Join('/', path.Select(s => s.Id))).ToArray();
+        return proxyPaths.Concat(directPaths).Distinct(PathIdEqualityComparer.Instance).ToArray();
 
         List<Guid>? ShortestPath(
             Guid startId, Guid destinationId, (Guid From, Guid To)? bannedEdge = null)
         {
-            var queue = new Queue<Guid>();
+            var queue = new Queue<(Guid Id, int Depth)>();
             var previous = new Dictionary<Guid, Guid?>();
-            queue.Enqueue(startId);
+            queue.Enqueue((startId, 1));
             previous[startId] = null;
             while (queue.Count > 0)
             {
-                var current = queue.Dequeue();
-                var depth = 1;
-                for (var node = current; previous[node] is Guid parent; node = parent) depth++;
+                var (current, depth) = queue.Dequeue();
                 if (current == destinationId)
                 {
                     var path = new List<Guid>();
@@ -96,7 +94,7 @@ public static class RoutePlanner
                 {
                     if (bannedEdge == (current, id) || previous.ContainsKey(id)) continue;
                     previous[id] = current;
-                    queue.Enqueue(id);
+                    queue.Enqueue((id, depth + 1));
                 }
             }
             return null;
@@ -124,7 +122,7 @@ public static class RoutePlanner
             .SelectMany(proxy => CandidatesForProxy(config, target, proxy, savedPaths)));
         return Rank(config, target, raw
             .Where(candidate => SatisfiesRouteConstraints(config, candidate))
-            .DistinctBy(CandidateSignature));
+            .Distinct(RouteCandidateEqualityComparer.Instance));
     }
 
     /// <summary>
@@ -521,7 +519,7 @@ public static class RoutePlanner
                 candidate.Servers.Append(target).ToArray(),
                 candidate.WithoutProxy))
             .Where(candidate => SatisfiesRouteConstraints(config, candidate))
-            .DistinctBy(CandidateSignature);
+            .Distinct(RouteCandidateEqualityComparer.Instance);
         return LimitGroupEntryServers(config, Rank(config, target, candidates));
     }
 
@@ -658,4 +656,60 @@ public static class RoutePlanner
 
     private static bool SameProxyHost(string left, string right) =>
         ProxyEndpointComparer.HostsEquivalent(left, right);
+
+    private sealed class PathIdEqualityComparer : IEqualityComparer<IReadOnlyList<ManagedServer>>
+    {
+        public static readonly PathIdEqualityComparer Instance = new();
+
+        public bool Equals(IReadOnlyList<ManagedServer>? x, IReadOnlyList<ManagedServer>? y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x is null || y is null || x.Count != y.Count) return false;
+            for (var i = 0; i < x.Count; i++)
+            {
+                if (x[i].Id != y[i].Id) return false;
+            }
+            return true;
+        }
+
+        public int GetHashCode(IReadOnlyList<ManagedServer> obj)
+        {
+            var hash = new HashCode();
+            foreach (var server in obj)
+            {
+                hash.Add(server.Id);
+            }
+            return hash.ToHashCode();
+        }
+    }
+
+    private sealed class RouteCandidateEqualityComparer : IEqualityComparer<RouteCandidate>
+    {
+        public static readonly RouteCandidateEqualityComparer Instance = new();
+
+        public bool Equals(RouteCandidate? x, RouteCandidate? y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x is null || y is null) return false;
+            if (x.Proxy.Id != y.Proxy.Id || x.WithoutProxy != y.WithoutProxy || x.Servers.Count != y.Servers.Count)
+                return false;
+            for (var i = 0; i < x.Servers.Count; i++)
+            {
+                if (x.Servers[i].Id != y.Servers[i].Id) return false;
+            }
+            return true;
+        }
+
+        public int GetHashCode(RouteCandidate obj)
+        {
+            var hash = new HashCode();
+            hash.Add(obj.Proxy.Id);
+            hash.Add(obj.WithoutProxy);
+            foreach (var server in obj.Servers)
+            {
+                hash.Add(server.Id);
+            }
+            return hash.ToHashCode();
+        }
+    }
 }

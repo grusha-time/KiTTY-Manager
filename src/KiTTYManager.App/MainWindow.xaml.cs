@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -45,7 +46,7 @@ public partial class MainWindow : Window
     private readonly JumphostProcessRegistry jumphostProcesses = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> jumphostStartupGates = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, SemaphoreSlim> accessScriptGates = new();
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> backgroundAccessChecks = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, Task> backgroundAccessChecks = new();
     private LinkMapWindow? linkMapWindow;
     private BatchTaskWindow? batchTaskWindow;
     private ActiveTunnelsWindow? activeTunnelsWindow;
@@ -53,11 +54,20 @@ public partial class MainWindow : Window
     private readonly TunnelService tunnelService;
     private readonly Dictionary<Guid, QuickDuplicateDialog> quickDuplicateWindows = [];
     private readonly Dictionary<Guid, SavedLinksDialog> savedLinksWindows = [];
+    private readonly ConcurrentDictionary<Task, byte> activeSavedLinksChecks = new();
+    private CancellationTokenSource savedLinksChecksCancellation = new();
+    private readonly ConcurrentDictionary<Task, byte> activeAccessScriptTasks = new();
+    private CancellationTokenSource accessScriptsMasterCancellation = new();
+    private Task? activeForegroundOperationTask;
     private bool batchExitPending;
     private readonly HashSet<(Guid ServerId, Guid? ForcedViaServerId)> pendingSessionOpenings = [];
     private CancellationTokenSource sessionCts = new();
     private bool sessionExitPending;
     private bool sessionExitCompleted;
+    private bool configExitPending;
+    private bool configExitCompleted;
+    private bool isImportWizardActive;
+    private bool importWizardMissedSave;
     private bool configAvailable = true;
     private RequiredRouteOption[] requiredRouteOptions = [];
     private RequiredRouteOption? selectedRequiredRouteOption;
@@ -67,21 +77,63 @@ public partial class MainWindow : Window
         { Interval = TimeSpan.FromSeconds(30) };
     private readonly DispatcherTimer pamTotpTimer = new()
         { Interval = TimeSpan.FromSeconds(1) };
-    private readonly CancellationTokenSource accessScriptAlarmCancellation = new();
+    private CancellationTokenSource accessScriptAlarmCancellation = new();
+    private Task? activeAccessScriptAlarmTask;
+    private Task? activeImportTask;
     private bool accessScriptAlarmRunning;
     private bool accessScriptAlarmRerunRequested;
     private readonly HashSet<Guid> accessStartupPreflightCompleted = [];
     private readonly Dictionary<Guid, DateTimeOffset> accessPromptCancelledUtc = [];
     private string? lastImportBackupPath;
+    private readonly DispatcherTimer searchDebounceTimer = new()
+        { Interval = TimeSpan.FromMilliseconds(150) };
+    private readonly DispatcherTimer groupSearchDebounceTimer = new()
+        { Interval = TimeSpan.FromMilliseconds(150) };
+    private readonly Task startupCleanupTask;
+    private Dictionary<Guid, string> cachedGroupPaths = [];
+    private Dictionary<Guid, string> cachedServerGroupPaths = [];
+    private Dictionary<Guid, HashSet<Guid>> cachedGroupNestedServers = [];
+    private List<SessionRow> cachedAllSessionRows = [];
+    private Dictionary<Guid, string> cachedSearchableTexts = [];
+    private RequiredRouteOption[] cachedAllRequiredRouteOptions = [];
+    private Dictionary<Guid, RequiredRouteOption> cachedRouteOptionsById = [];
+    private static readonly RequiredRouteOption AutoRequiredRouteOption =
+        new(null, "Автоматически (без ограничения)");
+    private readonly BackgroundConfigSaver configSaver;
+
     public MainWindow()
     {
         InitializeComponent();
-        KittyRoutedSession.CleanupStaleFiles(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
-        KittySessionWriter.RelocateLegacyBackups(Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions"));
-        WinScpCredentialFiles.CleanupStale(Path.Combine(dataDirectory, "Temp"), DateTime.UtcNow);
-        KittyWindowInput.CleanupStaleLogs();
+        searchDebounceTimer.Tick += (_, _) =>
+        {
+            searchDebounceTimer.Stop();
+            RefreshSessions();
+        };
+        groupSearchDebounceTimer.Tick += (_, _) =>
+        {
+            groupSearchDebounceTimer.Stop();
+            RefreshGroups();
+        };
+        var sessionsDir = Path.Combine(AppContext.BaseDirectory, "KiTTY", "Sessions");
+        var tempDir = Path.Combine(dataDirectory, "Temp");
+        var startupUtc = DateTime.UtcNow;
+        startupCleanupTask = Task.Run(() =>
+        {
+            try { KittyRoutedSession.CleanupStaleFiles(sessionsDir, startupUtc); } catch { }
+            try { KittySessionWriter.RelocateLegacyBackups(sessionsDir); } catch { }
+            try { WinScpCredentialFiles.CleanupStale(tempDir, startupUtc); } catch { }
+            try { KittyWindowInput.CleanupStaleLogs(); } catch { }
+        });
         configPath = Path.Combine(dataDirectory, "config.json");
         config = LoadInitialConfig(configPath, out configAvailable);
+        configSaver = new BackgroundConfigSaver(configPath, (path, snapshot) => ConfigStore.SaveSnapshot(path, snapshot))
+        {
+            OnSaveFailed = ex => Dispatcher.BeginInvoke(() =>
+            {
+                RouteLog($"[ConfigSave] Ошибка фонового сохранения конфигурации: {ex.Message}");
+                Status($"Ошибка сохранения: {ex.Message} (изменения сохранены в памяти)");
+            })
+        };
         if (configAvailable) MigrateLegacyPrototypeConfig();
         RestoreRememberedConsoles();
         ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
@@ -343,14 +395,80 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task EnsureStartupCleanupCompletedAsync()
+    {
+        try { await startupCleanupTask.ConfigureAwait(false); } catch { }
+    }
+
+    private void RebuildIndex()
+    {
+        var (groupPaths, serverGroupPaths) = config.BuildGroupAndServerPathMaps();
+        cachedGroupPaths = groupPaths;
+        cachedServerGroupPaths = serverGroupPaths;
+
+        var nestedMap = new Dictionary<Guid, HashSet<Guid>>();
+        foreach (var group in config.AllGroups())
+        {
+            var servers = new HashSet<Guid>();
+            CollectNestedServerIds(group, servers);
+            nestedMap[group.Id] = servers;
+        }
+        cachedGroupNestedServers = nestedMap;
+
+        var allServers = config.AllServers().ToList();
+        var rows = new List<SessionRow>(allServers.Count);
+        var searchTexts = new Dictionary<Guid, string>(allServers.Count);
+        foreach (var s in allServers)
+        {
+            var groupName = cachedServerGroupPaths.GetValueOrDefault(s.Id, "Без группы");
+            rows.Add(new SessionRow(s, groupName));
+            searchTexts[s.Id] = ComputeSearchableText(s, groupName);
+        }
+        rows.Sort((a, b) => StringComparer.CurrentCultureIgnoreCase.Compare(a.Name, b.Name));
+        cachedAllSessionRows = rows;
+        cachedSearchableTexts = searchTexts;
+
+        var routeOptions = new List<RequiredRouteOption>(allServers.Count + 1)
+        {
+            AutoRequiredRouteOption
+        };
+        var byId = new Dictionary<Guid, RequiredRouteOption>(allServers.Count);
+
+        var orderedCandidates = allServers
+            .OrderBy(candidate => candidate.Name, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+
+        foreach (var candidate in orderedCandidates)
+        {
+            var groupName = cachedServerGroupPaths.GetValueOrDefault(candidate.Id, "Без группы");
+            var option = new RequiredRouteOption(
+                candidate.Id,
+                $"{candidate.Name} — {groupName}",
+                $"{candidate.Name} {candidate.Host} {candidate.Port} {groupName}");
+            routeOptions.Add(option);
+            byId[candidate.Id] = option;
+        }
+
+        cachedAllRequiredRouteOptions = routeOptions.ToArray();
+        cachedRouteOptionsById = byId;
+
+        static void CollectNestedServerIds(ServerGroup group, HashSet<Guid> set)
+        {
+            foreach (var server in group.Servers) set.Add(server.Id);
+            foreach (var child in group.Groups) CollectNestedServerIds(child, set);
+        }
+    }
+
     private void RefreshAll()
     {
+        RebuildIndex();
         RefreshGroups(); RefreshSessions(); ShowServer(selectedServer);
         Status($"Сессий: {config.AllServers().Count()} • Групп: {config.AllGroups().Count()} • Jumphost’ов: {config.BaseProxies.Count}");
     }
 
     private void RefreshGroups()
     {
+        if (GroupTree is null || config is null) return;
         refreshingGroups = true;
         try
         {
@@ -379,9 +497,9 @@ public partial class MainWindow : Window
         return false;
     }
 
-    private static TreeViewItem CreateGroupItem(ServerGroup group, string query = "", bool ancestorMatched = false)
+    private TreeViewItem CreateGroupItem(ServerGroup group, string query = "", bool ancestorMatched = false)
     {
-        var count = AllNestedServers(group).Count();
+        var count = cachedGroupNestedServers.TryGetValue(group.Id, out var servers) ? servers.Count : AllNestedServers(group).Count();
         var item = new TreeViewItem { Header = $"{group.Name}   {count}", Tag = group, IsExpanded = true, Padding = new Thickness(5) };
         var matched = ancestorMatched || query.Length == 0 || group.Name.Contains(query, StringComparison.CurrentCultureIgnoreCase);
         foreach (var child in group.Groups.OrderBy(g => g.Name))
@@ -396,34 +514,42 @@ public partial class MainWindow : Window
 
     private void RefreshSessions()
     {
+        if (SessionsGrid is null || config is null || cachedAllSessionRows is null) return;
         var query = SearchBox?.Text.Trim() ?? "";
-        var rows = config.AllServers()
-            .Where(s => selectedGroup is null || AllNestedServers(selectedGroup).Any(candidate => candidate.Id == s.Id))
-            .Where(s => query.Length == 0 || SearchableText(s).Contains(query, StringComparison.CurrentCultureIgnoreCase))
-            .Select(s => new SessionRow(s, GroupNameFor(s)))
-            .OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+        HashSet<Guid>? allowedServerIds = null;
+        if (selectedGroup is not null && cachedGroupNestedServers is not null)
+        {
+            cachedGroupNestedServers.TryGetValue(selectedGroup.Id, out allowedServerIds);
+        }
+
+        var rows = cachedAllSessionRows
+            .Where(r => allowedServerIds is null || allowedServerIds.Contains(r.Server.Id))
+            .Where(r => query.Length == 0 || (cachedSearchableTexts is not null && cachedSearchableTexts.TryGetValue(r.Server.Id, out var text) && text.Contains(query, StringComparison.CurrentCultureIgnoreCase)))
+            .ToList();
+
         SessionsGrid.ItemsSource = rows;
-        SessionCountText.Text = query.Length == 0 ? $"{rows.Count} сессий" : $"Найдено: {rows.Count}";
-        GroupFilterText.Text = selectedGroup is null ? "" : $"Группа: {FindGroupPath(config.Groups, selectedGroup.Id)}";
-        ClearGroupFilterButton.Visibility = selectedGroup is null ? Visibility.Collapsed : Visibility.Visible;
+        if (SessionCountText is not null) SessionCountText.Text = query.Length == 0 ? $"{rows.Count} сессий" : $"Найдено: {rows.Count}";
+        if (GroupFilterText is not null) GroupFilterText.Text = selectedGroup is null ? "" : $"Группа: {(cachedGroupPaths is not null ? cachedGroupPaths.GetValueOrDefault(selectedGroup.Id, selectedGroup.Name) : selectedGroup.Name)}";
+        if (ClearGroupFilterButton is not null) ClearGroupFilterButton.Visibility = selectedGroup is null ? Visibility.Collapsed : Visibility.Visible;
         if (selectedServer is not null) SessionsGrid.SelectedItem = rows.FirstOrDefault(r => r.Server.Id == selectedServer.Id);
     }
 
-    private string SearchableText(ManagedServer server)
+    private static string ComputeSearchableText(ManagedServer server, string groupName)
     {
         var web = server.WebInterfaces.SelectMany(item =>
             new[] { item.Name, item.Url, item.ResolverAddress, item.Username, item.Password });
         return string.Join('\n', new[] { server.Name, server.Host, server.Port.ToString(), server.Username, server.Password,
             server.PrivateKeyPath, server.PrivateKeyPassphrase,
-            server.RootLogin, server.RootPassword, server.SourceScriptPath ?? "", server.SourceScriptContent, GroupNameFor(server) }.Concat(web));
+            server.RootLogin, server.RootPassword, server.SourceScriptPath ?? "", server.SourceScriptContent, groupName }.Concat(web));
     }
 
-    private string GroupNameFor(ManagedServer server)
-    {
-        foreach (var group in config.AllGroups())
-            if (group.Servers.Any(s => s.Id == server.Id)) return FindGroupPath(config.Groups, group.Id) ?? group.Name;
-        return "Без группы";
-    }
+    private string SearchableText(ManagedServer server) =>
+        cachedSearchableTexts.TryGetValue(server.Id, out var text)
+            ? text
+            : ComputeSearchableText(server, GroupNameFor(server));
+
+    private string GroupNameFor(ManagedServer server) =>
+        cachedServerGroupPaths.TryGetValue(server.Id, out var path) ? path : "Без группы";
 
     private static string? FindGroupPath(IEnumerable<ServerGroup> groups, Guid id, string prefix = "")
     {
@@ -490,21 +616,12 @@ public partial class MainWindow : Window
         EnableTcpKeepalivesBox.IsChecked = server.EnableTcpKeepalives;
         ReconnectOnConnectionFailureBox.IsChecked = server.ReconnectOnConnectionFailure;
         ReconnectOnSystemWakeupBox.IsChecked = server.ReconnectOnSystemWakeup;
-        requiredRouteOptions = new[]
-            {
-                new RequiredRouteOption(null, "Автоматически (без ограничения)")
-            }
-            .Concat(config.AllServers()
-                .Where(candidate => candidate.Id != server.Id)
-                .OrderBy(candidate => candidate.Name, StringComparer.CurrentCultureIgnoreCase)
-                .Select(candidate => new RequiredRouteOption(
-                    candidate.Id,
-                    $"{candidate.Name} — {GroupNameFor(candidate)}",
-                    $"{candidate.Name} {candidate.Host} {candidate.Port} {GroupNameFor(candidate)}")))
-            .ToArray();
-        selectedRequiredRouteOption = requiredRouteOptions.First(option =>
-            option.Id == server.RequiredPreviousServerId);
-        ResetRequiredRoutePicker();
+        selectedRequiredRouteOption = server.RequiredPreviousServerId is Guid requiredId && cachedRouteOptionsById.TryGetValue(requiredId, out var routeOpt)
+            ? routeOpt
+            : AutoRequiredRouteOption;
+        updatingRequiredRoutePicker = true;
+        RequiredRouteSearchBox.Text = selectedRequiredRouteOption?.Name ?? "";
+        updatingRequiredRoutePicker = false;
         StartJumphostButton.Visibility = config.BaseProxies.Any(proxy => proxy.Enabled && proxy.StartupServerId == server.Id)
             ? Visibility.Visible : Visibility.Collapsed;
         ScriptInfoText.Text = server.SourceScriptPath is not null
@@ -581,7 +698,21 @@ public partial class MainWindow : Window
     }
     private void ClearGroupFilter_Click(object sender, RoutedEventArgs e) { selectedGroup = null; ClearTreeSelection(GroupTree.Items); RefreshSessions(); }
     private static void ClearTreeSelection(ItemCollection items) { foreach (var value in items) if (value is TreeViewItem item) { item.IsSelected = false; ClearTreeSelection(item.Items); } }
-    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) { if (SessionsGrid is not null) RefreshSessions(); }
+    private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (SessionsGrid is null) return;
+        var text = SearchBox.Text;
+        if (string.IsNullOrEmpty(text))
+        {
+            searchDebounceTimer?.Stop();
+            RefreshSessions();
+        }
+        else
+        {
+            searchDebounceTimer?.Stop();
+            searchDebounceTimer?.Start();
+        }
+    }
     private void FindSession_Executed(object sender, ExecutedRoutedEventArgs e)
     {
         SearchBox.Focus();
@@ -592,10 +723,21 @@ public partial class MainWindow : Window
     {
         if (SessionKeyboardPolicy.ShouldClearSearchOnKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None))
         {
+            searchDebounceTimer?.Stop();
             SearchBox.Clear();
             SearchBox.Focus();
+            RefreshSessions();
             e.Handled = true;
             return;
+        }
+
+        if (SessionKeyboardPolicy.ShouldFlushSearchDebounceOnKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None))
+        {
+            if (searchDebounceTimer?.IsEnabled == true)
+            {
+                searchDebounceTimer.Stop();
+                RefreshSessions();
+            }
         }
 
         var result = SessionKeyboardPolicy.EvaluateSearchKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None, SessionsGrid.Items.Count);
@@ -635,31 +777,76 @@ public partial class MainWindow : Window
             ShowServer(selected.Server);
         }
     }
-    private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e) { if (GroupTree is not null) RefreshGroups(); }
+    private void GroupSearchBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (GroupTree is null || GroupSearchBox is null) return;
+        var text = GroupSearchBox.Text;
+        if (string.IsNullOrEmpty(text))
+        {
+            groupSearchDebounceTimer?.Stop();
+            RefreshGroups();
+        }
+        else
+        {
+            groupSearchDebounceTimer?.Stop();
+            groupSearchDebounceTimer?.Start();
+        }
+    }
     private void GroupSearchClear_Click(object sender, RoutedEventArgs e)
     {
+        groupSearchDebounceTimer?.Stop();
         GroupSearchBox.Clear();
         GroupSearchBox.Focus();
+        if (GroupTree is not null) RefreshGroups();
     }
 
     private void SearchClear_Click(object sender, RoutedEventArgs e)
     {
+        searchDebounceTimer?.Stop();
         SearchBox.Clear();
         SearchBox.Focus();
+        RefreshSessions();
     }
 
     private void GroupSearchBox_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
         if (SessionKeyboardPolicy.ShouldClearSearchOnKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None))
         {
+            groupSearchDebounceTimer?.Stop();
             GroupSearchBox.Clear();
             GroupSearchBox.Focus();
+            if (GroupTree is not null) RefreshGroups();
             e.Handled = true;
+            return;
+        }
+
+        if (SessionKeyboardPolicy.ShouldFlushSearchDebounceOnKeyDown(e.Key.ToString(), Keyboard.Modifiers != ModifierKeys.None))
+        {
+            if (groupSearchDebounceTimer?.IsEnabled == true)
+            {
+                groupSearchDebounceTimer.Stop();
+                if (GroupTree is not null) RefreshGroups();
+            }
+        }
+    }
+
+    private void PopulateRequiredRoutePickerOptions()
+    {
+        if (selectedServer is null)
+        {
+            requiredRouteOptions = cachedAllRequiredRouteOptions;
+        }
+        else
+        {
+            requiredRouteOptions = cachedAllRequiredRouteOptions
+                .Where(opt => opt.Id is null || opt.Id != selectedServer.Id)
+                .ToArray();
         }
     }
 
     private void ResetRequiredRoutePicker()
     {
+        PopulateRequiredRoutePickerOptions();
         updatingRequiredRoutePicker = true;
         RequiredRouteSearchBox.Text = selectedRequiredRouteOption?.Name ?? "";
         RequiredRouteOptionsList.ItemsSource = requiredRouteOptions;
@@ -669,8 +856,7 @@ public partial class MainWindow : Window
 
     private void RequiredRouteSearchBox_GotKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
     {
-        RequiredRouteOptionsList.ItemsSource = requiredRouteOptions;
-        RequiredRouteOptionsList.SelectedItem = selectedRequiredRouteOption;
+        ResetRequiredRoutePicker();
         RequiredRoutePopup.IsOpen = true;
         RequiredRouteSearchBox.SelectAll();
     }
@@ -870,6 +1056,7 @@ public partial class MainWindow : Window
     {
         var server = new ManagedServer();
         config.UngroupedServers.Add(server);
+        RebuildIndex();
         SaveConfig();
         SelectServerFromLinkMap(server.Id);
     }
@@ -928,6 +1115,8 @@ public partial class MainWindow : Window
         if (config.BaseProxies.All(proxy => !proxy.Enabled)) { Warn("Дубль сохранён, но нет включённых точек входа для построения связей."); return; }
         using var cts = new CancellationTokenSource();
         operationCancellation = cts;
+        var tcs = new TaskCompletionSource();
+        activeForegroundOperationTask = tcs.Task;
         var progress = new LinkBuildingProgress { Owner = this, CancelRequested = () => cts.Cancel() };
         progress.Show(); HeaderPanel.IsEnabled = false; WorkspacePanel.IsEnabled = false;
         CancelOperationButton.IsEnabled = true; CancelOperationButton.Visibility = Visibility.Visible;
@@ -976,7 +1165,12 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         { RouteLog($"Quick duplicate links failed: duplicate={copy.Name}; error={ex.GetType().Name}: {ex.Message}"); Error(ex); }
-        finally { EndProgressOperation(cts, progress); }
+        finally
+        {
+            activeForegroundOperationTask = null;
+            tcs.TrySetResult();
+            EndProgressOperation(cts, progress);
+        }
         if (showSummary)
         {
             var successText = successfulNames.Count == 0 ? "—" :
@@ -1163,7 +1357,15 @@ public partial class MainWindow : Window
         assign(value);
     }
 
-    private void AddWeb_Click(object sender, RoutedEventArgs e) { if (selectedServer is null) { Warn("Сначала выберите сессию."); return; } selectedServer.WebInterfaces.Add(new()); WebGrid.ItemsSource = null; WebGrid.ItemsSource = selectedServer.WebInterfaces; }
+    private void AddWeb_Click(object sender, RoutedEventArgs e)
+    {
+        if (selectedServer is null) { Warn("Сначала выберите сессию."); return; }
+        selectedServer.WebInterfaces.Add(new());
+        WebGrid.ItemsSource = null;
+        WebGrid.ItemsSource = selectedServer.WebInterfaces;
+        var groupName = cachedServerGroupPaths.GetValueOrDefault(selectedServer.Id, "Без группы");
+        cachedSearchableTexts[selectedServer.Id] = ComputeSearchableText(selectedServer, groupName);
+    }
     private void AddBackupEndpoint_Click(object sender, RoutedEventArgs e)
     {
         if (selectedServer is null) { Warn("Сначала выберите сессию."); return; }
@@ -1305,11 +1507,19 @@ public partial class MainWindow : Window
 
     private void WebGrid_CellEditEnding(object sender, DataGridCellEditEndingEventArgs e)
     {
+        var targetServer = selectedServer;
+        if (targetServer is null) return;
         _ = Dispatcher.BeginInvoke(() =>
         {
             WebGrid.IsReadOnly = true;
+            var groupName = cachedServerGroupPaths.GetValueOrDefault(targetServer.Id, "Без группы");
+            cachedSearchableTexts[targetServer.Id] = ComputeSearchableText(targetServer, groupName);
+            if (SearchBox?.Text.Length > 0)
+            {
+                RefreshSessions();
+            }
             SaveConfig();
-        });
+        }, DispatcherPriority.Background);
     }
 
     private void OpenOriginalSession_Click(object sender, RoutedEventArgs e) => OpenOriginalSession();
@@ -2391,6 +2601,7 @@ public partial class MainWindow : Window
         ManagerConfig? routeConfig = null, SshConnectionService? sshService = null, bool persist = true, bool enableBackgroundProbing = true,
         IReadOnlyList<RouteCandidate>? explicitCandidates = null)
     {
+        await EnsureStartupCleanupCompletedAsync();
         var activeConfig = routeConfig ?? ConfigTransfer.CloneSnapshot(config);
         var activeSsh = sshService ?? ssh;
         var targetServer = activeConfig.FindServer(server.Id) ?? server;
@@ -2731,8 +2942,10 @@ public partial class MainWindow : Window
     private void ScheduleAccessCheckAfterRouteFailure(RouteCandidate candidate, Guid targetServerId)
     {
         var proxy = candidate.Proxy;
-        if (candidate.WithoutProxy || !AccessGrantPolicy.ShouldCheckControlsAfterRouteFailure(proxy) ||
-            !backgroundAccessChecks.TryAdd(proxy.Id, 0)) return;
+        if (candidate.WithoutProxy || !AccessGrantPolicy.ShouldCheckControlsAfterRouteFailure(proxy)) return;
+
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!backgroundAccessChecks.TryAdd(proxy.Id, tcs.Task)) return;
         _ = CheckAsync();
 
         async Task CheckAsync()
@@ -2748,7 +2961,11 @@ public partial class MainWindow : Window
                 RouteLog($"Background access check failed: proxy={proxy.Name}; target={targetServerId}; " +
                          $"error={ex.GetType().Name}: {ex.Message}");
             }
-            finally { backgroundAccessChecks.TryRemove(proxy.Id, out _); }
+            finally
+            {
+                backgroundAccessChecks.TryRemove(proxy.Id, out _);
+                tcs.TrySetResult(true);
+            }
         }
     }
 
@@ -2756,70 +2973,82 @@ public partial class MainWindow : Window
         BaseProxy proxy, ManagedServer server, int processId, Guid? targetServerId,
         CancellationToken cancellationToken, bool persist = true, ManagerConfig? runConfig = null)
     {
-        var activeConfig = runConfig ?? config;
-        var proxyId = proxy.Id;
-        var requestedAfter = proxy.LastAccessScriptAttemptUtc;
-        var gate = accessScriptGates.GetOrAdd(proxyId, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(cancellationToken);
+        var tcs = new TaskCompletionSource();
+        activeAccessScriptTasks.TryAdd(tcs.Task, 0);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, accessScriptsMasterCancellation.Token);
         try
         {
-            var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-            var sharedLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-            if (sharedLive is not null && sharedLive.LastAccessScriptAttemptUtc != requestedAfter)
-                return sharedLive.LastAccessScriptResult == "Verified";
-            if (executionProxy.LastAccessScriptAttemptUtc != requestedAfter)
-                return executionProxy.LastAccessScriptResult == "Verified";
-
-            var now = DateTimeOffset.UtcNow;
-            AccessGrantPolicy.MarkScriptAttempt(executionProxy, now);
-            var liveProxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-            if (liveProxy is not null && !ReferenceEquals(liveProxy, executionProxy))
-                AccessGrantPolicy.MarkScriptAttempt(liveProxy, now);
-            if (persist) SaveConfig();
+            var effectiveToken = linkedCts.Token;
+            var activeConfig = runConfig ?? config;
+            var proxyId = proxy.Id;
+            var requestedAfter = proxy.LastAccessScriptAttemptUtc;
+            var gate = accessScriptGates.GetOrAdd(proxyId, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(effectiveToken);
             try
             {
-                using var existing = Process.GetProcessById(processId);
-                await KittyWindowInput.SendLinesAsync(existing,
-                    JumphostStartupPlan.BuildPostLogin(executionProxy, server, true)
-                        .Select(step => step.Response).ToArray(), cancellationToken);
-                if (executionProxy.PostCommandReadyDelaySeconds > 0)
-                    await Task.Delay(TimeSpan.FromSeconds(executionProxy.PostCommandReadyDelaySeconds), cancellationToken);
-                var controls = await VerifyAccessControlsAsync(executionProxy, targetServerId, cancellationToken);
-                if (controls.Count == 0)
+                var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+                var sharedLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (sharedLive is not null && sharedLive.LastAccessScriptAttemptUtc != requestedAfter)
+                    return sharedLive.LastAccessScriptResult == "Verified";
+                if (executionProxy.LastAccessScriptAttemptUtc != requestedAfter)
+                    return executionProxy.LastAccessScriptResult == "Verified";
+
+                var now = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptAttempt(executionProxy, now);
+                var liveProxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (liveProxy is not null && !ReferenceEquals(liveProxy, executionProxy))
+                    AccessGrantPolicy.MarkScriptAttempt(liveProxy, now);
+                if (persist) SaveConfig();
+                try
                 {
-                    var failNow = DateTimeOffset.UtcNow;
-                    AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, failNow);
-                    var currentLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-                    if (currentLive is not null && !ReferenceEquals(currentLive, executionProxy))
-                        AccessGrantPolicy.MarkScriptUnconfirmed(currentLive, failNow);
-                    if (persist) SaveConfig();
-                    return false;
-                }
-                var successNow = DateTimeOffset.UtcNow;
-                AccessGrantPolicy.MarkScriptSuccess(executionProxy, successNow);
-                var currentLiveSuccess = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-                if (currentLiveSuccess is not null && !ReferenceEquals(currentLiveSuccess, executionProxy))
-                    AccessGrantPolicy.MarkScriptSuccess(currentLiveSuccess, successNow);
-                AccessGrantPolicy.RememberReachableControls(
-                    config, executionProxy.Id, controls, successNow);
-                if (!ReferenceEquals(activeConfig, config))
+                    using var existing = Process.GetProcessById(processId);
+                    await KittyWindowInput.SendLinesAsync(existing,
+                        JumphostStartupPlan.BuildPostLogin(executionProxy, server, true)
+                            .Select(step => step.Response).ToArray(), effectiveToken);
+                    if (executionProxy.PostCommandReadyDelaySeconds > 0)
+                        await Task.Delay(TimeSpan.FromSeconds(executionProxy.PostCommandReadyDelaySeconds), effectiveToken);
+                    var controls = await VerifyAccessControlsAsync(executionProxy, targetServerId, effectiveToken);
+                    if (controls.Count == 0)
+                    {
+                        var failNow = DateTimeOffset.UtcNow;
+                        AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, failNow);
+                        var currentLive = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                        if (currentLive is not null && !ReferenceEquals(currentLive, executionProxy))
+                            AccessGrantPolicy.MarkScriptUnconfirmed(currentLive, failNow);
+                        if (persist) SaveConfig();
+                        return false;
+                    }
+                    var successNow = DateTimeOffset.UtcNow;
+                    AccessGrantPolicy.MarkScriptSuccess(executionProxy, successNow);
+                    var currentLiveSuccess = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                    if (currentLiveSuccess is not null && !ReferenceEquals(currentLiveSuccess, executionProxy))
+                        AccessGrantPolicy.MarkScriptSuccess(currentLiveSuccess, successNow);
                     AccessGrantPolicy.RememberReachableControls(
-                        activeConfig, executionProxy.Id, controls, successNow);
-                if (persist) SaveConfig();
-                return true;
+                        config, executionProxy.Id, controls, successNow);
+                    if (!ReferenceEquals(activeConfig, config))
+                        AccessGrantPolicy.RememberReachableControls(
+                            activeConfig, executionProxy.Id, controls, successNow);
+                    if (persist) SaveConfig();
+                    return true;
+                }
+                catch
+                {
+                    var errNow = DateTimeOffset.UtcNow;
+                    AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, errNow);
+                    var currentLiveErr = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                    if (currentLiveErr is not null && !ReferenceEquals(currentLiveErr, executionProxy))
+                        AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveErr, errNow);
+                    if (persist) SaveConfig();
+                    throw;
+                }
             }
-            catch
-            {
-                var errNow = DateTimeOffset.UtcNow;
-                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, errNow);
-                var currentLiveErr = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-                if (currentLiveErr is not null && !ReferenceEquals(currentLiveErr, executionProxy))
-                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveErr, errNow);
-                if (persist) SaveConfig();
-                throw;
-            }
+            finally { gate.Release(); }
         }
-        finally { gate.Release(); }
+        finally
+        {
+            activeAccessScriptTasks.TryRemove(tcs.Task, out _);
+            tcs.TrySetResult();
+        }
     }
 
     private async Task<bool> RunAccessScriptWithConsoleChoiceAsync(
@@ -3066,6 +3295,11 @@ public partial class MainWindow : Window
                     {
                         var result = await ssh.ConnectCandidateAsync(
                             probeConfig, candidate, probe.Token, true);
+                        if (probe.Token.IsCancellationRequested || configExitPending)
+                        {
+                            result.Route.Dispose();
+                            return;
+                        }
                         SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
                         var liveServer = config.FindServer(server.Id) ?? server;
@@ -3137,6 +3371,11 @@ public partial class MainWindow : Window
                     {
                         var result = await ssh.ConnectCandidateAsync(
                             probeConfig, candidate, probe.Token, true);
+                        if (probe.Token.IsCancellationRequested || configExitPending)
+                        {
+                            result.Route.Dispose();
+                            return;
+                        }
                         SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
                         var liveServer = config.FindServer(server.Id) ?? server;
@@ -3225,6 +3464,11 @@ public partial class MainWindow : Window
                     {
                         var result = await ssh.ConnectCandidateAsync(
                             probeConfig, candidate, probe.Token, true);
+                        if (probe.Token.IsCancellationRequested || configExitPending)
+                        {
+                            result.Route.Dispose();
+                            return;
+                        }
                         SyncBackgroundProbeHops(result, initialFingerprints, probeConfig);
                         result.Route.Dispose();
                         var liveServer = config.FindServer(server.Id) ?? server;
@@ -3272,6 +3516,8 @@ public partial class MainWindow : Window
         if (!configAvailable ||
             accessScriptAlarmCancellation.IsCancellationRequested) return;
         accessScriptAlarmRunning = true;
+        var tcs = new TaskCompletionSource();
+        activeAccessScriptAlarmTask = tcs.Task;
         var handledAny = false;
         try
         {
@@ -3321,6 +3567,8 @@ public partial class MainWindow : Window
         finally
         {
             accessScriptAlarmRunning = false;
+            activeAccessScriptAlarmTask = null;
+            tcs.TrySetResult();
             if (handledAny) Status("");
             RefreshAccessScriptAlarmInterval();
             if (accessScriptAlarmRerunRequested && !accessScriptAlarmCancellation.IsCancellationRequested)
@@ -3450,136 +3698,149 @@ public partial class MainWindow : Window
         BaseProxy proxy, ManagedServer server, Guid? targetServerId,
         CancellationToken cancellationToken, bool persist = true, ManagerConfig? runConfig = null)
     {
-        var activeConfig = runConfig ?? config;
-        var proxyId = proxy.Id;
-        var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
-        var liveProxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-        var now = DateTimeOffset.UtcNow;
-        AccessGrantPolicy.MarkScriptAttempt(executionProxy, now);
-        if (liveProxy is not null && !ReferenceEquals(liveProxy, executionProxy))
-            AccessGrantPolicy.MarkScriptAttempt(liveProxy, now);
-        if (persist) SaveConfig();
-        AccessScriptRunnerPlan? plan = null;
-        Process? process = null;
-        var cleanupAfterExit = false;
+        var tcs = new TaskCompletionSource();
+        activeAccessScriptTasks.TryAdd(tcs.Task, 0);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, accessScriptsMasterCancellation.Token);
         try
         {
-            var (createdPlan, startedProcess) = await Task.Run(() =>
+            var effectiveToken = linkedCts.Token;
+            var activeConfig = runConfig ?? config;
+            var proxyId = proxy.Id;
+            var executionProxy = activeConfig.BaseProxies.FirstOrDefault(item => item.Id == proxyId) ?? proxy;
+            var liveProxy = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+            var now = DateTimeOffset.UtcNow;
+            AccessGrantPolicy.MarkScriptAttempt(executionProxy, now);
+            if (liveProxy is not null && !ReferenceEquals(liveProxy, executionProxy))
+                AccessGrantPolicy.MarkScriptAttempt(liveProxy, now);
+            if (persist) SaveConfig();
+            AccessScriptRunnerPlan? plan = null;
+            Process? process = null;
+            var cleanupAfterExit = false;
+            try
             {
-                AccessScriptRunnerPlan? p = null;
-                try
+                var (createdPlan, startedProcess) = await Task.Run(() =>
                 {
-                    var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
-                        ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(activeConfig.KittyPath)
-                        : ResolveProgram(activeConfig.KittyPath);
-                    p = AccessScriptRunnerPlan.Create(kitty, server, executionProxy, DateTimeOffset.UtcNow);
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var proc = Process.Start(p.StartInfo)
-                        ?? throw new InvalidOperationException("KiTTY для скрипта доступа не удалось запустить.");
-                    return (p, proc);
-                }
-                catch
+                    AccessScriptRunnerPlan? p = null;
+                    try
+                    {
+                        var kitty = !string.IsNullOrWhiteSpace(server.SourceSessionPath) && File.Exists(server.SourceSessionPath)
+                            ? FindKittyNearSession(server.SourceSessionPath!) ?? ResolveProgram(activeConfig.KittyPath)
+                            : ResolveProgram(activeConfig.KittyPath);
+                        p = AccessScriptRunnerPlan.Create(kitty, server, executionProxy, DateTimeOffset.UtcNow);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        effectiveToken.ThrowIfCancellationRequested();
+                        var proc = Process.Start(p.StartInfo)
+                            ?? throw new InvalidOperationException("KiTTY для скрипта доступа не удалось запустить.");
+                        return (p, proc);
+                    }
+                    catch
+                    {
+                        p?.Dispose();
+                        throw;
+                    }
+                }, effectiveToken);
+                plan = createdPlan;
+                process = startedProcess;
+                // Remember the service console so every later attempt reuses it
+                // instead of opening another duplicate window.
+                jumphostProcesses.Remember(executionProxy, JumphostConsoleKind.Access, process,
+                    JumphostConsoleTitles.AccessTitle(server.Name, executionProxy.Name));
+                PersistConsoles();
+                if (plan.TotpCodeForWindowInput is not null)
+                    await KittyWindowInput.SendLineAsync(process, plan.TotpCodeForWindowInput, effectiveToken);
+
+                var deadline = DateTime.UtcNow + plan.CompletionTimeout;
+                while (DateTime.UtcNow < deadline && !process.HasExited && !plan.HasCompletionMarker())
+                    await Task.Delay(500, effectiveToken);
+                var markerSeen = plan.HasCompletionMarker();
+                if (!markerSeen)
                 {
-                    p?.Dispose();
-                    throw;
+                    var failNow = DateTimeOffset.UtcNow;
+                    AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, failNow);
+                    var currentLiveFail = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                    if (currentLiveFail is not null && !ReferenceEquals(currentLiveFail, executionProxy))
+                        AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveFail, failNow);
+                    if (persist) SaveConfig();
+                    var earlyExit = process.HasExited;
+                    RouteLog($"Access script unconfirmed: proxy={executionProxy.Name}; " +
+                             (earlyExit ? "KiTTY exited before marker" : "marker timeout; process left running"));
+                    cleanupAfterExit = true;
+                    _ = plan.DisposeAfterExitAsync(process);
+                    Status(earlyExit
+                        ? $"KiTTY скрипта через «{executionProxy.Name}» закрылась до подтверждения завершения"
+                        : $"Запуск скрипта через «{executionProxy.Name}» не подтверждён за " +
+                          $"{(int)plan.CompletionTimeout.TotalSeconds} сек.; консоль оставлена открытой");
+                    return false;
                 }
-            }, cancellationToken);
-            plan = createdPlan;
-            process = startedProcess;
-            // Remember the service console so every later attempt reuses it
-            // instead of opening another duplicate window.
-            jumphostProcesses.Remember(executionProxy, JumphostConsoleKind.Access, process,
-                JumphostConsoleTitles.AccessTitle(server.Name, executionProxy.Name));
-            PersistConsoles();
-            if (plan.TotpCodeForWindowInput is not null)
-                await KittyWindowInput.SendLineAsync(process, plan.TotpCodeForWindowInput, cancellationToken);
 
-            var deadline = DateTime.UtcNow + plan.CompletionTimeout;
-            while (DateTime.UtcNow < deadline && !process.HasExited && !plan.HasCompletionMarker())
-                await Task.Delay(500, cancellationToken);
-            var markerSeen = plan.HasCompletionMarker();
-            if (!markerSeen)
-            {
-                var failNow = DateTimeOffset.UtcNow;
-                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, failNow);
-                var currentLiveFail = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-                if (currentLiveFail is not null && !ReferenceEquals(currentLiveFail, executionProxy))
-                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveFail, failNow);
-                if (persist) SaveConfig();
-                var earlyExit = process.HasExited;
-                RouteLog($"Access script unconfirmed: proxy={executionProxy.Name}; " +
-                         (earlyExit ? "KiTTY exited before marker" : "marker timeout; process left running"));
-                cleanupAfterExit = true;
-                _ = plan.DisposeAfterExitAsync(process);
-                Status(earlyExit
-                    ? $"KiTTY скрипта через «{executionProxy.Name}» закрылась до подтверждения завершения"
-                    : $"Запуск скрипта через «{executionProxy.Name}» не подтверждён за " +
-                      $"{(int)plan.CompletionTimeout.TotalSeconds} сек.; консоль оставлена открытой");
-                return false;
-            }
-
-            var controls = await VerifyAccessControlsAsync(executionProxy, targetServerId, cancellationToken);
-            if (controls.Count == 0)
-            {
-                IReadOnlyList<Guid> candidates;
-                try { candidates = await DiscoverAccessControlsAsync(executionProxy, targetServerId, cancellationToken); }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                { candidates = []; }
-                AccessGrantPolicy.RememberControlCandidates(config, executionProxy.Id, candidates);
-                if (!ReferenceEquals(activeConfig, config))
-                    AccessGrantPolicy.RememberControlCandidates(activeConfig, executionProxy.Id, candidates);
-                var unconfNow = DateTimeOffset.UtcNow;
-                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, unconfNow);
-                var currentLiveUnconf = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-                if (currentLiveUnconf is not null && !ReferenceEquals(currentLiveUnconf, executionProxy))
-                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveUnconf, unconfNow);
-                if (persist) SaveConfig();
-                RouteLog($"Access script unconfirmed: proxy={executionProxy.Name}; marker=seen; controls=0; " +
-                         $"learned-candidates={candidates.Count}");
-                Status("Команда завершилась, но доступ к целевому или контрольному серверу не подтверждён");
-                return false;
-            }
-            IReadOnlyList<Guid> learned;
-            try { learned = await DiscoverAccessControlsAsync(executionProxy, targetServerId, cancellationToken); }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            { learned = controls; }
-            var succNow = DateTimeOffset.UtcNow;
-            AccessGrantPolicy.MarkScriptSuccess(executionProxy, succNow);
-            var currentLiveSucc = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-            if (currentLiveSucc is not null && !ReferenceEquals(currentLiveSucc, executionProxy))
-                AccessGrantPolicy.MarkScriptSuccess(currentLiveSucc, succNow);
-            AccessGrantPolicy.RememberReachableControls(config, executionProxy.Id,
-                learned.Count > 0 ? learned : controls, succNow);
-            if (!ReferenceEquals(activeConfig, config))
-                AccessGrantPolicy.RememberReachableControls(activeConfig, executionProxy.Id,
+                var controls = await VerifyAccessControlsAsync(executionProxy, targetServerId, effectiveToken);
+                if (controls.Count == 0)
+                {
+                    IReadOnlyList<Guid> candidates;
+                    try { candidates = await DiscoverAccessControlsAsync(executionProxy, targetServerId, effectiveToken); }
+                    catch (OperationCanceledException) when (effectiveToken.IsCancellationRequested || cancellationToken.IsCancellationRequested)
+                    { candidates = []; }
+                    AccessGrantPolicy.RememberControlCandidates(config, executionProxy.Id, candidates);
+                    if (!ReferenceEquals(activeConfig, config))
+                        AccessGrantPolicy.RememberControlCandidates(activeConfig, executionProxy.Id, candidates);
+                    var unconfNow = DateTimeOffset.UtcNow;
+                    AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, unconfNow);
+                    var currentLiveUnconf = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                    if (currentLiveUnconf is not null && !ReferenceEquals(currentLiveUnconf, executionProxy))
+                        AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveUnconf, unconfNow);
+                    if (persist) SaveConfig();
+                    RouteLog($"Access script unconfirmed: proxy={executionProxy.Name}; marker=seen; controls=0; " +
+                             $"learned-candidates={candidates.Count}");
+                    Status("Команда завершилась, но доступ к целевому или контрольному серверу не подтверждён");
+                    return false;
+                }
+                IReadOnlyList<Guid> learned;
+                try { learned = await DiscoverAccessControlsAsync(executionProxy, targetServerId, effectiveToken); }
+                catch (OperationCanceledException) when (effectiveToken.IsCancellationRequested || cancellationToken.IsCancellationRequested)
+                { learned = controls; }
+                var succNow = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptSuccess(executionProxy, succNow);
+                var currentLiveSucc = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (currentLiveSucc is not null && !ReferenceEquals(currentLiveSucc, executionProxy))
+                    AccessGrantPolicy.MarkScriptSuccess(currentLiveSucc, succNow);
+                AccessGrantPolicy.RememberReachableControls(config, executionProxy.Id,
                     learned.Count > 0 ? learned : controls, succNow);
-            if (persist) SaveConfig();
-            RouteLog($"Access script verified: proxy={executionProxy.Name}; controls={controls.Count}; learned={learned.Count}");
-            Status($"Скрипт доступа через «{executionProxy.Name}» подтверждён ({controls.Count} серверов)");
-            return true;
-        }
-        catch
-        {
-            var errNow = DateTimeOffset.UtcNow;
-            AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, errNow);
-            var currentLiveErr = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
-            if (currentLiveErr is not null && !ReferenceEquals(currentLiveErr, executionProxy))
-                AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveErr, errNow);
-            if (persist) SaveConfig();
-            if (plan is not null && process is not null)
-            {
-                cleanupAfterExit = true;
-                _ = plan.DisposeAfterExitAsync(process);
+                if (!ReferenceEquals(activeConfig, config))
+                    AccessGrantPolicy.RememberReachableControls(activeConfig, executionProxy.Id,
+                        learned.Count > 0 ? learned : controls, succNow);
+                if (persist) SaveConfig();
+                RouteLog($"Access script verified: proxy={executionProxy.Name}; controls={controls.Count}; learned={learned.Count}");
+                Status($"Скрипт доступа через «{executionProxy.Name}» подтверждён ({controls.Count} серверов)");
+                return true;
             }
-            throw;
+            catch
+            {
+                var errNow = DateTimeOffset.UtcNow;
+                AccessGrantPolicy.MarkScriptUnconfirmed(executionProxy, errNow);
+                var currentLiveErr = config.BaseProxies.FirstOrDefault(item => item.Id == proxyId);
+                if (currentLiveErr is not null && !ReferenceEquals(currentLiveErr, executionProxy))
+                    AccessGrantPolicy.MarkScriptUnconfirmed(currentLiveErr, errNow);
+                if (persist) SaveConfig();
+                if (plan is not null && process is not null)
+                {
+                    cleanupAfterExit = true;
+                    _ = plan.DisposeAfterExitAsync(process);
+                }
+                throw;
+            }
+            finally
+            {
+                if (!cleanupAfterExit)
+                {
+                    plan?.Dispose();
+                    process?.Dispose();
+                }
+            }
         }
         finally
         {
-            if (!cleanupAfterExit)
-            {
-                plan?.Dispose();
-                process?.Dispose();
-            }
+            activeAccessScriptTasks.TryRemove(tcs.Task, out _);
+            tcs.TrySetResult();
         }
     }
 
@@ -3641,6 +3902,7 @@ public partial class MainWindow : Window
         Guid? forceAccessScriptProxyId = null, bool deferAccessScriptUntilReady = false,
         bool isManualLaunch = false, bool persist = true, ManagerConfig? runConfig = null)
     {
+        await EnsureStartupCleanupCompletedAsync();
         var activeConfig = runConfig ?? config;
         var ordered = RoutePlanner.OrderedProxies(activeConfig)
             .Where(proxy => startupServerId is null || proxy.StartupServerId == startupServerId)
@@ -4050,6 +4312,7 @@ public partial class MainWindow : Window
 
     private async Task OfferStartMissingJumphostsAsync()
     {
+        await EnsureStartupCleanupCompletedAsync();
         if (!config.OfferStartMissingJumphosts) return;
         var configured = config.BaseProxies.Where(item =>
             item.Enabled && item.StartupServerId is not null).ToArray();
@@ -4360,6 +4623,7 @@ public partial class MainWindow : Window
 
     private async Task StartManagedJumphostAsync(ManagedServer server)
     {
+        await EnsureStartupCleanupCompletedAsync();
         if (sessionExitPending || sessionExitCompleted) return;
         var openingKey = (server.Id, (Guid?)null);
         if (!pendingSessionOpenings.Add(openingKey))
@@ -4590,6 +4854,8 @@ public partial class MainWindow : Window
         if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return; }
         using var cts = new CancellationTokenSource();
         operationCancellation = cts;
+        var tcs = new TaskCompletionSource();
+        activeForegroundOperationTask = tcs.Task;
         var progressWindow = new LinkBuildingProgress
         {
             Owner = this,
@@ -4632,12 +4898,15 @@ public partial class MainWindow : Window
                     var phaseResults = await ConnectivityBatchExecutor.CheckPairsAsync(
                         phasePairs, CheckConnectivityBatchFromAsync, cts.Token);
                     all.AddRange(phaseResults);
-                    foreach (var pair in phasePairs.Where(pair => !phaseResults.Any(result =>
-                                 result.Success &&
-                                 ((result.SourceId == pair.A.Id && result.TargetId == pair.B.Id) ||
-                                  (result.SourceId == pair.B.Id && result.TargetId == pair.A.Id)))))
-                        ServerLinkPairPolicy.Invalidate(config, pair.A.Id, pair.B.Id);
-                    SaveLinkResults(phaseResults);
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        foreach (var pair in phasePairs.Where(pair => !phaseResults.Any(result =>
+                                     result.Success &&
+                                     ((result.SourceId == pair.A.Id && result.TargetId == pair.B.Id) ||
+                                      (result.SourceId == pair.B.Id && result.TargetId == pair.A.Id)))))
+                            ServerLinkPairPolicy.Invalidate(config, pair.A.Id, pair.B.Id);
+                        SaveLinkResults(phaseResults);
+                    });
                     checkedTargetIds.AddRange(phasePairs.Select(pair => pair.B.Id));
                     var phaseCompleted = phasePairs.Length;
                     var phaseSuccessful = phasePairs.Count(pair => phaseResults.Any(result =>
@@ -4724,6 +4993,8 @@ public partial class MainWindow : Window
         }
         finally
         {
+            activeForegroundOperationTask = null;
+            tcs.TrySetResult();
             EndProgressOperation(cts, progressWindow);
         }
     }
@@ -4736,6 +5007,8 @@ public partial class MainWindow : Window
         if (operationCancellation is not null) { Status("Дождитесь завершения текущей операции или отмените её."); return false; }
         using var cts = new CancellationTokenSource();
         operationCancellation = cts;
+        var tcs = new TaskCompletionSource();
+        activeForegroundOperationTask = tcs.Task;
         var progress = new LinkBuildingProgress { Owner = this, CancelRequested = () => cts.Cancel() };
         progress.Show();
         HeaderPanel.IsEnabled = false;
@@ -4891,15 +5164,42 @@ public partial class MainWindow : Window
             return false;
         }
         catch (Exception ex) { Error(ex); return false; }
-        finally { EndProgressOperation(cts, progress); }
+        finally
+        {
+            activeForegroundOperationTask = null;
+            tcs.TrySetResult();
+            EndProgressOperation(cts, progress);
+        }
     }
 
     private async Task<IReadOnlyList<ConnectivityResult>> CheckConnectivityBatchFromAsync(
         Guid sourceId, IReadOnlyList<Guid> targetIds, CancellationToken cancellationToken)
     {
+        // 1. Snapshot config on UI thread so background SSH checks cannot mutate live model
+        var snapshotConfig = Dispatcher.CheckAccess()
+            ? ConfigTransfer.CloneSnapshot(config)
+            : Dispatcher.Invoke(() => ConfigTransfer.CloneSnapshot(config));
+
+        var initialFingerprints = snapshotConfig.AllServers()
+            .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
+        var initialRoutes = snapshotConfig.AllServers()
+            .ToDictionary(s => s.Id, s => s.PreferredRoute);
+
         try
         {
-            return await ssh.CheckFromAsync(config, sourceId, targetIds, cancellationToken);
+            var results = await ssh.CheckFromAsync(snapshotConfig, sourceId, targetIds, cancellationToken);
+
+            // 2. Safely apply discovered routes and address preferences back to live config on UI thread
+            if (Dispatcher.CheckAccess())
+            {
+                ApplyDiscoveredRoutesAndPreferences(config, snapshotConfig, initialFingerprints, initialRoutes, sourceId, targetIds, () => Dispatcher.CheckAccess());
+            }
+            else
+            {
+                await Dispatcher.InvokeAsync(() => ApplyDiscoveredRoutesAndPreferences(config, snapshotConfig, initialFingerprints, initialRoutes, sourceId, targetIds, () => Dispatcher.CheckAccess()));
+            }
+
+            return results;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
@@ -4935,6 +5235,11 @@ public partial class MainWindow : Window
             existing.Activate();
             return;
         }
+        if (savedLinksChecksCancellation.IsCancellationRequested)
+        {
+            try { savedLinksChecksCancellation.Dispose(); } catch { }
+            savedLinksChecksCancellation = new CancellationTokenSource();
+        }
         var dialog = new SavedLinksDialog(config, source, CheckSavedLinksAsync, SaveConfig,
             async (viaServerId, cancellationToken) =>
             {
@@ -4947,6 +5252,7 @@ public partial class MainWindow : Window
 
     private void CloseActiveSavedLinksDialogs()
     {
+        savedLinksChecksCancellation.Cancel();
         foreach (var dialog in savedLinksWindows.Values.ToList())
         {
             try { dialog.Close(); } catch { }
@@ -4957,22 +5263,28 @@ public partial class MainWindow : Window
     private async Task<IReadOnlyList<ConnectivityResult>> CheckSavedLinksAsync(
         Guid sourceId, IReadOnlyList<Guid> targetIds, CancellationToken cancellationToken)
     {
-        var snapshotConfig = ConfigTransfer.CloneSnapshot(config);
-        await EnsureManagedJumphostAsync(cancellationToken, false, runConfig: snapshotConfig);
-        var snapSource = snapshotConfig.FindServer(sourceId)
-            ?? throw new InvalidOperationException("Исходный сервер связи не найден.");
-        var initialFingerprints = snapshotConfig.AllServers()
-            .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
-
-        var checkingSsh = new SshConnectionService
+        var tcs = new TaskCompletionSource();
+        activeSavedLinksChecks.TryAdd(tcs.Task, 0);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, savedLinksChecksCancellation.Token);
+        try
         {
-            Timeout = TimeSpan.FromSeconds(snapshotConfig.ConnectionTimeoutSeconds),
-            EndpointProbeTimeout = TimeSpan.FromSeconds(snapshotConfig.EndpointProbeTimeoutSeconds),
-            HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, cancellationToken),
-            HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, cancellationToken),
-        };
+            var effectiveToken = linkedCts.Token;
+            var snapshotConfig = ConfigTransfer.CloneSnapshot(config);
+            await EnsureManagedJumphostAsync(effectiveToken, false, runConfig: snapshotConfig);
+            var snapSource = snapshotConfig.FindServer(sourceId)
+                ?? throw new InvalidOperationException("Исходный сервер связи не найден.");
+            var initialFingerprints = snapshotConfig.AllServers()
+                .ToDictionary(s => s.Id, s => (Host: s.Host, Port: s.Port, Fingerprint: s.HostKeyFingerprint ?? ""));
 
-        var results = await checkingSsh.CheckFromAsync(snapshotConfig, sourceId, targetIds, cancellationToken);
+            var checkingSsh = new SshConnectionService
+            {
+                Timeout = TimeSpan.FromSeconds(snapshotConfig.ConnectionTimeoutSeconds),
+                EndpointProbeTimeout = TimeSpan.FromSeconds(snapshotConfig.EndpointProbeTimeoutSeconds),
+                HostKeyVerifier = (s, fp) => ConfirmHostKey(s, fp, effectiveToken),
+                HostKeyMismatchVerifier = (s, oldFp, newFp) => ConfirmChangedHostKey(s, oldFp, newFp, effectiveToken),
+            };
+
+            var results = await checkingSsh.CheckFromAsync(snapshotConfig, sourceId, targetIds, effectiveToken);
         var changed = false;
 
         foreach (var result in results)
@@ -5059,8 +5371,14 @@ public partial class MainWindow : Window
             }
         }
 
-        if (changed) SaveConfig();
-        return results;
+            if (changed) SaveConfig();
+            return results;
+        }
+        finally
+        {
+            activeSavedLinksChecks.TryRemove(tcs.Task, out _);
+            tcs.TrySetResult();
+        }
     }
 
     private void Jumphosts_Click(object sender, RoutedEventArgs e)
@@ -5192,7 +5510,15 @@ public partial class MainWindow : Window
         try
         {
             pendingKittyConflicts.Clear();
-            if (Directory.Exists(BundledSessionsDirectory)) _ = ImportOrUpdateSessions(BundledSessionsDirectory);
+            if (Directory.Exists(BundledSessionsDirectory))
+            {
+                var result = ImportOrUpdateSessions(BundledSessionsDirectory);
+                if (result.Changed)
+                {
+                    RebuildIndex();
+                    RefreshSessions();
+                }
+            }
             var conflicts = pendingKittyConflicts
                 .Where(conflict => KittySessionWriter.WritableProperties.Contains(conflict.PropertyName))
                 .ToDictionary(conflict => (conflict.Server.Id, conflict.PropertyName));
@@ -5475,6 +5801,10 @@ public partial class MainWindow : Window
     {
         var server = config.FindServer(serverId);
         if (server is null) return;
+        if (!cachedAllSessionRows.Any(r => r.Server.Id == serverId))
+        {
+            RebuildIndex();
+        }
         selectedGroup = null;
         ClearTreeSelection(GroupTree.Items);
         if (SearchBox.Text.Length > 0) SearchBox.Text = "";
@@ -5509,8 +5839,9 @@ public partial class MainWindow : Window
         Process.Start(new ProcessStartInfo("explorer.exe", Quote(directory)) { UseShellExecute = true });
     }
 
-    private void Export_Click(object sender, RoutedEventArgs e)
+    private async void Export_Click(object sender, RoutedEventArgs e)
     {
+        if (isImportWizardActive || configExitPending) return;
         var selection = new ExportSelectionDialog(config) { Owner = this };
         if (selection.ShowDialog() != true) return;
         if (ThemedMessageDialog.Show(this,
@@ -5518,21 +5849,39 @@ public partial class MainWindow : Window
                 "Открытые секреты", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
         var dialog = new SaveFileDialog { Filter = "JSON (*.json)|*.json", FileName = "kitty-manager-export.json" };
         if (dialog.ShowDialog() != true) return;
-        var exportConfig = ConfigTransfer.CreateExport(config, selection.SelectedServerIds, selection.IncludeEntryPoints);
-        ConfigStore.Export(dialog.FileName, exportConfig);
-        Status($"Экспортировано сессий: {exportConfig.AllServers().Count()}");
-    }
-    private void ImportConfig_Click(object sender, RoutedEventArgs e)
-    {
-        var dialog = new OpenFileDialog { Filter = "JSON (*.json)|*.json" }; if (dialog.ShowDialog() != true) return;
         try
         {
+            await FlushPendingSavesAsync();
+            var exportConfig = ConfigTransfer.CreateExport(config, selection.SelectedServerIds, selection.IncludeEntryPoints);
+            ConfigStore.Export(dialog.FileName, exportConfig);
+            Status($"Экспортировано сессий: {exportConfig.AllServers().Count()}");
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"EXPORT failed: {ex.Message}");
+            Error(ex, "Ошибка при экспорте конфигурации");
+        }
+    }
+    private async void ImportConfig_Click(object sender, RoutedEventArgs e)
+    {
+        if (isImportWizardActive || configExitPending) return;
+        var dialog = new OpenFileDialog { Filter = "JSON (*.json)|*.json" }; if (dialog.ShowDialog() != true) return;
+        if (isImportWizardActive || configExitPending) return;
+        isImportWizardActive = true;
+        var tcs = new TaskCompletionSource();
+        activeImportTask = tcs.Task;
+        var importCompletedSuccessfully = false;
+        try
+        {
+            await FlushPendingSavesAsync();
             var incoming = ConfigStore.Import(dialog.FileName);
             var wizard = new ImportWizardDialog(config, incoming) { Owner = this };
             if (wizard.ShowDialog() != true || wizard.ResultConfig is null) return;
             var merged = wizard.ResultConfig;
             foreach (var line in ImportWizardEngine.DescribePlan(wizard.Plan)) RouteLog(line);
             RouteLog(ImportWizardEngine.DescribeResult(config, merged));
+            configSaver.ClearPending();
+            await FlushPendingSavesAsync();
             lastImportBackupPath = ImportWizardTransaction.SaveWithBackup(configPath, merged);
             RouteLog($"IMPORT APPLY success backup=\"{Path.GetFileName(lastImportBackupPath)}\"");
             CloseActiveSavedLinksDialogs();
@@ -5548,6 +5897,10 @@ public partial class MainWindow : Window
             }
             Status($"Импорт завершён. Backup: {Path.GetFileName(lastImportBackupPath)}");
 
+            isImportWizardActive = false;
+            importWizardMissedSave = false;
+            importCompletedSuccessfully = true;
+
             var selectedIncomingProxyIds = wizard.Plan.Proxies
                 .Where(row => row.Decision is ImportDecision.Add or ImportDecision.UseIncoming)
                 .Select(row => row.IncomingId).ToHashSet();
@@ -5562,27 +5915,71 @@ public partial class MainWindow : Window
                     "Для автоматической подстановки OTP добавьте свой TOTP-секрет в настройках каждой точки входа.",
                     "Импорт: требуется настройка OTP", MessageBoxButton.OK, MessageBoxImage.Information);
             }
+            importCompletedSuccessfully = true;
         }
         catch (Exception ex)
         {
             RouteLog($"IMPORT APPLY failed type={ex.GetType().Name} message=\"{ex.Message}\"");
             Error(ex);
         }
+        finally
+        {
+            isImportWizardActive = false;
+            activeImportTask = null;
+            tcs.TrySetResult();
+            if (importWizardMissedSave && !importCompletedSuccessfully)
+            {
+                importWizardMissedSave = false;
+                SaveConfig();
+            }
+            else
+            {
+                importWizardMissedSave = false;
+            }
+        }
     }
 
-    private void RollbackLastImport()
+    private async void RollbackLastImport()
     {
+        if (isImportWizardActive || configExitPending) return;
         if (lastImportBackupPath is null || !File.Exists(lastImportBackupPath)) return;
         if (ThemedMessageDialog.Show(this, "Вернуть конфигурацию к состоянию перед последним импортом?",
                 "Откат импорта", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
-        ImportWizardTransaction.Rollback(configPath, lastImportBackupPath);
-        CloseActiveSavedLinksDialogs();
-        config = ConfigStore.Load(configPath, migratePlaintextSecrets: true);
-        ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
-        ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
-        lastImportBackupPath = null;
-        RefreshAll();
-        Status("Последний импорт отменён");
+        if (isImportWizardActive || configExitPending) return;
+        isImportWizardActive = true;
+        var tcs = new TaskCompletionSource();
+        activeImportTask = tcs.Task;
+        var rollbackCompleted = false;
+        try
+        {
+            configSaver.ClearPending();
+            await FlushPendingSavesAsync();
+            ImportWizardTransaction.Rollback(configPath, lastImportBackupPath);
+            CloseActiveSavedLinksDialogs();
+            config = ConfigStore.Load(configPath, migratePlaintextSecrets: true);
+            ssh.Timeout = TimeSpan.FromSeconds(config.ConnectionTimeoutSeconds);
+            ssh.EndpointProbeTimeout = TimeSpan.FromSeconds(config.EndpointProbeTimeoutSeconds);
+            lastImportBackupPath = null;
+            RefreshAll();
+            Status("Последний импорт отменён");
+            rollbackCompleted = true;
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"ROLLBACK failed: {ex.Message}");
+            Error(ex);
+        }
+        finally
+        {
+            isImportWizardActive = false;
+            activeImportTask = null;
+            tcs.TrySetResult();
+            importWizardMissedSave = false;
+            if (!rollbackCompleted)
+            {
+                SaveConfig();
+            }
+        }
     }
 
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
@@ -5658,27 +6055,142 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Verify update helper process is still alive and commit signal before irreversible cleanup
-        if (pendingUpdateSession is not null)
+        if (configExitCompleted)
         {
-            if (!pendingUpdateSession.IsHelperAlive() || !pendingUpdateSession.Commit())
-            {
-                pendingUpdateSession.Disarm();
-                pendingUpdateSession = null;
-                ThemedMessageDialog.Show(this,
-                    "Не удалось инициировать процедуру обновления: процесс помощника завершился или не удалось записать сигнал подтверждения.\n\nОбновление отменено во избежание сбоя. Приложение продолжит работу.",
-                    "Ошибка обновления",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Warning);
-                ResetPendingExitState();
-                e.Cancel = true;
-                forceExit = false;
-                return;
-            }
+            return;
         }
 
-        Cleanup();
+        if (!configAvailable)
+        {
+            Cleanup();
+            return;
+        }
+
+        e.Cancel = true;
+        if (configExitPending) return;
+        configExitPending = true;
+        _ = FlushConfigAndExitAsync();
     }
+    private async Task FlushConfigAndExitAsync()
+    {
+        try
+        {
+            IsEnabled = false;
+            pamTotpTimer.Stop();
+            backgroundRouteProbes.CancelAll();
+
+            // 1. Cancel foreground operations and await active task
+            operationCancellation?.Cancel();
+            if (activeForegroundOperationTask is { } opTask)
+            {
+                try { await opTask; } catch { }
+            }
+
+            if (activeImportTask is { } importTask)
+            {
+                try { await importTask; } catch { }
+            }
+
+            // 2. Close saved links dialogs and await link checks
+            CloseActiveSavedLinksDialogs();
+            savedLinksChecksCancellation.Cancel();
+            var runningLinkChecks = activeSavedLinksChecks.Keys.ToArray();
+            if (runningLinkChecks.Length > 0)
+            {
+                try { await Task.WhenAll(runningLinkChecks); } catch { }
+            }
+
+            // 3. Stop access script alarm and cancel alarm tokens
+            accessScriptAlarm.Stop();
+            accessScriptAlarmCancellation.Cancel();
+            if (activeAccessScriptAlarmTask is { } alarmTask)
+            {
+                try { await alarmTask; } catch { }
+            }
+
+            // 4. Cancel and await ALL active access script operations across the entire application
+            accessScriptsMasterCancellation.Cancel();
+            var runningAccessScripts = activeAccessScriptTasks.Keys.ToArray();
+            if (runningAccessScripts.Length > 0)
+            {
+                try { await Task.WhenAll(runningAccessScripts); } catch { }
+            }
+
+            // 5. Await background access checks
+            var runningAccessChecks = backgroundAccessChecks.Values.ToArray();
+            if (runningAccessChecks.Length > 0)
+            {
+                try { await Task.WhenAll(runningAccessChecks); } catch { }
+            }
+
+            // Ensure latest in-memory model changes are enqueued for saving
+            SaveConfig();
+
+            while (true)
+            {
+                var targetVersion = configSaver.EnqueuedVersion;
+                await configSaver.FlushPendingSavesAsync();
+                if (configSaver.SavedVersion >= configSaver.EnqueuedVersion && !configSaver.HasPendingUnsavedChanges)
+                {
+                    break;
+                }
+            }
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    if (configSaver.HasPendingUnsavedChanges || configSaver.SavedVersion < configSaver.EnqueuedVersion)
+                    {
+                        _ = FlushConfigAndExitAsync();
+                        return;
+                    }
+
+                    if (pendingUpdateSession is not null)
+                    {
+                        if (!pendingUpdateSession.IsHelperAlive() || !pendingUpdateSession.Commit())
+                        {
+                            pendingUpdateSession.Disarm();
+                            pendingUpdateSession = null;
+                            IsEnabled = true;
+                            ThemedMessageDialog.Show(this,
+                                "Не удалось инициировать процедуру обновления: процесс помощника завершился или не удалось записать сигнал подтверждения.\n\nОбновление отменено во избежание сбоя. Приложение продолжит работу.",
+                                "Ошибка обновления",
+                                MessageBoxButton.OK,
+                                MessageBoxImage.Warning);
+                            ResetPendingExitState();
+                            forceExit = false;
+                            return;
+                        }
+                    }
+
+                    configExitCompleted = true;
+                    Cleanup();
+                    Close();
+                }
+                catch (Exception ex)
+                {
+                    RouteLog($"[ConfigExit] Deferred close error: {ex.Message}");
+                    ResetPendingExitState();
+                }
+            }), DispatcherPriority.Normal);
+        }
+        catch (Exception ex)
+        {
+            RouteLog($"[ConfigExit] Ошибка сохранения конфигурации при выходе: {ex.Message}");
+            IsEnabled = true;
+            ThemedMessageDialog.Show(this,
+                $"Не удалось сохранить конфигурацию при выходе:\n\n{ex.Message}\n\nВыход прерван во избежание потери данных.",
+                "Ошибка сохранения",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            pendingUpdateSession?.Disarm();
+            pendingUpdateSession = null;
+            forceExit = false;
+            ResetPendingExitState();
+        }
+    }
+
     private async Task StopBatchAndExitAsync()
     {
         bool closed;
@@ -5760,10 +6272,36 @@ public partial class MainWindow : Window
     }
     private void ResetPendingExitState()
     {
+        IsEnabled = true;
+        if (accessScriptsMasterCancellation.IsCancellationRequested)
+        {
+            try { accessScriptsMasterCancellation.Dispose(); } catch { }
+            accessScriptsMasterCancellation = new CancellationTokenSource();
+        }
+        if (savedLinksChecksCancellation.IsCancellationRequested)
+        {
+            try { savedLinksChecksCancellation.Dispose(); } catch { }
+            savedLinksChecksCancellation = new CancellationTokenSource();
+        }
+        if (accessScriptAlarmCancellation.IsCancellationRequested)
+        {
+            try { accessScriptAlarmCancellation.Dispose(); } catch { }
+            accessScriptAlarmCancellation = new CancellationTokenSource();
+        }
+        if (!accessScriptAlarm.IsEnabled) accessScriptAlarm.Start();
+        if (!pamTotpTimer.IsEnabled) pamTotpTimer.Start();
+        if (updateSchedulerCancellation is not null && updateSchedulerCancellation.IsCancellationRequested)
+        {
+            try { updateSchedulerCancellation.Dispose(); } catch { }
+            updateSchedulerCancellation = new CancellationTokenSource();
+            _ = RunUpdateSchedulerAsync(updateSchedulerCancellation.Token);
+        }
         webExitPending = false;
         webExitCompleted = false;
         sessionExitPending = false;
         sessionExitCompleted = false;
+        configExitPending = false;
+        configExitCompleted = false;
         tunnelsExitConfirmed = false;
         if (webCts.IsCancellationRequested)
         {
@@ -5799,10 +6337,11 @@ public partial class MainWindow : Window
         accessScriptAlarm.Stop();
         accessScriptAlarmCancellation.Cancel();
         accessScriptAlarmCancellation.Dispose();
+        try { accessScriptsMasterCancellation.Cancel(); } catch { }
+        try { accessScriptsMasterCancellation.Dispose(); } catch { }
         jumphostProcesses.Clear();
         jumphostStartupGates.Clear();
         accessScriptGates.Clear();
-        try { SaveConfig(); } catch { }
         StopFirefoxContainers();
         CloseActiveSavedLinksDialogs();
         try { activeTunnelsWindow?.ForceClose(); } catch { }
@@ -5810,7 +6349,6 @@ public partial class MainWindow : Window
         foreach (var route in activeRoutes) route.Dispose();
         if (trayIcon is not null) { trayIcon.Visible = false; trayIcon.Dispose(); }
         KittyWindowInput.CleanupStaleLogs();
-        pendingUpdateSession?.Commit();
         try { webCts.Dispose(); } catch { }
         try { sessionCts.Dispose(); } catch { }
         try { firefoxStartupLock.Dispose(); } catch { }
@@ -5824,6 +6362,8 @@ public partial class MainWindow : Window
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(
             externalCancellationToken);
         operationCancellation = cancellation;
+        var tcs = new TaskCompletionSource();
+        activeForegroundOperationTask = tcs.Task;
         HeaderPanel.IsEnabled = false;
         WorkspacePanel.IsEnabled = false;
         UpdateCancelOperationButtonVisibility();
@@ -5837,6 +6377,8 @@ public partial class MainWindow : Window
         catch (Exception ex) { Error(ex); }
         finally
         {
+            activeForegroundOperationTask = null;
+            tcs.TrySetResult();
             if (ReferenceEquals(operationCancellation, cancellation)) operationCancellation = null;
             HeaderPanel.IsEnabled = true;
             WorkspacePanel.IsEnabled = true;
@@ -5987,11 +6529,28 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveAndRefresh() { SaveConfig(); var group = selectedGroup; RefreshAll(); selectedGroup = group; RefreshSessions(); }
+    private void SaveAndRefresh() { SaveConfig(); var group = selectedGroup; RefreshAll(); selectedGroup = group; }
     private void SaveConfig()
     {
-        if (configAvailable) ConfigStore.Save(configPath, config);
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(SaveConfig);
+            return;
+        }
+        if (configAvailable)
+        {
+            if (isImportWizardActive)
+            {
+                importWizardMissedSave = true;
+                return;
+            }
+            configSaver.Save(config);
+        }
     }
+
+    private void WaitForPendingSave() => configSaver.WaitForPendingSave();
+
+    private Task FlushPendingSavesAsync() => configSaver.FlushPendingSavesAsync();
     private SessionRow? SelectedRow() => SessionsGrid.SelectedItem as SessionRow;
     private string? Prompt(string title, string text, string initial = "") { var dialog = new PromptDialog(title, text, initial) { Owner = this }; return dialog.ShowDialog() == true ? dialog.Value : null; }
     private IReadOnlyList<object> ChooseMany(string title, string prompt, IEnumerable<object> values) { var list = values.ToList(); if (list.Count == 0) { Warn("Нет доступных вариантов."); return []; } var dialog = new SearchChoiceDialog(title, prompt, list) { Owner = this }; return dialog.ShowDialog() == true ? dialog.Selections : []; }

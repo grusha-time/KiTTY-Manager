@@ -109,11 +109,12 @@ public static class LinkMapLayout
             maxX = Math.Max(maxX, cursorX);
         }
 
+        var groupPaths = config.BuildServerGroupPathMap();
         var nodes = included.Select(id =>
             {
                 var server = servers[id];
                 var point = placed[id];
-                return new LinkMapNode(id, server.Name, GroupPath(config, id),
+                return new LinkMapNode(id, server.Name, groupPaths.GetValueOrDefault(id, "Без группы"),
                     point.X, point.Y, adjacency[id].Count);
             })
             .OrderBy(node => node.Name, StringComparer.CurrentCultureIgnoreCase)
@@ -347,15 +348,8 @@ public static class LinkMapLayout
     private static (Guid A, Guid B) OrderedPair(Guid left, Guid right) =>
         left.CompareTo(right) <= 0 ? (left, right) : (right, left);
 
-    private static string GroupPath(ManagerConfig config, Guid serverId)
-    {
-        foreach (var group in config.Groups)
-        {
-            var path = GroupPath(group, serverId, group.Name);
-            if (path is not null) return path;
-        }
-        return "Без группы";
-    }
+    private static string GroupPath(ManagerConfig config, Guid serverId) =>
+        config.BuildServerGroupPathMap().GetValueOrDefault(serverId, "Без группы");
 
     private static string? GroupPath(ServerGroup group, Guid serverId, string path)
     {

@@ -444,6 +444,9 @@ internal sealed partial class SelfTestRunner
 
         var textBoxType = presentationFramework.GetType("System.Windows.Controls.TextBox")!;
         var dataGridType = presentationFramework.GetType("System.Windows.Controls.DataGrid")!;
+        var treeViewType = presentationFramework.GetType("System.Windows.Controls.TreeView");
+        var textBlockType = presentationFramework.GetType("System.Windows.Controls.TextBlock");
+        var btnType = presentationFramework.GetType("System.Windows.Controls.Button");
 
         var window = System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(windowType);
 
@@ -455,6 +458,68 @@ internal sealed partial class SelfTestRunner
         windowType.GetField("SearchBox", flags)?.SetValue(window, searchBox);
         windowType.GetField("GroupSearchBox", flags)?.SetValue(window, groupSearchBox);
         windowType.GetField("SessionsGrid", flags)?.SetValue(window, sessionsGrid);
+
+        object? groupTree = null;
+        if (treeViewType is not null)
+        {
+            try
+            {
+                groupTree = Activator.CreateInstance(treeViewType);
+                windowType.GetField("GroupTree", flags)?.SetValue(window, groupTree);
+            }
+            catch { }
+        }
+
+        if (textBlockType is not null)
+        {
+            try
+            {
+                windowType.GetField("SessionCountText", flags)?.SetValue(window, Activator.CreateInstance(textBlockType));
+                windowType.GetField("GroupFilterText", flags)?.SetValue(window, Activator.CreateInstance(textBlockType));
+            }
+            catch { }
+        }
+
+        if (btnType is not null)
+        {
+            try
+            {
+                windowType.GetField("ClearGroupFilterButton", flags)?.SetValue(window, Activator.CreateInstance(btnType));
+            }
+            catch { }
+        }
+
+        // Initialize dummy config and cached collections to defend against uninitialized state
+        windowType.GetField("config", flags)?.SetValue(window, new ManagerConfig());
+        var cachedRowsField = windowType.GetField("cachedAllSessionRows", flags);
+        if (cachedRowsField is not null)
+        {
+            try
+            {
+                var list = Activator.CreateInstance(cachedRowsField.FieldType);
+                cachedRowsField.SetValue(window, list);
+            }
+            catch { }
+        }
+        windowType.GetField("cachedSearchableTexts", flags)?.SetValue(window, new Dictionary<Guid, string>());
+        windowType.GetField("cachedGroupNestedServers", flags)?.SetValue(window, new Dictionary<Guid, HashSet<Guid>>());
+        windowType.GetField("cachedGroupPaths", flags)?.SetValue(window, new Dictionary<Guid, string>());
+
+        var winBase = AppDomain.CurrentDomain.GetAssemblies().FirstOrDefault(a => a.GetName().Name == "WindowsBase")
+            ?? System.Reflection.Assembly.Load("WindowsBase");
+        var dispatcherTimerType = presentationFramework.GetType("System.Windows.Threading.DispatcherTimer")
+            ?? winBase?.GetType("System.Windows.Threading.DispatcherTimer");
+        if (dispatcherTimerType is not null)
+        {
+            try
+            {
+                var sTimer = Activator.CreateInstance(dispatcherTimerType);
+                var gTimer = Activator.CreateInstance(dispatcherTimerType);
+                windowType.GetField("searchDebounceTimer", flags)?.SetValue(window, sTimer);
+                windowType.GetField("groupSearchDebounceTimer", flags)?.SetValue(window, gTimer);
+            }
+            catch { }
+        }
 
         // 1. Verify FindSession_Executed
         var findMethod = windowType.GetMethod("FindSession_Executed", flags)
@@ -499,6 +564,8 @@ internal sealed partial class SelfTestRunner
                     var addMethod = children?.GetType().GetMethod("Add", new[] { presentationCore.GetType("System.Windows.UIElement")! });
                     addMethod?.Invoke(children, new[] { groupSearchBox });
                     addMethod?.Invoke(children, new[] { searchBox });
+                    if (groupTree is not null) addMethod?.Invoke(children, new[] { groupTree });
+                    addMethod?.Invoke(children, new[] { sessionsGrid });
                     rootProp.SetValue(source, rootPanel);
                 }
             }

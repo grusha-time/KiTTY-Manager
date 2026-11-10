@@ -94,4 +94,105 @@ public static class ConfigIndex
         }
         return null;
     }
+
+    /// <summary>
+    /// Builds a dictionary mapping each group ID to its formatted path (e.g. "Root / Subgroup") in a single tree walk.
+    /// </summary>
+    public static Dictionary<Guid, string> BuildGroupPathMap(this ManagerConfig config)
+    {
+        var map = new Dictionary<Guid, string>();
+        foreach (var group in config.Groups)
+        {
+            WalkGroup(group, group.Name, map);
+        }
+        return map;
+
+        static void WalkGroup(ServerGroup group, string currentPath, Dictionary<Guid, string> map)
+        {
+            map[group.Id] = currentPath;
+            foreach (var child in group.Groups)
+            {
+                WalkGroup(child, $"{currentPath} / {child.Name}", map);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds both group path map and server-to-group-path map in a single tree pass.
+    /// Ungrouped servers are mapped to "Без группы".
+    /// </summary>
+    public static (Dictionary<Guid, string> GroupPaths, Dictionary<Guid, string> ServerGroupPaths) BuildGroupAndServerPathMaps(this ManagerConfig config)
+    {
+        var groupPaths = new Dictionary<Guid, string>();
+        var serverGroupPaths = new Dictionary<Guid, string>();
+        foreach (var group in config.Groups)
+        {
+            WalkGroup(group, group.Name, groupPaths, serverGroupPaths);
+        }
+        foreach (var server in config.UngroupedServers)
+        {
+            serverGroupPaths[server.Id] = "Без группы";
+        }
+        return (groupPaths, serverGroupPaths);
+
+        static void WalkGroup(
+            ServerGroup group,
+            string currentPath,
+            Dictionary<Guid, string> groupPaths,
+            Dictionary<Guid, string> serverGroupPaths)
+        {
+            groupPaths[group.Id] = currentPath;
+            foreach (var server in group.Servers)
+            {
+                serverGroupPaths[server.Id] = currentPath;
+            }
+            foreach (var child in group.Groups)
+            {
+                WalkGroup(child, $"{currentPath} / {child.Name}", groupPaths, serverGroupPaths);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds a dictionary mapping server ID to its group path in a single tree pass.
+    /// Ungrouped servers map to "Без группы".
+    /// </summary>
+    public static Dictionary<Guid, string> BuildServerGroupPathMap(this ManagerConfig config) =>
+        config.BuildGroupAndServerPathMaps().ServerGroupPaths;
+
+    /// <summary>
+    /// Builds a fast server-to-group mapping in a single tree walk.
+    /// Ungrouped servers map to null.
+    /// </summary>
+    public static Dictionary<Guid, ServerGroup?> BuildServerToGroupMap(this ManagerConfig config)
+    {
+        var map = new Dictionary<Guid, ServerGroup?>();
+        foreach (var server in config.UngroupedServers)
+        {
+            map[server.Id] = null;
+        }
+        foreach (var group in config.Groups)
+        {
+            Walk(group, map);
+        }
+        return map;
+
+        static void Walk(ServerGroup group, Dictionary<Guid, ServerGroup?> map)
+        {
+            foreach (var server in group.Servers)
+            {
+                map[server.Id] = group;
+            }
+            foreach (var child in group.Groups)
+            {
+                Walk(child, map);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds an indexed dictionary mapping server ID to ManagedServer for fast O(1) lookups.
+    /// </summary>
+    public static Dictionary<Guid, ManagedServer> BuildServerLookup(this ManagerConfig config) =>
+        config.AllServers().ToDictionary(s => s.Id);
 }
