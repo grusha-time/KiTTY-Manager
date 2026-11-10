@@ -16,6 +16,7 @@ using KeyEventArgs = System.Windows.Input.KeyEventArgs;
 using MouseEventArgs = System.Windows.Input.MouseEventArgs;
 using Panel = System.Windows.Controls.Panel;
 using Point = System.Windows.Point;
+using Pen = System.Windows.Media.Pen;
 
 namespace KiTTYManager.App;
 
@@ -27,9 +28,114 @@ public partial class LinkMapWindow : Window
     private readonly ManagerConfig config;
     private readonly Action<Guid> selectServer;
     private readonly Func<IReadOnlyList<Guid>, Task> checkLinks;
+    private static readonly SolidColorBrush AvailableBrush = CreateFrozenBrush("#4F8CFF", 0.78);
+    private static readonly SolidColorBrush AvailableDimBrush = CreateFrozenBrush("#4F8CFF", 0.14);
+    private static readonly SolidColorBrush UnavailableBrush = CreateFrozenBrush("#D68A2E", 0.65);
+    private static readonly SolidColorBrush UnavailableDimBrush = CreateFrozenBrush("#D68A2E", 0.14);
+
+    private static readonly Pen AvailablePen = CreateFrozenPen(AvailableBrush, 2.4);
+    private static readonly Pen AvailableDimPen = CreateFrozenPen(AvailableDimBrush, 2.4);
+    private static readonly Pen UnavailablePen = CreateFrozenPen(UnavailableBrush, 1.8, [5, 4]);
+    private static readonly Pen UnavailableDimPen = CreateFrozenPen(UnavailableDimBrush, 1.8, [5, 4]);
+
+    private static readonly SolidColorBrush ArrowBrush = CreateFrozenBrush("#4F8CFF", 0.88);
+    private static readonly SolidColorBrush ArrowDimBrush = CreateFrozenBrush("#4F8CFF", 0.14);
+
+    private static readonly SolidColorBrush GoldHighlightBrush = CreateFrozenBrush(Color.FromRgb(255, 205, 67));
+    private static readonly Pen GoldHighlightPen = CreateFrozenPen(GoldHighlightBrush, 4.2);
+
+    private static readonly SolidColorBrush NodeDefaultBgBrush = CreateFrozenBrush(Color.FromRgb(31, 42, 59));
+    private static readonly SolidColorBrush NodeCurrentBgBrush = CreateFrozenBrush(Color.FromRgb(38, 57, 92));
+    private static readonly SolidColorBrush NodeCheckedBgBrush = CreateFrozenBrush(Color.FromRgb(45, 83, 61));
+
+    private static readonly SolidColorBrush NodeDefaultBorderBrush = CreateFrozenBrush(Color.FromRgb(66, 91, 128));
+    private static readonly SolidColorBrush NodeCurrentBorderBrush = CreateFrozenBrush(Color.FromRgb(79, 140, 255));
+    private static readonly SolidColorBrush NodeCheckedBorderBrush = CreateFrozenBrush(Color.FromRgb(63, 190, 116));
+    private static readonly SolidColorBrush NodeLinkedBorderBrush = CreateFrozenBrush(Color.FromRgb(255, 205, 67));
+
+    private static readonly SolidColorBrush NodeGroupTextBrush = CreateFrozenBrush(Color.FromRgb(170, 180, 196));
+
+    private static SolidColorBrush CreateFrozenBrush(string hex, double opacity = 1.0)
+    {
+        var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex)) { Opacity = opacity };
+        brush.Freeze();
+        return brush;
+    }
+
+    private static SolidColorBrush CreateFrozenBrush(Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
+    }
+
+    private static Pen CreateFrozenPen(Brush brush, double thickness, DoubleCollection? dashes = null)
+    {
+        var pen = new Pen(brush, thickness);
+        if (dashes is not null)
+        {
+            var dashStyle = new DashStyle(dashes, 0);
+            dashStyle.Freeze();
+            pen.DashStyle = dashStyle;
+        }
+        pen.Freeze();
+        return pen;
+    }
+
+    internal sealed class EdgeVisualHost : FrameworkElement
+    {
+        private readonly VisualCollection children;
+        public DrawingVisual BaseVisual { get; } = new();
+        public DrawingVisual HighlightVisual { get; } = new();
+        private readonly List<(Geometry HitArea, bool IsFill, string Tooltip)> hitAreas = [];
+        internal static readonly Pen HitTestPen;
+
+        static EdgeVisualHost()
+        {
+            HitTestPen = new Pen(Brushes.Black, 8.0);
+            HitTestPen.Freeze();
+        }
+
+        public EdgeVisualHost()
+        {
+            children = new VisualCollection(this) { BaseVisual, HighlightVisual };
+            IsHitTestVisible = true;
+        }
+
+        protected override int VisualChildrenCount => children.Count;
+        protected override Visual GetVisualChild(int index) => children[index];
+
+        public void SetHitAreas(IEnumerable<(Geometry HitArea, bool IsFill, string Tooltip)> areas)
+        {
+            hitAreas.Clear();
+            hitAreas.AddRange(areas);
+        }
+
+        internal static bool HitTest(Geometry geom, bool isFill, Point pt, Pen? pen = null) =>
+            isFill ? geom.FillContains(pt) : geom.StrokeContains(pen ?? HitTestPen, pt);
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            var pt = e.GetPosition(this);
+            for (var i = hitAreas.Count - 1; i >= 0; i--)
+            {
+                var (geom, isFill, tip) = hitAreas[i];
+                if (HitTest(geom, isFill, pt))
+                {
+                    ToolTip = tip;
+                    return;
+                }
+            }
+            ToolTip = null;
+        }
+    }
+
+    internal static bool HitTestEdge(Geometry geom, bool isFill, Point pt, Pen? pen = null) =>
+        EdgeVisualHost.HitTest(geom, isFill, pt, pen);
+
+    private EdgeVisualHost? edgeHost;
     private readonly Dictionary<Guid, Button> nodeButtons = [];
-    private readonly List<(LinkMapEdge Edge, Line Line, Polygon? Arrow)> edgeVisuals = [];
-    private readonly List<UIElement> highlightedVisuals = [];
     private readonly HashSet<Guid> checkedServerIds = [];
     private readonly HashSet<Guid> highlightedNeighborIds = [];
     private bool checkMode;
@@ -64,8 +170,6 @@ public partial class LinkMapWindow : Window
     {
         GraphCanvas.Children.Clear();
         nodeButtons.Clear();
-        edgeVisuals.Clear();
-        highlightedVisuals.Clear();
         highlightedNeighborIds.Clear();
         selectedNode = null;
         SummaryText.Text = map.Nodes.Count == 0
@@ -74,40 +178,15 @@ public partial class LinkMapWindow : Window
         EmptyPanel.Visibility = map.Nodes.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         GraphCanvas.Width = map.Width;
         GraphCanvas.Height = map.Height;
-        var nodes = map.Nodes.ToDictionary(node => node.ServerId);
 
-        foreach (var edge in map.Edges)
+        edgeHost = new EdgeVisualHost
         {
-            var from = nodes[edge.ServerAId];
-            var to = nodes[edge.ServerBId];
-            var tooltip = EdgeTooltip(edge, from.Name, to.Name);
-            var x1 = from.X + NodeWidth / 2;
-            var y1 = from.Y + NodeHeight / 2;
-            var x2 = to.X + NodeWidth / 2;
-            var y2 = to.Y + NodeHeight / 2;
-            var line = new Line
-            {
-                X1 = x1,
-                Y1 = y1,
-                X2 = x2,
-                Y2 = y2,
-                Stroke = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
-                    edge.IsAvailable ? "#4F8CFF" : "#D68A2E")),
-                StrokeThickness = edge.IsAvailable ? 2.4 : 1.8,
-                Opacity = edge.IsAvailable ? 0.78 : 0.65,
-                ToolTip = tooltip
-            };
-            if (!edge.IsAvailable) line.StrokeDashArray = [5, 4];
-            GraphCanvas.Children.Add(line);
-
-            var arrow = CreateDirectedArrow(edge, x1, y1, x2, y2, tooltip);
-            if (arrow is not null)
-            {
-                Panel.SetZIndex(arrow, 1);
-                GraphCanvas.Children.Add(arrow);
-            }
-            edgeVisuals.Add((edge, line, arrow));
-        }
+            Width = map.Width,
+            Height = map.Height
+        };
+        Panel.SetZIndex(edgeHost, 0);
+        GraphCanvas.Children.Add(edgeHost);
+        RenderEdges(null);
 
         foreach (var node in map.Nodes)
         {
@@ -122,7 +201,7 @@ public partial class LinkMapWindow : Window
             {
                 Text = node.GroupPath,
                 FontSize = 11,
-                Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 196)),
+                Foreground = NodeGroupTextBrush,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 Margin = new Thickness(0, 3, 0, 0)
             };
@@ -138,8 +217,8 @@ public partial class LinkMapWindow : Window
                 Content = content,
                 Tag = node.ServerId,
                 ToolTip = $"{node.Name}\n{node.GroupPath}\nСвязей: {node.LinkCount}",
-                Background = new SolidColorBrush(Color.FromRgb(31, 42, 59)),
-                BorderBrush = new SolidColorBrush(Color.FromRgb(66, 91, 128)),
+                Background = NodeDefaultBgBrush,
+                BorderBrush = NodeDefaultBorderBrush,
                 BorderThickness = new Thickness(1.4)
             };
             button.Click += Node_Click;
@@ -150,6 +229,155 @@ public partial class LinkMapWindow : Window
             GraphCanvas.Children.Add(button);
         }
         ApplyTransform();
+    }
+
+    private static PathGeometry CreateArrowGeometry(
+        LinkMapEdge edge,
+        double x1, double y1, double x2, double y2,
+        Point? curveMidpoint = null,
+        bool isHighlight = false)
+    {
+        var dx = edge.AtoBAvailable ? (x2 - x1) : (x1 - x2);
+        var dy = edge.AtoBAvailable ? (y2 - y1) : (y1 - y2);
+        var len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1.0)
+        {
+            var empty = new PathGeometry();
+            empty.Freeze();
+            return empty;
+        }
+        var ux = dx / len;
+        var uy = dy / len;
+        var nx = -uy;
+        var ny = ux;
+        var mx = curveMidpoint?.X ?? ((x1 + x2) / 2);
+        var my = curveMidpoint?.Y ?? ((y1 + y2) / 2);
+
+        var tipOffset = isHighlight ? 9.5 : 8.0;
+        var baseOffset = isHighlight ? 8.5 : 7.0;
+        var baseWidth = isHighlight ? 6.5 : 5.5;
+
+        var figure = new PathFigure
+        {
+            StartPoint = new Point(mx + ux * tipOffset, my + uy * tipOffset),
+            IsClosed = true,
+            IsFilled = true
+        };
+        figure.Segments.Add(new LineSegment(new Point(mx - ux * baseOffset + nx * baseWidth, my - uy * baseOffset + ny * baseWidth), true));
+        figure.Segments.Add(new LineSegment(new Point(mx - ux * baseOffset - nx * baseWidth, my - uy * baseOffset - ny * baseWidth), true));
+        var geom = new PathGeometry([figure]);
+        geom.Freeze();
+        return geom;
+    }
+
+    private void RenderEdges(Guid? selectedServerId)
+    {
+        if (edgeHost is null) return;
+        var nodes = map.Nodes.ToDictionary(node => node.ServerId);
+        var hitAreas = new List<(Geometry HitArea, bool IsFill, string Tooltip)>();
+
+        using (var dc = edgeHost.BaseVisual.RenderOpen())
+        {
+            foreach (var edge in map.Edges)
+            {
+                if (!nodes.TryGetValue(edge.ServerAId, out var from) ||
+                    !nodes.TryGetValue(edge.ServerBId, out var to))
+                    continue;
+
+                var tooltip = EdgeTooltip(edge, from.Name, to.Name);
+                var x1 = from.X + NodeWidth / 2;
+                var y1 = from.Y + NodeHeight / 2;
+                var x2 = to.X + NodeWidth / 2;
+                var y2 = to.Y + NodeHeight / 2;
+
+                var isIncident = selectedServerId is not null &&
+                    (edge.ServerAId == selectedServerId || edge.ServerBId == selectedServerId);
+
+                var pen = selectedServerId is null
+                    ? (edge.IsAvailable ? AvailablePen : UnavailablePen)
+                    : (edge.IsAvailable ? AvailableDimPen : UnavailableDimPen);
+
+                var p1 = new Point(x1, y1);
+                var p2 = new Point(x2, y2);
+                dc.DrawLine(pen, p1, p2);
+
+                var lineGeom = new LineGeometry(p1, p2);
+                lineGeom.Freeze();
+                hitAreas.Add((lineGeom, false, tooltip));
+
+                if (edge.IsDirected)
+                {
+                    if (selectedServerId is null || !isIncident)
+                    {
+                        var arrowBrush = selectedServerId is null ? ArrowBrush : ArrowDimBrush;
+                        var arrowGeom = CreateArrowGeometry(edge, x1, y1, x2, y2, isHighlight: false);
+                        dc.DrawGeometry(arrowBrush, null, arrowGeom);
+                        hitAreas.Add((arrowGeom, true, tooltip));
+                    }
+                }
+            }
+        }
+
+        using (var dc = edgeHost.HighlightVisual.RenderOpen())
+        {
+            if (selectedServerId is not null)
+            {
+                var incident = map.Edges
+                    .Where(edge => edge.ServerAId == selectedServerId || edge.ServerBId == selectedServerId)
+                    .OrderBy(edge => edge.ServerAId == selectedServerId ? edge.ServerBId : edge.ServerAId)
+                    .ToArray();
+                var offsets = LinkMapLayout.HighlightOffsets(incident.Length);
+                for (var index = 0; index < incident.Length; index++)
+                {
+                    var edge = incident[index];
+                    var neighborId = edge.ServerAId == selectedServerId ? edge.ServerBId : edge.ServerAId;
+                    if (!nodes.TryGetValue(selectedServerId.Value, out var from) ||
+                        !nodes.TryGetValue(neighborId, out var to))
+                        continue;
+
+                    var start = new Point(from.X + NodeWidth / 2, from.Y + NodeHeight / 2);
+                    var end = new Point(to.X + NodeWidth / 2, to.Y + NodeHeight / 2);
+                    var dx = end.X - start.X;
+                    var dy = end.Y - start.Y;
+                    var length = Math.Max(1, Math.Sqrt(dx * dx + dy * dy));
+                    var offset = offsets[index];
+                    var control = new Point(
+                        (start.X + end.X) / 2 - dy / length * offset,
+                        (start.Y + end.Y) / 2 + dx / length * offset);
+
+                    var figure = new PathFigure { StartPoint = start, IsClosed = false, IsFilled = false };
+                    figure.Segments.Add(new QuadraticBezierSegment(control, end, true));
+                    var geom = new PathGeometry([figure]);
+                    geom.Freeze();
+
+                    var nodeA = nodes[edge.ServerAId];
+                    var nodeB = nodes[edge.ServerBId];
+                    var tooltip = EdgeTooltip(edge, nodeA.Name, nodeB.Name);
+
+                    dc.DrawGeometry(null, GoldHighlightPen, geom);
+                    hitAreas.Add((geom, false, tooltip));
+
+                    if (edge.IsDirected)
+                    {
+                        var curveMidpoint = new Point(
+                            0.25 * start.X + 0.5 * control.X + 0.25 * end.X,
+                            0.25 * start.Y + 0.5 * control.Y + 0.25 * end.Y);
+
+                        var ax = nodeA.X + NodeWidth / 2;
+                        var ay = nodeA.Y + NodeHeight / 2;
+                        var bx = nodeB.X + NodeWidth / 2;
+                        var by = nodeB.Y + NodeHeight / 2;
+
+                        var goldArrowGeom = CreateArrowGeometry(
+                            edge, ax, ay, bx, by, curveMidpoint: curveMidpoint, isHighlight: true);
+                        dc.DrawGeometry(GoldHighlightBrush, null, goldArrowGeom);
+                        hitAreas.Add((goldArrowGeom, true, tooltip));
+                    }
+                }
+            }
+        }
+
+        edgeHost.SetHitAreas(hitAreas);
     }
 
     internal static string EdgeTooltip(LinkMapEdge edge, string? nameA = null, string? nameB = null) =>
@@ -327,113 +555,32 @@ public partial class LinkMapWindow : Window
         var isChecked = checkMode && checkedServerIds.Contains(serverId);
         var isCurrent = !checkMode && ReferenceEquals(button, selectedNode);
         var isLinked = !checkMode && highlightedNeighborIds.Contains(serverId);
-        button.Background = new SolidColorBrush(isChecked
-            ? Color.FromRgb(45, 83, 61)
-            : isCurrent ? Color.FromRgb(38, 57, 92) : Color.FromRgb(31, 42, 59));
-        button.BorderBrush = new SolidColorBrush(isChecked
-            ? Color.FromRgb(63, 190, 116)
-            : isCurrent ? Color.FromRgb(79, 140, 255)
-            : isLinked ? Color.FromRgb(255, 205, 67) : Color.FromRgb(66, 91, 128));
+        button.Background = isChecked
+            ? NodeCheckedBgBrush
+            : isCurrent ? NodeCurrentBgBrush : NodeDefaultBgBrush;
+        button.BorderBrush = isChecked
+            ? NodeCheckedBorderBrush
+            : isCurrent ? NodeCurrentBorderBrush
+            : isLinked ? NodeLinkedBorderBrush : NodeDefaultBorderBrush;
         button.BorderThickness = new Thickness(isChecked || isLinked ? 2.2 : 1.4);
     }
 
     private void UpdateEdgeAppearance(Guid? selectedServerId)
     {
-        foreach (var visual in highlightedVisuals)
-            GraphCanvas.Children.Remove(visual);
-        highlightedVisuals.Clear();
         highlightedNeighborIds.Clear();
-
-        foreach (var (edge, line, arrow) in edgeVisuals)
-        {
-            var isIncident = selectedServerId is not null &&
-                (edge.ServerAId == selectedServerId || edge.ServerBId == selectedServerId);
-
-            line.Stroke = new SolidColorBrush((Color)ColorConverter.ConvertFromString(
-                edge.IsAvailable ? "#4F8CFF" : "#D68A2E"));
-            line.StrokeThickness = edge.IsAvailable ? 2.4 : 1.8;
-            line.Opacity = selectedServerId is null ? (edge.IsAvailable ? 0.78 : 0.65) : 0.14;
-            Panel.SetZIndex(line, 0);
-
-            if (arrow is not null)
-            {
-                arrow.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#4F8CFF"));
-                // When an incident edge is highlighted with a gold curve, hide the chord arrow
-                // so it does not float in empty space away from the gold curve.
-                arrow.Opacity = selectedServerId is null ? 0.88 : (isIncident ? 0.0 : 0.14);
-                Panel.SetZIndex(arrow, 1);
-            }
-        }
-
         if (selectedServerId is not null)
         {
-            var nodes = map.Nodes.ToDictionary(node => node.ServerId);
-            var incident = map.Edges
-                .Where(edge => edge.ServerAId == selectedServerId || edge.ServerBId == selectedServerId)
-                .OrderBy(edge => edge.ServerAId == selectedServerId ? edge.ServerBId : edge.ServerAId)
-                .ToArray();
-            var offsets = LinkMapLayout.HighlightOffsets(incident.Length);
-            for (var index = 0; index < incident.Length; index++)
+            foreach (var edge in map.Edges)
             {
-                var edge = incident[index];
-                var neighborId = edge.ServerAId == selectedServerId ? edge.ServerBId : edge.ServerAId;
-                highlightedNeighborIds.Add(neighborId);
-                var from = nodes[selectedServerId.Value];
-                var to = nodes[neighborId];
-                var start = new Point(from.X + NodeWidth / 2, from.Y + NodeHeight / 2);
-                var end = new Point(to.X + NodeWidth / 2, to.Y + NodeHeight / 2);
-                var dx = end.X - start.X;
-                var dy = end.Y - start.Y;
-                var length = Math.Max(1, Math.Sqrt(dx * dx + dy * dy));
-                var offset = offsets[index];
-                var control = new Point(
-                    (start.X + end.X) / 2 - dy / length * offset,
-                    (start.Y + end.Y) / 2 + dx / length * offset);
-                var figure = new PathFigure { StartPoint = start, IsClosed = false };
-                figure.Segments.Add(new QuadraticBezierSegment(control, end, true));
-
-                var nodeA = nodes[edge.ServerAId];
-                var nodeB = nodes[edge.ServerBId];
-                var tooltip = EdgeTooltip(edge, nodeA.Name, nodeB.Name);
-
-                var path = new System.Windows.Shapes.Path
-                {
-                    Data = new PathGeometry([figure]),
-                    Stroke = new SolidColorBrush(Color.FromRgb(255, 205, 67)),
-                    StrokeThickness = 4.2,
-                    Opacity = 1,
-                    ToolTip = tooltip,
-                    IsHitTestVisible = true
-                };
-                Panel.SetZIndex(path, 1);
-                highlightedVisuals.Add(path);
-                GraphCanvas.Children.Add(path);
-
-                if (edge.IsDirected)
-                {
-                    var curveMidpoint = new Point(
-                        0.25 * start.X + 0.5 * control.X + 0.25 * end.X,
-                        0.25 * start.Y + 0.5 * control.Y + 0.25 * end.Y);
-
-                    var ax = nodeA.X + NodeWidth / 2;
-                    var ay = nodeA.Y + NodeHeight / 2;
-                    var bx = nodeB.X + NodeWidth / 2;
-                    var by = nodeB.Y + NodeHeight / 2;
-
-                    var goldArrow = CreateDirectedArrow(
-                        edge, ax, ay, bx, by, tooltip,
-                        curveMidpoint: curveMidpoint,
-                        fillColor: Color.FromRgb(255, 205, 67));
-
-                    if (goldArrow is not null)
-                    {
-                        Panel.SetZIndex(goldArrow, 2);
-                        highlightedVisuals.Add(goldArrow);
-                        GraphCanvas.Children.Add(goldArrow);
-                    }
-                }
+                if (edge.ServerAId == selectedServerId)
+                    highlightedNeighborIds.Add(edge.ServerBId);
+                else if (edge.ServerBId == selectedServerId)
+                    highlightedNeighborIds.Add(edge.ServerAId);
             }
         }
+
+        RenderEdges(selectedServerId);
+
         foreach (var (serverId, button) in nodeButtons)
             UpdateNodeAppearance(button, serverId);
     }

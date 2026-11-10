@@ -12,7 +12,7 @@ public static class ConfigStore
     internal static IConfigSecretProtector SecretProtector { get; set; } =
         new DpapiConfigSecretProtector();
 
-    private static readonly JsonSerializerOptions Options = new()
+    public static readonly JsonSerializerOptions Options = new()
     {
         WriteIndented = true,
         PropertyNameCaseInsensitive = true
@@ -53,16 +53,21 @@ public static class ConfigStore
 
     public static void Save(string path, ManagerConfig config)
     {
+        var snapshot = CloneForSave(config);
+        SaveSnapshot(path, snapshot);
+    }
+
+    public static void SaveSnapshot(string path, ManagerConfig snapshot)
+    {
         var fullPath = Path.GetFullPath(path);
         lock (SaveLocks.GetOrAdd(fullPath, _ => new object()))
         {
             Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-            // Clone and make paths portable so the config is relocatable.
-            var portable = CloneForSave(config);
-            foreach (var server in portable.AllServers()) NormalizePamDefaults(server);
-            MakePathsPortable(portable);
-            ConfigSecrets.Protect(portable, SecretProtector);
-            WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options), secureAclRequired: true);
+            // Snapshot is already cloned before passing here.
+            foreach (var server in snapshot.AllServers()) NormalizePamDefaults(server);
+            MakePathsPortable(snapshot);
+            ConfigSecrets.Protect(snapshot, SecretProtector);
+            WriteAtomically(fullPath, stream => JsonSerializer.Serialize(stream, snapshot, Options), secureAclRequired: true);
         }
     }
 
@@ -246,7 +251,7 @@ public static class ConfigStore
             var portable = CloneForSave(config);
             foreach (var server in portable.AllServers()) NormalizePamDefaults(server);
             MakePathsPortable(portable);
-            WriteAtomically(fullPath, JsonSerializer.Serialize(portable, Options), secureAclRequired: false);
+            WriteAtomically(fullPath, stream => JsonSerializer.Serialize(stream, portable, Options), secureAclRequired: false);
         }
     }
 
@@ -259,7 +264,7 @@ public static class ConfigStore
     internal static Action<FileInfo>? PreWriteAclHook { get; set; }
     internal static bool ForceWindowsAclForTesting { get; set; }
 
-    private static void WriteAtomically(string path, string content, bool secureAclRequired = true)
+    private static void WriteAtomically(string path, Action<Stream> writeAction, bool secureAclRequired = true)
     {
         var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
@@ -289,10 +294,8 @@ public static class ConfigStore
                 {
                     // Enforce and verify ACLs on the open temporary file before writing any secret content
                     EnsureFileSecurityEnforced(fileInfo);
-
-                    using var writer = new StreamWriter(stream, System.Text.Encoding.UTF8);
-                    writer.Write(content);
-                    writer.Flush();
+                    writeAction(stream);
+                    stream.Flush();
                 }
 
                 // All security operations completed before replacement; same-volume rename preserves file security
@@ -300,7 +303,11 @@ public static class ConfigStore
             }
             else
             {
-                File.WriteAllText(temp, content);
+                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+                {
+                    writeAction(stream);
+                    stream.Flush();
+                }
                 File.Move(temp, path, true);
             }
         }
@@ -315,6 +322,16 @@ public static class ConfigStore
             try { if (File.Exists(temp)) File.Delete(temp); } catch { }
         }
     }
+
+    private static readonly System.Text.Encoding Utf8NoBom = new System.Text.UTF8Encoding(false);
+
+    private static void WriteAtomically(string path, string content, bool secureAclRequired = true) =>
+        WriteAtomically(path, stream =>
+        {
+            using var writer = new StreamWriter(stream, Utf8NoBom, leaveOpen: true);
+            writer.Write(content);
+            writer.Flush();
+        }, secureAclRequired);
 
     private static void EnsureFileSecurityEnforced(FileInfo fileInfo)
     {
@@ -491,11 +508,7 @@ public static class ConfigStore
         return null;
     }
 
-    private static ManagerConfig CloneForSave(ManagerConfig config)
-    {
-        var json = JsonSerializer.Serialize(config, Options);
-        return JsonSerializer.Deserialize<ManagerConfig>(json, Options)!;
-    }
+    public static ManagerConfig CloneForSave(ManagerConfig config) => config.CloneForSave();
 
     public static void Normalize(ManagerConfig config)
     {

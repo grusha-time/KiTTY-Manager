@@ -11,6 +11,11 @@ public static class SessionKeyboardPolicy
         return (key is "Escape" or "Esc") && !hasModifiers;
     }
 
+    public static bool ShouldFlushSearchDebounceOnKeyDown(string key, bool hasModifiers)
+    {
+        return (key is "Return" or "Enter" or "Down" or "Up") && !hasModifiers;
+    }
+
     public static SearchKeyDownResult EvaluateSearchKeyDown(string key, bool hasModifiers, int itemCount)
     {
         if (key == "Down" && !hasModifiers)

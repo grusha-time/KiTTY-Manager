@@ -159,6 +159,10 @@
           </Grid>
           <DataGrid x:Name="SessionsGrid" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
                     ClipboardCopyMode="ExcludeHeader"
+                    VirtualizingStackPanel.IsVirtualizing="True"
+                    VirtualizingStackPanel.VirtualizationMode="Recycling"
+                    ScrollViewer.CanContentScroll="True"
+                    EnableRowVirtualization="True"
                     MouseDoubleClick="SessionsGrid_MouseDoubleClick" PreviewMouseMove="SessionsGrid_PreviewMouseMove"
                     PreviewMouseLeftButtonDown="SessionsGrid_PreviewMouseLeftButtonDown"
                     PreviewMouseRightButtonDown="SessionsGrid_PreviewMouseRightButtonDown"

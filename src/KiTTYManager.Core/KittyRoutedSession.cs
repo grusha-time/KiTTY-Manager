@@ -151,14 +151,24 @@ public sealed class KittyRoutedSession : IDisposable
         try { File.Delete(Path); } catch { }
     }
 
-    public static void CleanupStaleFiles(string? legacySessionsDirectory = null)
+    public static void CleanupStaleFiles(string? legacySessionsDirectory = null, DateTime? cutoffUtc = null, string? routedSessionsDirectory = null)
     {
-        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "KiTTYManager", "RoutedSessions");
+        var directory = routedSessionsDirectory ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "KiTTYManager", "RoutedSessions");
         if (Directory.Exists(directory))
             foreach (var path in Directory.EnumerateFiles(directory, "KiTTYManager-route-*"))
-                try { File.Delete(path); } catch { }
+                try
+                {
+                    if (cutoffUtc is null || File.GetLastWriteTimeUtc(path) <= cutoffUtc.Value)
+                        File.Delete(path);
+                }
+                catch { }
         if (!string.IsNullOrWhiteSpace(legacySessionsDirectory) && Directory.Exists(legacySessionsDirectory))
             foreach (var path in Directory.EnumerateFiles(legacySessionsDirectory, "KiTTYManager-route-*", SearchOption.TopDirectoryOnly))
-                try { File.Delete(path); } catch { }
+                try
+                {
+                    if (cutoffUtc is null || File.GetLastWriteTimeUtc(path) <= cutoffUtc.Value)
+                        File.Delete(path);
+                }
+                catch { }
     }
 }

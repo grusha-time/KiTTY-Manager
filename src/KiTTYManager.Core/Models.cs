@@ -48,6 +48,45 @@ public sealed class ManagerConfig
         if (!HasNotifiedUpdateVersion(version))
             NotifiedUpdateVersions.Add(version);
     }
+
+    public ManagerConfig CloneForSave() => new()
+    {
+        SchemaVersion = SchemaVersion,
+        Groups = Groups.Select(g => g.Clone()).ToList(),
+        UngroupedServers = UngroupedServers.Select(s => s.Clone()).ToList(),
+        Links = Links.Select(l => l.Clone()).ToList(),
+        BaseProxies = BaseProxies.Select(p => p.Clone()).ToList(),
+        PreferredProxyId = PreferredProxyId,
+        KittyPath = KittyPath,
+        FirefoxPath = FirefoxPath,
+        WinScpPath = WinScpPath,
+        ClosePreferenceConfigured = ClosePreferenceConfigured,
+        CloseToTray = CloseToTray,
+        EnableLogging = EnableLogging,
+        WriteChangesImmediatelyToKitty = WriteChangesImmediatelyToKitty,
+        MaximizeKittyWindows = MaximizeKittyWindows,
+        CloseWebTunnelWithFirefox = CloseWebTunnelWithFirefox,
+        AutoDiscoverFirefoxProfile = AutoDiscoverFirefoxProfile,
+        FirefoxTemplateProfile = FirefoxTemplateProfile,
+        ConnectionTimeoutSeconds = ConnectionTimeoutSeconds,
+        EndpointProbeTimeoutSeconds = EndpointProbeTimeoutSeconds,
+        MaxRouteAttempts = MaxRouteAttempts,
+        MaxGroupServersInRouteAttempts = MaxGroupServersInRouteAttempts,
+        TaskConnectionRecoveryMinutes = TaskConnectionRecoveryMinutes,
+        AutoConfirmHostKeys = AutoConfirmHostKeys,
+        SuppressKittyChangeNotifications = SuppressKittyChangeNotifications,
+        RaceBestEntryPoints = RaceBestEntryPoints,
+        SkipExistingLinksInMapCheck = SkipExistingLinksInMapCheck,
+        OfferStartMissingJumphosts = OfferStartMissingJumphosts,
+        FirefoxOptimizeRamCache = FirefoxOptimizeRamCache,
+        FirefoxDisableSafeBrowsing = FirefoxDisableSafeBrowsing,
+        FirefoxDisableHistoryAndIcons = FirefoxDisableHistoryAndIcons,
+        FirefoxClearCacheOnShutdown = FirefoxClearCacheOnShutdown,
+        FirefoxCleanRemovedServerContainers = FirefoxCleanRemovedServerContainers,
+        FirefoxAcceptInsecureCerts = FirefoxAcceptInsecureCerts,
+        PendingFirefoxContainerCleanups = PendingFirefoxContainerCleanups.Select(t => t.Clone()).ToList(),
+        NotifiedUpdateVersions = [..NotifiedUpdateVersions]
+    };
 }
 
 public sealed class FirefoxContainerCleanupTask
@@ -55,6 +94,13 @@ public sealed class FirefoxContainerCleanupTask
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public Guid ServerId { get; set; }
     public Guid? WebId { get; set; }
+
+    public FirefoxContainerCleanupTask Clone() => new()
+    {
+        Id = Id,
+        ServerId = ServerId,
+        WebId = WebId
+    };
 }
 
 public sealed class ServerGroup
@@ -64,6 +110,14 @@ public sealed class ServerGroup
     public List<ServerGroup> Groups { get; set; } = [];
     public List<ManagedServer> Servers { get; set; } = [];
     public override string ToString() => Name;
+
+    public ServerGroup Clone() => new()
+    {
+        Id = Id,
+        Name = Name,
+        Groups = Groups.Select(g => g.Clone()).ToList(),
+        Servers = Servers.Select(s => s.Clone()).ToList()
+    };
 }
 
 public sealed class ManagedServer
@@ -219,12 +273,87 @@ public sealed class ManagedServer
         }
     }
     public override string ToString() => Name;
+
+    public ManagedServer Clone()
+    {
+        var copy = new ManagedServer
+        {
+            Id = Id,
+            Name = Name,
+            Host = Host,
+            Port = Port,
+            Username = Username,
+            Password = Password,
+            PasswordImportState = PasswordImportState,
+            PrivateKeyPath = PrivateKeyPath,
+            PrivateKeyPassphrase = PrivateKeyPassphrase,
+            UseKeyboardInteractive = UseKeyboardInteractive,
+            RootLogin = RootLogin,
+            RootPassword = RootPassword,
+            ShellPrompt = ShellPrompt,
+            ImportedCommand = ImportedCommand,
+            IgnoreImportedCommand = IgnoreImportedCommand,
+            UsePam = UsePam,
+            PamSshCommand = PamSshCommand,
+            PamPassword = PamPassword,
+            PamTotpSecret = PamTotpSecret,
+            PamTotpAlgorithm = PamTotpAlgorithm,
+            PamTotpDigits = PamTotpDigits,
+            PamTotpPeriodSeconds = PamTotpPeriodSeconds,
+            PamTotpPrompt = PamTotpPrompt,
+            PamAutoConfirm = PamAutoConfirm,
+            PamConfirmPrompt = PamConfirmPrompt,
+            HasExplicitUsePam = HasExplicitUsePam,
+            HasExplicitPamAutoConfirm = HasExplicitPamAutoConfirm,
+            HasAllPamPropertiesPresentInImport = HasAllPamPropertiesPresentInImport,
+            KeepaliveIntervalSeconds = KeepaliveIntervalSeconds,
+            EnableTcpKeepalives = EnableTcpKeepalives,
+            ReconnectOnConnectionFailure = ReconnectOnConnectionFailure,
+            ReconnectOnSystemWakeup = ReconnectOnSystemWakeup,
+            HasPersistedKeepaliveIntervalSeconds = HasPersistedKeepaliveIntervalSeconds,
+            HasPersistedEnableTcpKeepalives = HasPersistedEnableTcpKeepalives,
+            HasPersistedReconnectOnConnectionFailure = HasPersistedReconnectOnConnectionFailure,
+            HasPersistedReconnectOnSystemWakeup = HasPersistedReconnectOnSystemWakeup,
+            KittyBaseline = KittyBaseline?.Clone(),
+            HostKeyFingerprint = HostKeyFingerprint,
+            HostKeyAlgorithm = HostKeyAlgorithm,
+            HostKeyBits = HostKeyBits,
+            SourceSessionPath = SourceSessionPath,
+            SourceScriptPath = SourceScriptPath,
+            SourceScriptContent = SourceScriptContent,
+            ImportedProxy = ImportedProxy is null ? null : new ImportedProxy
+            {
+                Host = ImportedProxy.Host,
+                Port = ImportedProxy.Port,
+                Method = ImportedProxy.Method
+            },
+            ManagerOverrides = [..ManagerOverrides],
+            IgnoredKittyProperties = [..IgnoredKittyProperties],
+            IgnoredKittyChanges = IgnoredKittyChanges.Select(c => c.Clone()).ToList(),
+            PreferredRoute = PreferredRoute?.Clone(),
+            RequiredPreviousServerId = RequiredPreviousServerId,
+            TryDirectWithoutJumphost = TryDirectWithoutJumphost,
+            PreferredProxyId = PreferredProxyId,
+            BackupEndpoints = BackupEndpoints.Select(e => e.Clone()).ToList(),
+            PreferredEndpoint = PreferredEndpoint?.Clone(),
+            EndpointPreferences = EndpointPreferences.Select(ep => ep.Clone()).ToList(),
+            LastOriginalSessionFallbackUtc = LastOriginalSessionFallbackUtc,
+            WebInterfaces = WebInterfaces.Select(w => w.Clone()).ToList()
+        };
+        return copy;
+    }
 }
 
 public sealed class IgnoredKittyChange
 {
     public string PropertyName { get; set; } = "";
     public string Fingerprint { get; set; } = "";
+
+    public IgnoredKittyChange Clone() => new()
+    {
+        PropertyName = PropertyName,
+        Fingerprint = Fingerprint
+    };
 }
 
 public enum ImportedCredentialState { Unknown, Empty, Decoded, PresentButUndecodable }
@@ -245,6 +374,24 @@ public sealed class KittySessionSnapshot
     public bool EnableTcpKeepalives { get; set; } = true;
     public bool ReconnectOnConnectionFailure { get; set; } = true;
     public bool ReconnectOnSystemWakeup { get; set; } = true;
+
+    public KittySessionSnapshot Clone() => new()
+    {
+        Name = Name,
+        Host = Host,
+        Port = Port,
+        Username = Username,
+        Password = Password,
+        PrivateKeyPath = PrivateKeyPath,
+        UseKeyboardInteractive = UseKeyboardInteractive,
+        RootLogin = RootLogin,
+        RootPassword = RootPassword,
+        ImportedCommand = ImportedCommand,
+        KeepaliveIntervalSeconds = KeepaliveIntervalSeconds,
+        EnableTcpKeepalives = EnableTcpKeepalives,
+        ReconnectOnConnectionFailure = ReconnectOnConnectionFailure,
+        ReconnectOnSystemWakeup = ReconnectOnSystemWakeup
+    };
 }
 
 public sealed class CachedRoute
@@ -253,6 +400,14 @@ public sealed class CachedRoute
     public List<Guid> ServerIds { get; set; } = [];
     public double? LatencyMs { get; set; }
     public DateTimeOffset LastSuccessUtc { get; set; }
+
+    public CachedRoute Clone() => new()
+    {
+        ProxyId = ProxyId,
+        ServerIds = [..ServerIds],
+        LatencyMs = LatencyMs,
+        LastSuccessUtc = LastSuccessUtc
+    };
 }
 
 public sealed class WebInterface
@@ -264,6 +419,16 @@ public sealed class WebInterface
     public string Password { get; set; } = "";
     public string ResolverAddress { get; set; } = "";
     public override string ToString() => Name;
+
+    public WebInterface Clone() => new()
+    {
+        Id = Id,
+        Name = Name,
+        Url = Url,
+        Username = Username,
+        Password = Password,
+        ResolverAddress = ResolverAddress
+    };
 }
 
 public sealed class BaseProxy
@@ -300,6 +465,41 @@ public sealed class BaseProxy
     public double? LastStartupLatencyMs { get; set; }
     public DateTimeOffset? LastStartupFailureUtc { get; set; }
     public override string ToString() => $"{Name} ({Host}:{Port})";
+
+    public BaseProxy Clone() => new()
+    {
+        Id = Id,
+        Name = Name,
+        Host = Host,
+        Port = Port,
+        UseAutomaticPort = UseAutomaticPort,
+        Enabled = Enabled,
+        StartupServerId = StartupServerId,
+        AutoStartWhenUnavailable = AutoStartWhenUnavailable,
+        TotpSecret = TotpSecret,
+        TotpAlgorithm = TotpAlgorithm,
+        TotpDigits = TotpDigits,
+        TotpPeriodSeconds = TotpPeriodSeconds,
+        TotpPrompt = TotpPrompt,
+        PostLoginCommand = PostLoginCommand,
+        RepeatAccountPasswordAfterCommand = RepeatAccountPasswordAfterCommand,
+        PostLoginPasswordPrompt = PostLoginPasswordPrompt,
+        PostCommandReadyDelaySeconds = PostCommandReadyDelaySeconds,
+        EnableScheduledRestart = EnableScheduledRestart,
+        ScheduledRestartMinutes = ScheduledRestartMinutes,
+        EnableControlServerMechanism = EnableControlServerMechanism,
+        AccessProbeServerLimit = AccessProbeServerLimit,
+        AccessProbeServerIds = [..AccessProbeServerIds],
+        LastAccessScriptAttemptUtc = LastAccessScriptAttemptUtc,
+        LastAccessScriptSuccessUtc = LastAccessScriptSuccessUtc,
+        LastAccessConfirmedUtc = LastAccessConfirmedUtc,
+        AccessScheduleBaselineUtc = AccessScheduleBaselineUtc,
+        LastAccessScriptResult = LastAccessScriptResult,
+        LastSuccessUtc = LastSuccessUtc,
+        LastConnectLatencyMs = LastConnectLatencyMs,
+        LastStartupLatencyMs = LastStartupLatencyMs,
+        LastStartupFailureUtc = LastStartupFailureUtc
+    };
 }
 
 public sealed class ServerLink
@@ -312,6 +512,18 @@ public sealed class ServerLink
     public Guid? LastSuccessfulProxyId { get; set; }
     public double? LastLatencyMs { get; set; }
     public List<LinkProxyStatistic> ProxyStatistics { get; set; } = [];
+
+    public ServerLink Clone() => new()
+    {
+        FromServerId = FromServerId,
+        ToServerId = ToServerId,
+        Discovered = Discovered,
+        LastSuccessUtc = LastSuccessUtc,
+        LastStrategy = LastStrategy,
+        LastSuccessfulProxyId = LastSuccessfulProxyId,
+        LastLatencyMs = LastLatencyMs,
+        ProxyStatistics = ProxyStatistics.Select(s => s.Clone()).ToList()
+    };
 }
 
 public sealed class LinkProxyStatistic
@@ -320,6 +532,14 @@ public sealed class LinkProxyStatistic
     public DateTimeOffset LastSuccessUtc { get; set; }
     public double? LatencyMs { get; set; }
     public string Strategy { get; set; } = "";
+
+    public LinkProxyStatistic Clone() => new()
+    {
+        ProxyId = ProxyId,
+        LastSuccessUtc = LastSuccessUtc,
+        LatencyMs = LatencyMs,
+        Strategy = Strategy
+    };
 }
 
 public sealed class ImportedProxy
@@ -348,6 +568,7 @@ public sealed class ServerEndpoint : IEquatable<ServerEndpoint>
 
     public ServerEndpoint() { }
     public ServerEndpoint(string host, int port, bool internalOnly = false) { Host = host; Port = port; InternalOnly = internalOnly; }
+    public ServerEndpoint Clone() => new(Host, Port, InternalOnly);
 
     public bool Equals(ServerEndpoint? other) =>
         other is not null &&
@@ -370,6 +591,14 @@ public sealed class EndpointPreference
     public Guid? PreviousServerId { get; set; }
     public ServerEndpoint Endpoint { get; set; } = new();
     public DateTimeOffset LastSuccessUtc { get; set; }
+
+    public EndpointPreference Clone() => new()
+    {
+        ProxyId = ProxyId,
+        PreviousServerId = PreviousServerId,
+        Endpoint = Endpoint.Clone(),
+        LastSuccessUtc = LastSuccessUtc
+    };
 }
 
 public static class ManagedServerPamExtensions
