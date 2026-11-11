@@ -418,7 +418,7 @@
                 <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
                 <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
                 <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
-                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
               </Grid.RowDefinitions>
               <TextBlock Text="Название" VerticalAlignment="Center"/><TextBox x:Name="ServerNameBox" Grid.Column="1" Margin="0,0,0,8"/>
               <TextBlock Grid.Row="1" Text="Адрес" VerticalAlignment="Center"/><TextBox x:Name="HostBox" Grid.Row="1" Grid.Column="1" Margin="0,0,0,8"/>
@@ -429,15 +429,17 @@
               <TextBlock Grid.Row="6" Text="Пароль ключа" VerticalAlignment="Center"/><local:SecretBox x:Name="PrivateKeyPassphraseBox" Grid.Row="6" Grid.Column="1" Margin="0,0,0,8"/>
               <TextBlock Grid.Row="7" Text="Повышение прав" VerticalAlignment="Center"/><TextBox x:Name="RootLoginBox" Grid.Row="7" Grid.Column="1" Margin="0,0,0,8" ToolTip="Команда su/sudo из Autocommand или login script KiTTY, например su - или sudo su -"/>
               <TextBlock Grid.Row="8" Text="Root-пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="RootPasswordBox" Grid.Row="8" Grid.Column="1" Margin="0,0,0,8" ToolTip="Пароль для команды su/sudo"/>
-              <TextBlock Grid.Row="9" Text="Скрипт KiTTY" VerticalAlignment="Center"/>
-              <TextBlock x:Name="ScriptInfoText" Grid.Row="9" Grid.Column="1" Foreground="#9A9A9A" TextWrapping="Wrap" Margin="8,4,0,8"/>
-              <TextBlock Grid.Row="10" Text="Shell prompt" VerticalAlignment="Center"/>
-              <TextBox x:Name="ShellPromptBox" Grid.Row="10" Grid.Column="1" Margin="0,0,0,8" ToolTip="Часть приглашения shell, после которой можно безопасно отправить su/sudo. Обычно $"/>
-              <TextBlock Grid.Row="11" Text="Команда KiTTY" VerticalAlignment="Center"/>
-              <TextBox x:Name="ImportedCommandBox" Grid.Row="11" Grid.Column="1" Margin="0,0,0,8" TextWrapping="Wrap" ToolTip="Команда Autocommand из исходной сессии KiTTY. Изменение действует только внутри менеджера."/>
-              <CheckBox x:Name="IgnoreImportedCommandBox" Grid.Row="12" Grid.Column="1" Margin="0,0,0,8" Content="Не выполнять команду KiTTY при умном подключении"/>
-              <TextBlock Grid.Row="13" Text="Маршрут через" VerticalAlignment="Center"/>
-              <Grid x:Name="RequiredRoutePicker" Grid.Row="13" Grid.Column="1" Margin="0,0,0,8"
+              <TextBlock Grid.Row="9" Text="Ожидаемый запрос пароля" TextWrapping="Wrap" VerticalAlignment="Center"/>
+              <TextBox x:Name="RootPasswordPromptBox" Grid.Row="9" Grid.Column="1" Margin="0,0,0,8" ToolTip="Ожидаемый текст запроса пароля при повышении прав (по умолчанию assword), например Smart card PIN:"/>
+              <TextBlock Grid.Row="10" Text="Скрипт KiTTY" VerticalAlignment="Center"/>
+              <TextBlock x:Name="ScriptInfoText" Grid.Row="10" Grid.Column="1" Foreground="#9A9A9A" TextWrapping="Wrap" Margin="8,4,0,8"/>
+              <TextBlock Grid.Row="11" Text="Shell prompt" VerticalAlignment="Center"/>
+              <TextBox x:Name="ShellPromptBox" Grid.Row="11" Grid.Column="1" Margin="0,0,0,8" ToolTip="Часть приглашения shell, после которой можно безопасно отправить su/sudo. Обычно $"/>
+              <TextBlock Grid.Row="12" Text="Команда KiTTY" VerticalAlignment="Center"/>
+              <TextBox x:Name="ImportedCommandBox" Grid.Row="12" Grid.Column="1" Margin="0,0,0,8" TextWrapping="Wrap" ToolTip="Команда Autocommand из исходной сессии KiTTY. Изменение действует только внутри менеджера."/>
+              <CheckBox x:Name="IgnoreImportedCommandBox" Grid.Row="13" Grid.Column="1" Margin="0,0,0,8" Content="Не выполнять команду KiTTY при умном подключении"/>
+              <TextBlock Grid.Row="14" Text="Маршрут через" VerticalAlignment="Center"/>
+              <Grid x:Name="RequiredRoutePicker" Grid.Row="14" Grid.Column="1" Margin="0,0,0,8"
                     ToolTip="Если выбрана сессия, она всегда будет последним SSH-переходом перед этой целью. Используйте для одинаковых private IP в разных сетях.">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="38"/></Grid.ColumnDefinitions>
                 <TextBox x:Name="RequiredRouteSearchBox" Padding="10,8"
@@ -459,19 +461,19 @@
                   </Border>
                 </Popup>
               </Grid>
-              <CheckBox x:Name="TryDirectWithoutJumphostBox" Grid.Row="14" Grid.Column="1" Margin="0,2,0,8"
+              <CheckBox x:Name="TryDirectWithoutJumphostBox" Grid.Row="15" Grid.Column="1" Margin="0,2,0,8"
                         Content="Сначала подключаться напрямую, без JH"
                         ToolTip="Сначала попробовать SSH напрямую с этого компьютера. Если прямой доступ не работает, менеджер использует обычные сохранённые связи и точки входа; после обходного подключения прямой путь перепроверяется в фоне."/>
-              <TextBlock Grid.Row="15" Text="Keepalive (сек)" VerticalAlignment="Center"/>
-              <TextBox x:Name="KeepaliveIntervalBox" Grid.Row="15" Grid.Column="1" Margin="0,0,0,8"
+              <TextBlock Grid.Row="16" Text="Keepalive (сек)" VerticalAlignment="Center"/>
+              <TextBox x:Name="KeepaliveIntervalBox" Grid.Row="16" Grid.Column="1" Margin="0,0,0,8"
                        ToolTip="Интервал между keepalive в секундах (по умолчанию 15). 0 — отключить keepalive."/>
-              <CheckBox x:Name="EnableTcpKeepalivesBox" Grid.Row="16" Grid.Column="1" Margin="0,2,0,8"
+              <CheckBox x:Name="EnableTcpKeepalivesBox" Grid.Row="17" Grid.Column="1" Margin="0,2,0,8"
                         Content="Включить TCP keepalive"
                         ToolTip="Включает опцию TCP keepalive в сессии KiTTY."/>
-              <CheckBox x:Name="ReconnectOnConnectionFailureBox" Grid.Row="17" Grid.Column="1" Margin="0,2,0,8"
+              <CheckBox x:Name="ReconnectOnConnectionFailureBox" Grid.Row="18" Grid.Column="1" Margin="0,2,0,8"
                         Content="Переподключаться при сбое соединения"
                         ToolTip="Автоматическое переподключение KiTTY при обрыве связи."/>
-              <CheckBox x:Name="ReconnectOnSystemWakeupBox" Grid.Row="18" Grid.Column="1" Margin="0,2,0,8"
+              <CheckBox x:Name="ReconnectOnSystemWakeupBox" Grid.Row="19" Grid.Column="1" Margin="0,2,0,8"
                         Content="Переподключаться после выхода из сна"
                         ToolTip="Автоматическое переподключение KiTTY при выходе операционной системы из спящего режима."/>
             </Grid>

@@ -592,6 +592,7 @@ public partial class MainWindow : Window
             PamTotpPromptBox.Text = "OTP: ";
             PamAutoConfirmBox.IsChecked = false;
             PamConfirmPromptBox.Text = "[Y/n]";
+            RootPasswordPromptBox.Text = "assword";
             return;
         }
         PasswordBox.ResetToHidden();
@@ -615,6 +616,7 @@ public partial class MainWindow : Window
         PrivateKeyPathBox.Text = server.PrivateKeyPath;
         PrivateKeyPassphraseBox.Value = server.PrivateKeyPassphrase;
         RootLoginBox.Text = server.RootLogin; RootPasswordBox.Value = server.RootPassword;
+        RootPasswordPromptBox.Text = string.IsNullOrWhiteSpace(server.RootPasswordPrompt) ? "assword" : server.RootPasswordPrompt;
         ShellPromptBox.Text = server.ShellPrompt;
         ImportedCommandBox.Text = server.ImportedCommand;
         IgnoreImportedCommandBox.IsChecked = server.IgnoreImportedCommand;
@@ -1277,6 +1279,7 @@ public partial class MainWindow : Window
         var beforePamTotpPrompt = selectedServer.PamTotpPrompt;
         var beforePamAutoConfirm = selectedServer.PamAutoConfirm;
         var beforePamConfirmPrompt = selectedServer.PamConfirmPrompt;
+        var beforeRootPasswordPrompt = selectedServer.RootPasswordPrompt;
         SetManagerOverride(selectedServer, nameof(ManagedServer.Name), selectedServer.Name, ServerNameBox.Text.Trim(), value => selectedServer.Name = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.Host), selectedServer.Host, HostBox.Text.Trim(), value => selectedServer.Host = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.Port), selectedServer.Port, port, value => selectedServer.Port = value);
@@ -1286,6 +1289,7 @@ public partial class MainWindow : Window
         SetManagerOverride(selectedServer, nameof(ManagedServer.PrivateKeyPassphrase), selectedServer.PrivateKeyPassphrase, PrivateKeyPassphraseBox.Value, value => selectedServer.PrivateKeyPassphrase = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.RootLogin), selectedServer.RootLogin, RootLoginBox.Text.Trim(), value => selectedServer.RootLogin = value);
         SetManagerOverride(selectedServer, nameof(ManagedServer.RootPassword), selectedServer.RootPassword, RootPasswordBox.Value, value => selectedServer.RootPassword = value);
+        selectedServer.RootPasswordPrompt = string.IsNullOrWhiteSpace(RootPasswordPromptBox.Text) ? "assword" : RootPasswordPromptBox.Text.Replace("\r", "").Replace("\n", "");
         selectedServer.ShellPrompt = string.IsNullOrWhiteSpace(ShellPromptBox.Text) ? "$" : ShellPromptBox.Text;
         SetManagerOverride(selectedServer, nameof(ManagedServer.ImportedCommand), selectedServer.ImportedCommand,
             ImportedCommandBox.Text, value => selectedServer.ImportedCommand = value);
@@ -1337,6 +1341,7 @@ public partial class MainWindow : Window
             selectedServer.PamTotpPrompt = beforePamTotpPrompt;
             selectedServer.PamAutoConfirm = beforePamAutoConfirm;
             selectedServer.PamConfirmPrompt = beforePamConfirmPrompt;
+            selectedServer.RootPasswordPrompt = beforeRootPasswordPrompt;
             ShowServer(selectedServer);
             Error(ex);
             return;
@@ -1364,6 +1369,7 @@ public partial class MainWindow : Window
         PrivateKeyPassphrase = PrivateKeyPassphraseBox.Value,
         RootLogin = RootLoginBox.Text,
         RootPassword = RootPasswordBox.Value,
+        RootPasswordPrompt = RootPasswordPromptBox.Text,
         ShellPrompt = ShellPromptBox.Text,
         ImportedCommand = ImportedCommandBox.Text,
         IgnoreImportedCommand = IgnoreImportedCommandBox.IsChecked == true,

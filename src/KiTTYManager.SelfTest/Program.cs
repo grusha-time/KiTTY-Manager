@@ -546,6 +546,10 @@ internal sealed partial class SelfTestRunner
         Test("Интерфейс: хит-тестинг кривых и стрелок LinkMap и Windows STA проверки", LinkMapCurveStrokeHitTestingAndWindowsStaTests);
         Test("Безопасность данных: forceExit, FlushConfig, мастер импорта и откат", ExitSequenceAndImportWizardDataSafetyTests);
         Test("Подключение SSH: перенос PreferredProxyId и метрик прокси в ApplyDiscoveredRoutesAndPreferences", ApplyDiscoveredRoutesAndPreferencesPreservesSuccessfulProxyStateTests);
+        Test("Запрос пароля su/sudo: генерация login script и PAM-шагов с настраиваемым prompt", RootPasswordPromptLoginScriptAndPamTests);
+        Test("Запрос пароля su/sudo: правила импорта и слияния (default/custom, каскад, legacy)", RootPasswordPromptImportAndMergeRulesTests);
+        Test("Запрос пароля su/sudo: клонирование, дублирование и отслеживание изменений", RootPasswordPromptCloningDuplicationAndDirtyTrackerTests);
+        Test("Запрос пароля su/sudo: сохранение, экспорт и запись в session-файл KiTTY", RootPasswordPromptConfigRoundtripAndSessionWriterTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {

@@ -32,6 +32,7 @@ public sealed class KittyRoutedSession : IDisposable
         // The manager supplies a temporary, prompt-aware privilege script.
         Set(lines, "Scriptfile", "");
         Set(lines, "ScriptfileContent", "");
+        Set(lines, KittyCredentialDecoder.ScriptEncodingMarkerKey, "");
         Set(lines, "RemoteCommand", "");
         var isPrivilegeCommand = KittyCredentialDecoder.NormalizeRootCommand(importedCommand) is not null;
         Set(lines, "Autocommand", ignoreImportedCommand || isPrivilegeCommand ? "" : importedCommand);
@@ -71,6 +72,7 @@ public sealed class KittyRoutedSession : IDisposable
         Set(lines, "Password", "");
         Set(lines, "Scriptfile", "");
         Set(lines, "ScriptfileContent", "");
+        Set(lines, KittyCredentialDecoder.ScriptEncodingMarkerKey, "");
         Set(lines, "RemoteCommand", "");
         var isPrivilegeCommand =
             KittyCredentialDecoder.NormalizeRootCommand(importedCommand) is not null;
@@ -115,6 +117,7 @@ public sealed class KittyRoutedSession : IDisposable
             "Password\\\\",
             "Scriptfile\\\\",
             "ScriptfileContent\\\\",
+            $"{KittyCredentialDecoder.ScriptEncodingMarkerKey}\\\\",
             $"Autocommand\\{KittySessionWriter.EncodeValue(autoCmd)}\\",
             "RemoteCommand\\\\",
             "SendToTray\\0\\",

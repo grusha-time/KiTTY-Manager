@@ -12,7 +12,7 @@
           <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <TextBlock Text="Название" VerticalAlignment="Center"/><TextBox x:Name="NameBox" Grid.Column="1"/>
           <TextBlock Grid.Row="1" Text="IP / host" VerticalAlignment="Center"/><TextBox x:Name="HostBox" Grid.Row="1" Grid.Column="1"/>
@@ -21,6 +21,7 @@
           <TextBlock Grid.Row="4" Text="Пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="PasswordBox" Grid.Row="4" Grid.Column="1"/>
           <TextBlock Grid.Row="5" Text="Root-логин" VerticalAlignment="Center"/><TextBox x:Name="RootLoginBox" Grid.Row="5" Grid.Column="1" ToolTip="Команда su/sudo из Autocommand или login script KiTTY, например su - или sudo su -"/>
           <TextBlock Grid.Row="6" Text="Root-пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="RootPasswordBox" Grid.Row="6" Grid.Column="1" ToolTip="Пароль для команды su/sudo"/>
+          <TextBlock Grid.Row="7" Text="Ожидаемый запрос пароля" VerticalAlignment="Center"/><TextBox x:Name="RootPasswordPromptBox" Grid.Row="7" Grid.Column="1" ToolTip="Ожидаемый текст запроса пароля при повышении прав (по умолчанию assword), например Smart card PIN:"/>
         </Grid></ScrollViewer>
       </TabItem>
       <TabItem Header="Расширенное">

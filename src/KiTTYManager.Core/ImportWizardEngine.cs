@@ -130,6 +130,20 @@ public static class ImportWizardEngine
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
+    public static bool IsDefaultRootPasswordPrompt(string? prompt) =>
+        string.IsNullOrWhiteSpace(prompt) || string.Equals(prompt.Trim(), "assword", StringComparison.Ordinal);
+
+    public static string ResolveImportedRootPasswordPrompt(string? localPrompt, string? incomingPrompt)
+    {
+        var localIsCustom = !IsDefaultRootPasswordPrompt(localPrompt);
+        var incomingIsCustom = !IsDefaultRootPasswordPrompt(incomingPrompt);
+        if (incomingIsCustom)
+            return string.IsNullOrWhiteSpace(incomingPrompt) ? "assword" : incomingPrompt;
+        if (localIsCustom)
+            return string.IsNullOrWhiteSpace(localPrompt) ? "assword" : localPrompt;
+        return "assword";
+    }
+
     public static ImportWizardPlan Analyze(ManagerConfig current, ManagerConfig incoming)
     {
         ArgumentNullException.ThrowIfNull(current);
@@ -299,6 +313,10 @@ public static class ImportWizardEngine
                     if (existingServer.HasPamConfigured())
                     {
                         replacement.MergePamPreservingPopulated(existingServer);
+                    }
+                    if (!IsDefaultRootPasswordPrompt(existingServer.RootPasswordPrompt) && IsDefaultRootPasswordPrompt(replacement.RootPasswordPrompt))
+                    {
+                        replacement.RootPasswordPrompt = existingServer.RootPasswordPrompt;
                     }
                     var noteField = plan.Fields.FirstOrDefault(f =>
                         f.IncomingSessionId == row.IncomingId && f.PropertyName == "Note");
@@ -470,6 +488,13 @@ public static class ImportWizardEngine
                     continue;
                 }
             }
+            if (field.PropertyName == "RootPasswordPrompt")
+            {
+                var cur = field.CurrentValue?.Trim() ?? "";
+                var inc = field.IncomingValue?.Trim() ?? "";
+                if (!IsDefaultRootPasswordPrompt(cur) && IsDefaultRootPasswordPrompt(inc))
+                    continue;
+            }
             if (field.PropertyName == "Note" && !string.IsNullOrWhiteSpace(field.CurrentValue))
                 continue;
             field.UseIncoming = true;
@@ -496,6 +521,13 @@ public static class ImportWizardEngine
             Add("UseKeyboardInteractive", "Keyboard-interactive", before.UseKeyboardInteractive.ToString(), after.UseKeyboardInteractive.ToString());
             Add("RootLogin", "Логин повышения прав", before.RootLogin, after.RootLogin);
             Add("RootPassword", "Пароль повышения прав", before.RootPassword, after.RootPassword, true);
+            var beforePrompt = string.IsNullOrWhiteSpace(before.RootPasswordPrompt) ? "assword" : before.RootPasswordPrompt;
+            var afterPrompt = string.IsNullOrWhiteSpace(after.RootPasswordPrompt) ? "assword" : after.RootPasswordPrompt;
+            var localCustom = !IsDefaultRootPasswordPrompt(beforePrompt);
+            var incomingCustom = !IsDefaultRootPasswordPrompt(afterPrompt);
+            var keepCurrentPrompt = localCustom && !incomingCustom;
+            Add("RootPasswordPrompt", "Ожидаемый запрос пароля", beforePrompt, afterPrompt,
+                keepCurrent: keepCurrentPrompt, useIncomingDefault: !keepCurrentPrompt);
             Add("ShellPrompt", "Shell prompt", before.ShellPrompt, after.ShellPrompt);
             Add("ImportedCommand", "Команда входа", before.ImportedCommand, after.ImportedCommand);
             Add("IgnoreImportedCommand", "Игнорировать команду входа", before.IgnoreImportedCommand.ToString(), after.IgnoreImportedCommand.ToString());
@@ -626,6 +658,9 @@ public static class ImportWizardEngine
                 case "UseKeyboardInteractive": target.UseKeyboardInteractive = source.UseKeyboardInteractive; break;
                 case "RootLogin": target.RootLogin = source.RootLogin; break;
                 case "RootPassword": target.RootPassword = source.RootPassword; break;
+                case "RootPasswordPrompt":
+                    target.RootPasswordPrompt = ResolveImportedRootPasswordPrompt(target.RootPasswordPrompt, source.RootPasswordPrompt);
+                    break;
                 case "ShellPrompt": target.ShellPrompt = source.ShellPrompt; break;
                 case "ImportedCommand": target.ImportedCommand = source.ImportedCommand; break;
                 case "IgnoreImportedCommand": target.IgnoreImportedCommand = source.IgnoreImportedCommand; break;
