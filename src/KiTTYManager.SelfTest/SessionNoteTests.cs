@@ -299,6 +299,24 @@ internal sealed partial class SelfTestRunner
         Equal("SessionNotesToggle_Click", (string?)toggle!.Attribute("Click"));
         Equal("False", (string?)toggle.Attribute("IsThreeState"));
         Equal("False", (string?)toggle.Attribute("Focusable"));
+
+        // Reset-filter action stays left of the notes toggle, which remains the rightmost header action.
+        var actionChildren = toggle.Parent?.Elements().ToList();
+        Equal(true, actionChildren is not null);
+        var resetIndex = actionChildren!.FindIndex(element =>
+            (string?)element.Attribute(xNs + "Name") == "ClearGroupFilterButton");
+        var toggleIndex = actionChildren.FindIndex(element =>
+            (string?)element.Attribute(xNs + "Name") == "SessionNotesToggleButton");
+        Equal(true, resetIndex >= 0 && resetIndex < toggleIndex);
+        Equal(actionChildren.Count - 1, toggleIndex);
+        var resetButton = actionChildren[resetIndex];
+        Equal("0,0,8,0", (string?)resetButton.Attribute("Margin"));
+        var toggleStyle = doc.Descendants(ns + "Style")
+            .FirstOrDefault(element => (string?)element.Attribute(xNs + "Key") == "SessionNotesToggleStyle");
+        Equal(true, toggleStyle is not null);
+        var toggleMargin = toggleStyle!.Descendants(ns + "Setter")
+            .FirstOrDefault(element => (string?)element.Attribute("Property") == "Margin");
+        Equal("0", (string?)toggleMargin?.Attribute("Value"));
         Equal(true, xamlText.Contains("x:Name=\"SessionNotesStrike\""));
         Equal(true, xamlText.Contains("RelativeSource AncestorType=ToggleButton") &&
                     xamlText.Contains("Property=\"IsChecked\""));

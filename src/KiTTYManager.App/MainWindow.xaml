@@ -92,7 +92,7 @@
       <Setter Property="MinWidth" Value="0"/>
       <Setter Property="MinHeight" Value="0"/>
       <Setter Property="Padding" Value="0"/>
-      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="Margin" Value="0"/>
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Cursor" Value="Hand"/>
@@ -216,6 +216,7 @@
                 <TextBlock x:Name="SessionCountText" Foreground="#858585" FontSize="12"/>
               </StackPanel>
               <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <Button x:Name="ClearGroupFilterButton" Click="ClearGroupFilter_Click" Padding="10,5" Margin="0,0,8,0" Visibility="Collapsed">Сбросить фильтр групп</Button>
                 <ToggleButton x:Name="SessionNotesToggleButton" Click="SessionNotesToggle_Click"
                               Style="{StaticResource SessionNotesToggleStyle}"
                               IsThreeState="False" Focusable="False"
@@ -243,7 +244,6 @@
                     </Path>
                   </Grid>
                 </ToggleButton>
-                <Button x:Name="ClearGroupFilterButton" Click="ClearGroupFilter_Click" Padding="10,5" Visibility="Collapsed">Сбросить фильтр групп</Button>
               </StackPanel>
             </Grid>
             <StackPanel Grid.Row="1" Margin="0,10,0,0">
