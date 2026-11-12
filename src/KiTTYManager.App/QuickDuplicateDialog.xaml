@@ -12,7 +12,7 @@
           <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <TextBlock Text="Название" VerticalAlignment="Center"/><TextBox x:Name="NameBox" Grid.Column="1"/>
           <TextBlock Grid.Row="1" Text="IP / host" VerticalAlignment="Center"/><TextBox x:Name="HostBox" Grid.Row="1" Grid.Column="1"/>
@@ -20,13 +20,15 @@
           <TextBlock Grid.Row="3" Text="Логин" VerticalAlignment="Center"/><TextBox x:Name="UsernameBox" Grid.Row="3" Grid.Column="1"/>
           <TextBlock Grid.Row="4" Text="Пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="PasswordBox" Grid.Row="4" Grid.Column="1"/>
           <TextBlock Grid.Row="5" Text="Root-логин" VerticalAlignment="Center"/><TextBox x:Name="RootLoginBox" Grid.Row="5" Grid.Column="1" ToolTip="Команда su/sudo из Autocommand или login script KiTTY, например su - или sudo su -"/>
-          <TextBlock Grid.Row="6" Text="Root-пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="RootPasswordBox" Grid.Row="6" Grid.Column="1" ToolTip="Пароль для команды su/sudo"/>
+          <TextBlock Grid.Row="6" Text="Ожидаемый запрос пароля" VerticalAlignment="Center"/><TextBox x:Name="RootPasswordPromptBox" Grid.Row="6" Grid.Column="1" ToolTip="Ожидаемый текст запроса, после которого можно ввести пароль для повышения прав (по умолчанию assword)."/>
+          <TextBlock Grid.Row="7" Text="Root-пароль" VerticalAlignment="Center"/><local:SecretBox x:Name="RootPasswordBox" Grid.Row="7" Grid.Column="1" ToolTip="Пароль для команды su/sudo"/>
         </Grid></ScrollViewer>
       </TabItem>
       <TabItem Header="Расширенное">
         <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="12">
           <TextBlock Text="Приватный ключ"/><TextBox x:Name="PrivateKeyBox" ToolTip="Путь к PPK/PEM на этом ПК. Оставьте пустым, если ключ лежит на jumphost — пароль ключа всё равно будет передан."/>
           <TextBlock Text="Passphrase ключа" Margin="0,8,0,0"/><local:SecretBox x:Name="PrivateKeyPassphraseBox"/>
+          <TextBlock Text="Ожидаемая строка shell" Margin="0,8,0,0"/><TextBox x:Name="ShellPromptBox" ToolTip="Часть приглашения shell, после которой можно безопасно отправить su/sudo. Обычно $"/>
           <CheckBox x:Name="KeyboardInteractiveBox" Content="Keyboard-interactive" Margin="0,10,0,0"
                     Style="{StaticResource {x:Type CheckBox}}"
                     ToolTip="Разрешить интерактивную SSH-аутентификацию с вопросами сервера, например одноразовым кодом или дополнительным паролем."/>
@@ -35,7 +37,6 @@
                     ToolTip="Сначала попробовать SSH напрямую с этого компьютера. Если прямой доступ не работает, менеджер использует обычные сохранённые связи и точки входа; после обходного подключения прямой путь перепроверяется в фоне."/>
           <CheckBox x:Name="IgnoreCommandBox" Content="Не выполнять импортированную команду"
                     Style="{StaticResource {x:Type CheckBox}}"/>
-          <TextBlock Text="Ожидаемая строка shell" Margin="0,8,0,0"/><TextBox x:Name="ShellPromptBox" ToolTip="Часть приглашения shell, после которой можно безопасно отправить su/sudo. Обычно $"/>
           <TextBlock Text="Импортированная команда" Margin="0,8,0,0"/><TextBox x:Name="ImportedCommandBox" AcceptsReturn="True" Height="70" ToolTip="Команда Autocommand из исходной сессии KiTTY. Изменение действует только внутри менеджера."/>
           <TextBlock Text="Обязательный предыдущий сервер" Margin="0,8,0,0"/>
           <ComboBox x:Name="RequiredPreviousBox" DisplayMemberPath="Name" SelectedValuePath="Id"

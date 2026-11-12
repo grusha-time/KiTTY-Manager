@@ -23,6 +23,11 @@ public static class KittySessionWriter
     public static IReadOnlySet<string> WritableProperties { get; } =
         new HashSet<string>(Keys.Keys.Append(nameof(ManagedServer.Name)).Append(nameof(ManagedServer.RootPassword)), StringComparer.Ordinal);
 
+    // Test-only fault injection at the filesystem boundary; production leaves
+    // these null.
+    internal static Action<string, string>? SourceMoveHook { get; set; }
+    internal static Action<string>? RestoreWriteHook { get; set; }
+
     public static void Write(string bundledSessionsDirectory, ManagedServer server, IEnumerable<string> properties,
         BaseProxy? confirmedDirectProxy = null)
     {
@@ -94,19 +99,27 @@ public static class KittySessionWriter
             // KiTTY 0.76.1.13 only executes encrypted embedded scripts.
             var shellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
             var command = KittyCredentialDecoder.NormalizeRootCommand(server.RootLogin)!;
-            var script = $"{shellPrompt}\n{command}\nassword:\n{server.RootPassword}";
+            var rootPrompt = string.IsNullOrWhiteSpace(server.RootPasswordPrompt) ? "assword:" : server.RootPasswordPrompt.Replace("\r", "").Replace("\n", "").Replace("\0", "");
+            if (string.IsNullOrWhiteSpace(rootPrompt)) rootPrompt = "assword:";
+            var script = $"{shellPrompt}\n{command}\n{rootPrompt}\n{server.RootPassword}";
             Set(lines, "Autocommand", "");
             Set(lines, "ScriptfileContent", KittyCredentialDecoder.EncryptScriptContent(script));
+            Set(lines, KittyCredentialDecoder.ScriptEncodingMarkerKey, "1");
         }
         else if (rewriteRootPassword)
         {
             var oldRootPassword = server.KittyBaseline?.RootPassword ?? "";
+            var storedContent = values.GetValueOrDefault("ScriptfileContent") ?? "";
+            var hasTrailer = KittyCredentialDecoder.HasScriptFormatTrailer(storedContent);
             if (!KittyCredentialDecoder.TryRewriteRootPassword(
-                    values.GetValueOrDefault("ScriptfileContent") ?? "", server.RootLogin,
-                    oldRootPassword, server.RootPassword, out var script))
+                    storedContent, server.RootLogin,
+                    oldRootPassword, server.RootPassword, out var script, server.RootPasswordPrompt))
                 throw new InvalidOperationException(
                     "Root-пароль не записан: во встроенном login script не найден единственный безопасный ответ после su/sudo.");
             Set(lines, "ScriptfileContent", script);
+            // Marked scripts keep the durable trailer; legacy scripts stay
+            // legacy so their untouched answers keep their interpretation.
+            if (hasTrailer) Set(lines, KittyCredentialDecoder.ScriptEncodingMarkerKey, "1");
         }
         // Если ImportedCommand — привилегированная команда (su -, sudo su),
         // а встроенный скрипт уже существует, очищаем Autocommand — иначе
@@ -156,23 +169,90 @@ public static class KittySessionWriter
             _ = KittySessionImporter.ParseFile(temp);
             if (originalBytes is not null && (!File.Exists(source) || !File.ReadAllBytes(source).SequenceEqual(originalBytes)))
                 throw new IOException("Сессия KiTTY изменилась во время записи. Обновите список изменений и повторите попытку.");
-            if (File.Exists(destination))
+            var backupDirectory = Path.Combine(Directory.GetParent(root)!.FullName, "ManagerBackups", "Sessions");
+            var renamedBackup = Path.Combine(backupDirectory, Path.GetFileName(source) + ".renamed-backup");
+            var installed = false;
+            var sourceMoved = false;
+            string? recoveryPath = null;
+            try
             {
-                var backupDirectory = Path.Combine(Directory.GetParent(root)!.FullName, "ManagerBackups", "Sessions");
-                Directory.CreateDirectory(backupDirectory);
-                var backup = Path.Combine(backupDirectory, Path.GetFileName(destination) + ".backup");
-                File.Replace(temp, destination, backup, true);
+                if (File.Exists(destination))
+                {
+                    Directory.CreateDirectory(backupDirectory);
+                    var backup = Path.Combine(backupDirectory, Path.GetFileName(destination) + ".backup");
+                    File.Replace(temp, destination, backup, true);
+                    recoveryPath = backup;
+                }
+                else File.Move(temp, destination);
+                installed = true;
+                if (!source.Equals(destination, StringComparison.OrdinalIgnoreCase) && File.Exists(source))
+                {
+                    Directory.CreateDirectory(backupDirectory);
+                    SourceMoveHook?.Invoke(source, renamedBackup);
+                    File.Move(source, renamedBackup, true);
+                    sourceMoved = true;
+                    recoveryPath = renamedBackup;
+                }
+                server.SourceSessionPath = destination;
+                VerifyWrittenSession(destination, server, selected, proxyToWrite,
+                    rewriteRootPassword || createRootScript);
             }
-            else File.Move(temp, destination);
-            if (!source.Equals(destination, StringComparison.OrdinalIgnoreCase) && File.Exists(source))
+            catch (Exception originalError)
             {
-                var backupDirectory = Path.Combine(Directory.GetParent(root)!.FullName, "ManagerBackups", "Sessions");
-                Directory.CreateDirectory(backupDirectory);
-                File.Move(source, Path.Combine(backupDirectory, Path.GetFileName(source) + ".renamed-backup"), true);
+                // A failed post-install verification must not leave the change
+                // applied: rewrite back to the original bytes, rename back to
+                // the source path, or remove the created session.
+                if (installed)
+                {
+                    try
+                    {
+                        if (creating)
+                        {
+                            if (File.Exists(destination)) File.Delete(destination);
+                        }
+                        else if (source.Equals(destination, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (originalBytes is not null)
+                            {
+                                RestoreWriteHook?.Invoke(destination);
+                                File.WriteAllBytes(destination, originalBytes);
+                            }
+                        }
+                        else
+                        {
+                            if (File.Exists(destination)) File.Delete(destination);
+                            // Only this operation's completed move may be
+                            // restored; a stale .renamed-backup from an older
+                            // run must never overwrite the untouched source.
+                            if (sourceMoved && File.Exists(renamedBackup)) File.Move(renamedBackup, source, true);
+                        }
+                        server.SourceSessionPath = creating ? null : source;
+                    }
+                    catch (Exception rollbackError)
+                    {
+                        // The rollback failed, so the file may still be changed.
+                        // Exception.Message is immutable and both presentation
+                        // paths read it, so wrap the original error with a
+                        // truthful message that names the recovery backup.
+                        const string unappliedSuffix = " Изменение оставлено неприменённым.";
+                        var verification = originalError.Message;
+                        if (verification.EndsWith(unappliedSuffix, StringComparison.Ordinal))
+                            verification = verification[..^unappliedSuffix.Length];
+                        var message = verification +
+                                      " Восстановить исходный файл не удалось: " + rollbackError.Message + "." +
+                                      " Файл мог остаться изменённым.";
+                        if (recoveryPath is not null) message += " Резервная копия: " + recoveryPath + ".";
+                        var wrapped = new IOException(message, originalError);
+                        wrapped.Data["RollbackFailure"] = rollbackError;
+                        if (recoveryPath is not null) wrapped.Data["RollbackBackup"] = recoveryPath;
+                        server.SourceSessionPath = File.Exists(destination) ? destination
+                            : File.Exists(source) ? source
+                            : recoveryPath;
+                        throw wrapped;
+                    }
+                }
+                throw;
             }
-            server.SourceSessionPath = destination;
-            VerifyWrittenSession(destination, server, selected, proxyToWrite,
-                rewriteRootPassword || createRootScript);
         }
         finally { try { File.Delete(temp); } catch { } }
     }
@@ -192,9 +272,21 @@ public static class KittySessionWriter
         }
         if (verifyRootPassword)
         {
-            var imported = KittySessionImporter.ImportDirectory(Path.GetDirectoryName(path)!)
-                .Single(item => Path.GetFullPath(item.SourceSessionPath!).Equals(Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase));
-            if (imported.RootPassword != server.RootPassword)
+            // Verify the embedded script with the configured prompt: arbitrary
+            // user-defined text (e.g. "Введите код:") is not a known password
+            // keyword, so the generic importer would not recognize the response.
+            var decodedRoot = KittyCredentialDecoder.DecodeLoginScript(
+                values.GetValueOrDefault("ScriptfileContent") ?? "", 0, server.RootPasswordPrompt);
+            var confirmed = (decodedRoot?.RootPassword ?? "") == server.RootPassword;
+            if (!confirmed)
+            {
+                // Password-only scripts paired with an automatic su/sudo command
+                // are reclassified by the importer; keep accepting that shape.
+                var imported = KittySessionImporter.ImportDirectory(Path.GetDirectoryName(path)!)
+                    .Single(item => Path.GetFullPath(item.SourceSessionPath!).Equals(Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase));
+                confirmed = imported.RootPassword == server.RootPassword;
+            }
+            if (!confirmed)
                 throw new IOException("KiTTY не подтвердила записанный root-пароль login script. Изменение оставлено неприменённым.");
         }
         if (proxy is null) return;

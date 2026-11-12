@@ -136,6 +136,7 @@ public sealed class ManagedServer
     public bool UseKeyboardInteractive { get; set; } = true;
     public string RootLogin { get; set; } = "";
     public string RootPassword { get; set; } = "";
+    public string RootPasswordPrompt { get; set; } = "assword";
     public string ShellPrompt { get; set; } = "$";
     public string Note { get; set; } = "";
     [JsonIgnore] public bool HasNote => SessionNotePolicy.HasNote(Note);
@@ -294,6 +295,7 @@ public sealed class ManagedServer
             UseKeyboardInteractive = UseKeyboardInteractive,
             RootLogin = RootLogin,
             RootPassword = RootPassword,
+            RootPasswordPrompt = RootPasswordPrompt,
             ShellPrompt = ShellPrompt,
             Note = Note,
             ImportedCommand = ImportedCommand,

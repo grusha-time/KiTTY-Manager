@@ -31,7 +31,9 @@ public sealed class KittyLoginScript : IDisposable
         // shell prompt first prevents the root password from matching and being
         // sent to the initial SSH "password:" prompt.
         var shellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
-        File.WriteAllLines(path, [shellPrompt, command, "assword", EscapeResponse(server.RootPassword)],
+        var rootPrompt = string.IsNullOrWhiteSpace(server.RootPasswordPrompt) ? "assword" : server.RootPasswordPrompt.Replace("\r", "").Replace("\n", "").Replace("\0", "");
+        if (string.IsNullOrWhiteSpace(rootPrompt)) rootPrompt = "assword";
+        File.WriteAllLines(path, [shellPrompt, command, rootPrompt, EscapeResponse(server.RootPassword)],
             new UTF8Encoding(false));
         return new KittyLoginScript(path);
     }

@@ -72,7 +72,9 @@ public static class PamLoginPlan
             steps.Add(new JumphostPromptResponse(targetShellPrompt, rootCommand));
             if (!string.IsNullOrEmpty(target.RootPassword))
             {
-                steps.Add(new JumphostPromptResponse("assword", target.RootPassword));
+                var prompt = string.IsNullOrWhiteSpace(target.RootPasswordPrompt) ? "assword" : target.RootPasswordPrompt.Replace("\r", "").Replace("\n", "").Replace("\0", "");
+                if (string.IsNullOrWhiteSpace(prompt)) prompt = "assword";
+                steps.Add(new JumphostPromptResponse(prompt, target.RootPassword));
             }
         }
 

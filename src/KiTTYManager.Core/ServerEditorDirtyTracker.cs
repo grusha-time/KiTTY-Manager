@@ -11,6 +11,7 @@ public sealed class ServerEditorDraft
     public string PrivateKeyPassphrase { get; set; } = "";
     public string RootLogin { get; set; } = "";
     public string RootPassword { get; set; } = "";
+    public string RootPasswordPrompt { get; set; } = "assword";
     public string ShellPrompt { get; set; } = "$";
     public string ImportedCommand { get; set; } = "";
     public bool IgnoreImportedCommand { get; set; }
@@ -47,6 +48,10 @@ public static class ServerEditorDirtyTracker
         if ((draft.PrivateKeyPassphrase ?? "") != server.PrivateKeyPassphrase) return true;
         if ((draft.RootLogin ?? "").Trim() != server.RootLogin) return true;
         if ((draft.RootPassword ?? "") != server.RootPassword) return true;
+
+        var effectiveRootPrompt = string.IsNullOrWhiteSpace(draft.RootPasswordPrompt) ? "assword" : draft.RootPasswordPrompt;
+        var serverRootPrompt = string.IsNullOrWhiteSpace(server.RootPasswordPrompt) ? "assword" : server.RootPasswordPrompt;
+        if (effectiveRootPrompt != serverRootPrompt) return true;
 
         var effectivePrompt = string.IsNullOrWhiteSpace(draft.ShellPrompt) ? "$" : draft.ShellPrompt;
         if (effectivePrompt != server.ShellPrompt) return true;

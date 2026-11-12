@@ -240,6 +240,11 @@ public static class ConfigTransfer
                 {
                     incomingServer.MergePamPreservingPopulated(existing);
                 }
+                if (!ImportWizardEngine.IsDefaultRootPasswordPrompt(existing.RootPasswordPrompt) &&
+                    ImportWizardEngine.IsDefaultRootPasswordPrompt(incomingServer.RootPasswordPrompt))
+                {
+                    incomingServer.RootPasswordPrompt = existing.RootPasswordPrompt;
+                }
                 result.RemoveServer(existing.Id);
             }
 

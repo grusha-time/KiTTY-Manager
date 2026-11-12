@@ -44,6 +44,7 @@ public static class ManagedServerDuplicator
             UseKeyboardInteractive = source.UseKeyboardInteractive,
             RootLogin = source.RootLogin,
             RootPassword = source.RootPassword,
+            RootPasswordPrompt = source.RootPasswordPrompt,
             ShellPrompt = source.ShellPrompt,
             ImportedCommand = source.ImportedCommand,
             IgnoreImportedCommand = source.IgnoreImportedCommand,

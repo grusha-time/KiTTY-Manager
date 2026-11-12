@@ -125,7 +125,7 @@ internal sealed partial class SelfTestRunner
         Test("Импорт kmtask не записывает файлы вне папки назначения", BatchPackageRejectsTraversal);
         Test("Миграция schema 9 сохраняет данные и сбрасывает только старые InternalOnly", Schema9MigrationPreservesUserData);
         Test("Выбор только независимых серверов группы при построении связей", ConnectivityGroupSelectionStateTests);
-        Test("Версия продукта 2.2.1 и схема 9", Version2Metadata);
+        Test("Версия продукта 2.2.2 и схема 9", Version2Metadata);
         Test("Миграция схемы 7 в 8 сохраняет старые данные", Version2SchemaMigration);
         Test("Таймаут подключения допускает минимум 3 секунды", Version2ConnectionTimeoutMinimum);
         Test("WinSCP использует локальный маршрут и передаёт пароль напрямую", WinScpRouteArguments);
@@ -546,6 +546,10 @@ internal sealed partial class SelfTestRunner
         Test("Интерфейс: хит-тестинг кривых и стрелок LinkMap и Windows STA проверки", LinkMapCurveStrokeHitTestingAndWindowsStaTests);
         Test("Безопасность данных: forceExit, FlushConfig, мастер импорта и откат", ExitSequenceAndImportWizardDataSafetyTests);
         Test("Подключение SSH: перенос PreferredProxyId и метрик прокси в ApplyDiscoveredRoutesAndPreferences", ApplyDiscoveredRoutesAndPreferencesPreservesSuccessfulProxyStateTests);
+        Test("Запрос пароля su/sudo: генерация login script и PAM-шагов с настраиваемым prompt", RootPasswordPromptLoginScriptAndPamTests);
+        Test("Запрос пароля su/sudo: правила импорта и слияния (default/custom, каскад, legacy)", RootPasswordPromptImportAndMergeRulesTests);
+        Test("Запрос пароля su/sudo: клонирование, дублирование и отслеживание изменений", RootPasswordPromptCloningDuplicationAndDirtyTrackerTests);
+        Test("Запрос пароля su/sudo: сохранение, экспорт и запись в session-файл KiTTY", RootPasswordPromptConfigRoundtripAndSessionWriterTests);
         Console.WriteLine($"Итог: успешно {passed}, ошибок {failed}");
         if (selected == 0)
         {

@@ -648,6 +648,16 @@ public static class ConfigStore
         server.Note = SessionNotePolicy.Normalize(server.Note);
         if (server.KittyBaseline is not null) server.KittyBaseline.Host = server.KittyBaseline.Host.Trim();
         server.ShellPrompt = string.IsNullOrWhiteSpace(server.ShellPrompt) ? "$" : server.ShellPrompt;
+        if (string.IsNullOrWhiteSpace(server.RootPasswordPrompt))
+        {
+            server.RootPasswordPrompt = "assword";
+        }
+        else
+        {
+            server.RootPasswordPrompt = server.RootPasswordPrompt.Replace("\r", "").Replace("\n", "").Replace("\0", "");
+            if (string.IsNullOrWhiteSpace(server.RootPasswordPrompt))
+                server.RootPasswordPrompt = "assword";
+        }
         server.ImportedCommand ??= "";
         server.PamSshCommand = (server.PamSshCommand ?? "").Trim();
         server.PamPassword ??= "";

@@ -45,6 +45,7 @@ public partial class QuickDuplicateDialog : Window
         NameBox.Text = Draft.Name; HostBox.Text = Draft.Host; PortBox.Text = Draft.Port.ToString();
         UsernameBox.Text = Draft.Username; PasswordBox.Value = Draft.Password;
         RootLoginBox.Text = Draft.RootLogin; RootPasswordBox.Value = Draft.RootPassword;
+        RootPasswordPromptBox.Text = string.IsNullOrWhiteSpace(Draft.RootPasswordPrompt) ? "assword" : Draft.RootPasswordPrompt;
         PrivateKeyBox.Text = Draft.PrivateKeyPath; PrivateKeyPassphraseBox.Value = Draft.PrivateKeyPassphrase;
         KeyboardInteractiveBox.IsChecked = Draft.UseKeyboardInteractive; TryDirectBox.IsChecked = Draft.TryDirectWithoutJumphost;
         IgnoreCommandBox.IsChecked = Draft.IgnoreImportedCommand; ShellPromptBox.Text = Draft.ShellPrompt;
@@ -106,6 +107,7 @@ public partial class QuickDuplicateDialog : Window
         Draft.Name = NameBox.Text.Trim(); Draft.Host = HostBox.Text.Trim(); Draft.Port = port;
         Draft.Username = UsernameBox.Text.Trim(); Draft.Password = PasswordBox.Value;
         Draft.RootLogin = RootLoginBox.Text.Trim(); Draft.RootPassword = RootPasswordBox.Value;
+        Draft.RootPasswordPrompt = string.IsNullOrWhiteSpace(RootPasswordPromptBox.Text) ? "assword" : RootPasswordPromptBox.Text.Replace("\r", "").Replace("\n", "");
         Draft.PrivateKeyPath = PrivateKeyBox.Text.Trim(); Draft.PrivateKeyPassphrase = PrivateKeyPassphraseBox.Value;
         Draft.UseKeyboardInteractive = KeyboardInteractiveBox.IsChecked == true; Draft.TryDirectWithoutJumphost = TryDirectBox.IsChecked == true;
         Draft.IgnoreImportedCommand = IgnoreCommandBox.IsChecked == true; Draft.ShellPrompt = ShellPromptBox.Text;
