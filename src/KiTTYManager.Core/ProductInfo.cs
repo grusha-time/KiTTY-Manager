@@ -2,7 +2,7 @@ namespace KiTTYManager.Core;
 
 public static class ProductInfo
 {
-    public const string Version = "2.2.1";
+    public const string Version = "2.2.2";
 }
 
 public static class JumphostStartupOfferPolicy
